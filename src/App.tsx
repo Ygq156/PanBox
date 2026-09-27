@@ -36,9 +36,13 @@ const EP_NETDISKS = ['lanzou', 'ilanzou', 'quark', 'uc', 'baidu', 'xunlei', '123
 function EndpointSection({
   list,
   onChange,
+  ack,
+  onAck,
 }: {
   list: ParseEndpoint[]
   onChange: (next: ParseEndpoint[]) => void
+  ack: boolean
+  onAck: (v: boolean) => void
 }) {
   const upd = (id: string, p: Partial<ParseEndpoint>) =>
     onChange(list.map((x) => (x.id === id ? { ...x, ...p } : x)))
@@ -178,6 +182,17 @@ function EndpointSection({
         另外：填了提取码时，<b>提取码和分享链接会一起发给你配置的这个接口</b>（否则它没法取链）；
         你的网盘 Cookie 只在你自己的机器上用，<b>不会</b>被发往接口。
       </div>
+
+      {/* 用户承诺：有启用中的接口时必须勾选，否则不允许保存 */}
+      <label className={`ep-ack${ack ? '' : ' need'}`}>
+        <input type="checkbox" checked={ack} onChange={(e) => onAck(e.target.checked)} />
+        <span>
+          我确认并同意：只用它下载<b>我自己有权下载</b>的内容；
+          <b>不</b>用于规避网盘会员 / 限速机制，也<b>不</b>用于获取、传播、转售他人受版权保护的资源。
+          <br />
+          PanBox 只做 HTTP 转发，不看、不存、不校验接口返回什么；接口地址由我自己提供并自行确认合法性。
+        </span>
+      </label>
     </div>
   )
 }
@@ -199,12 +214,18 @@ function SettingsModal({
 
   const patch = (p: Partial<Settings>) => setS((v) => ({ ...v, ...p }))
 
+  // 有「启用中且填了地址」的解析接口时，必须先勾选用户承诺才能保存
+  const needAck =
+    (s.parseEndpoints || []).some((e) => e.enabled !== false && (e.url || '').trim() !== '') &&
+    !s.endpointAck
+
   const chooseDir = async () => {
     const dir = await api.pickDir()
     if (dir) patch({ downloadDir: dir })
   }
 
   const save = async () => {
+    if (needAck) return
     setBusy(true)
     try {
       const saved = await api.setSettings(s)
@@ -338,7 +359,12 @@ function SettingsModal({
             </div>
           </div>
 
-          <EndpointSection list={s.parseEndpoints || []} onChange={(next) => patch({ parseEndpoints: next })} />
+          <EndpointSection
+            list={s.parseEndpoints || []}
+            onChange={(next) => patch({ parseEndpoints: next })}
+            ack={!!s.endpointAck}
+            onAck={(v) => patch({ endpointAck: v })}
+          />
 
           <div className="field">
             <label>aria2 RPC 端口</label>
@@ -351,8 +377,13 @@ function SettingsModal({
           </div>
         </div>
         <div className="footer">
+          {needAck && (
+            <span className="hint err" style={{ marginRight: 'auto' }}>
+              请先勾选上面的「用户承诺」
+            </span>
+          )}
           <button onClick={onClose}>取消</button>
-          <button className="primary" disabled={busy} onClick={save}>
+          <button className="primary" disabled={busy || needAck} onClick={save}>
             保存
           </button>
         </div>

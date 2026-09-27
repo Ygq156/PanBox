@@ -31,6 +31,8 @@ const DEFAULTS = () => ({
   /* 用户自备的「网盘解析接口」（见 electron/parsers/custom.js 顶部注释）。
    * 默认空 —— 程序不内置、也不推荐任何具体解析站。 */
   parseEndpoints: [],
+  // 「解析接口」的用户承诺开关：默认关，必须在设置页勾选后才允许保存启用中的接口
+  endpointAck: false,
 })
 
 let cache = null

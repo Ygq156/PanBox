@@ -618,6 +618,38 @@ input[type='checkbox'] {
   font-size: 11px;
 }
 
+/* 「解析接口」用户承诺勾选框 */
+.ep-ack {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #14161c;
+  font-size: 12px;
+  line-height: 1.65;
+  color: #9aa3b8;
+  cursor: pointer;
+}
+
+.ep-ack input {
+  margin-top: 3px;
+  flex: none;
+}
+
+.ep-ack b {
+  color: #d6dbe6;
+}
+
+/* 还没勾选时高亮提醒，并把保存按钮挡住 */
+.ep-ack.need {
+  border-color: #4a3a1e;
+  background: #1a1710;
+  color: #d8c08a;
+}
+
 .chip {
   display: inline-flex;
   align-items: center;

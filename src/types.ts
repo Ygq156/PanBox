@@ -117,6 +117,12 @@ export interface Settings {
   openFolderWhenDone: boolean
   /** 用户自备的网盘解析接口，优先于内置解析 */
   parseEndpoints: ParseEndpoint[]
+  /**
+   * 是否已勾选并同意「解析接口用户承诺」（只用它下载自己有权下载的内容、
+   * 不用于规避网盘会员/限速机制、不转售他人资源）。
+   * 有启用中的接口但这里为 false 时，设置页不允许保存。
+   */
+  endpointAck?: boolean
 }
 
 export interface Aria2Status {
