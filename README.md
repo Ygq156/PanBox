@@ -46,7 +46,10 @@
 - **百度是真正的账号级总量限速**：1 / 2 / 4 / 8 连接都是 **0.08 MB/s**，16 / 24 连接直接回 **403**。
   多开连接不会更快，只会招来几小时到几天的**惩罚性降速**。本程序对百度强制 `split=1`、
   `max-connection-per-server=1`，并且**不走分段引擎**。
-- **迅雷**是第三种：8 连接最好（1.09 MB/s），16 / 32 连接开始回 **503**。所以它的连接数故意压在 8。
+- **迅雷**是第三种：**8 连接之后就到顶了**——1/2/4/8 连接是 0.15 / 0.29 / 0.56 / **1.09 MB/s**（近似线性，
+  说明这一段确实按连接发额度），但 16 连接只到 1.17 MB/s（+7%），而且 16/32 都开始零星回 **503**。
+  也就是说它的天花板是**账号级 ~1.1–1.2 MB/s 的总量**，再加连接没有意义还有风险，
+  所以迅雷的连接数故意压在 8，并且**不走分段引擎**。
 - **蓝奏云 / 直链**不按连接发额度，多开只是抗抖动，实测已经是 10 MB/s / 3.2 MB/s 档。
 
 ### 为什么夸克/UC/百度"需要登录"
@@ -247,14 +250,14 @@ node test\probe-parse-node.js <链接> --dl                   # 单条解析（�
 # 端到端真实下载（需要 Electron）
 Remove-Item Env:ELECTRON_RUN_AS_NODE
 Start-Process node_modules\electron\dist\electron.exe `
-  -ArgumentList 'test\e2e-netdisk.js','https://dmla.lanzouy.com/b05qmjg9i' `
+  -ArgumentList 'test\e2e-netdisk.js','<你自己的分享链接> <提取码>' `
   -WorkingDirectory $PWD -NoNewWindow -Wait
 
 # 界面级端到端（真的开窗口、点按钮、截图）
 #   ⚠️ 参数一律走环境变量：Start-Process -ArgumentList 传数组时是空格拼接，
 #      Chromium 的命令行解析器会把 https://… 这种位置参数吃掉，
 #      结果是 Electron 根本不加载脚本（exit -1、stdout/stderr 全空）。
-$env:PANBOX_UI_SHARE='https://www.ilanzou.com/s/1kTy3Cxf'
+$env:PANBOX_UI_SHARE='<你自己的分享链接>'
 $env:PANBOX_UI_OUT="$PWD\dl\ui-e2e"
 Start-Process node_modules\electron\dist\electron.exe `
   -ArgumentList 'test\ui-e2e.js' `
