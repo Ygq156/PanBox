@@ -1,0 +1,34 @@
+MIT License
+
+Copyright (c) 2026 PanBox contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+## 第三方参考
+
+本项目的网盘解析器是按公开的协议规格**独立实现**的，编写过程中参考了以下开源项目（均未直接复制其代码，仅参考接口行为与常量）：
+
+- [qaiu/netdisk-fast-download](https://github.com/qaiu/netdisk-fast-download) — MIT，蓝奏云 / 蓝奏优享 / 123 云盘解析流程的主要参考
+- [muyan556/gopeed-extension-quark](https://github.com/muyan556/gopeed-extension-quark) — MIT，夸克网盘转存与回收流程参考
+- [hmjz100/LinkSwift](https://github.com/hmjz100/LinkSwift) — AGPL-3.0，端点交叉验证（仅作事实核对）
+- [chanha666/JieXi](https://github.com/chanha666/JieXi) — 迅雷云盘调研参考
+
+下载引擎使用 [aria2](https://github.com/aria2/aria2)（GPL-2.0-or-later），本项目**不重新分发** aria2 二进制，使用前请自行下载（见 README）。

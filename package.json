@@ -1,0 +1,79 @@
+{
+  "name": "panbox",
+  "productName": "PanBox",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PanBox 网盘快取 —— 多网盘分享链接解析 + aria2 多线程下载桌面客户端",
+  "main": "electron/main.js",
+  "author": "PanBox",
+  "license": "MIT",
+  "scripts": {
+    "dev:renderer": "vite",
+    "build:renderer": "vite build",
+    "start": "npm run build:renderer && electron .",
+    "pack": "npm run build:renderer && electron-builder --win --x64",
+    "pack:dir": "npm run build:renderer && electron-builder --win --x64 --dir"
+  },
+  "build": {
+    "appId": "com.panbox.downloader",
+    "productName": "PanBox",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json",
+      "!**/*.map"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/aria2",
+        "to": "aria2"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "PanBox"
+    },
+    "portable": {
+      "artifactName": "PanBox-${version}-portable.exe"
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1"
+  },
+  "optionalDependencies": {
+    "@rolldown/binding-win32-x64-msvc": "^1.2.11"
+  }
+}

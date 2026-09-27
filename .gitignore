@@ -1,0 +1,22 @@
+# 依赖与构建产物
+node_modules/
+dist/
+release/
+
+# 第三方二进制（aria2c.exe 约 5.4 MB，请按 README 自行下载到 resources/aria2/）
+resources/aria2/
+
+# 测试与调试脚本（本地保留，不入库）
+test/
+
+# 本机配置 / 日志 / 缓存
+.npmrc
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# 绝不允许入库的凭证类文件
+*.cookie
+cookies*.json
+settings.json
