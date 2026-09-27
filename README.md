@@ -145,7 +145,10 @@ A：不会。下载完成后程序会**自动删除**它转存进去的副本（
 - **下载引擎**：内置 **aria2 1.37.0**（通过 JSON-RPC 控制，随机 token 鉴权、只监听 127.0.0.1）
 - **解析层**：`electron/parsers/` 下每个网盘一个模块，纯 Node 实现
 
-解析规格来源（均为开源项目，MIT / 参考实现）：
+解析规格来源（以下均为**许可证要求的署名**：PanBox 借鉴的是它们公开的**本地解析算法实现**，
+用于 `electron/parsers/` 里的离线计算。PanBox **不调用**、**不推荐**、也不链接这些项目的任何
+在线服务或接口，署名不代表对其服务可用性、合规性的背书）：
+
 - 蓝奏云：`qaiu/netdisk-fast-download` 的 `LzTool.java`
 - 蓝奏优享：`qaiu/netdisk-fast-download` 的 `IzTool.java` + `AESUtils.java`
 - 夸克 / UC：`qaiu/netdisk-fast-download` 的 `QkTool.java` / `UcTool.java`，以及 `muyan556/gopeed-extension-quark`（MIT）
