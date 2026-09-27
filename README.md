@@ -83,8 +83,12 @@ PanBox 从 v0.4.0 起支持同样的模式：
 
 - **地址与请求体支持占位符**：`{url}`（完整分享链接）、`{pwd}`（提取码）、`{shareId}`、`{netdisk}`。
   例如 `https://example.com/api?url={url}&pwd={pwd}`，或 POST + 请求体 `url={url}&pwd={pwd}`。
-- **响应自动识别**：JSON 里的 `url` / `dlink` / `download_url` / `downurl` / `link` / `direct_url` … 都会被认出来；
-  也支持数组（目录分享一次返回多个文件）和 `data.url`、`data.list[0].url` 这种嵌套。认不出来时可以手填字段路径。
+- **响应自动识别**：JSON 里的 `url` / `dlink` / `directLink` / `downLink` / `downloadLink` / `download_url` /
+  `downurl` / `real_url` / `link` / `parserUrl` … 都会被认出来；也支持数组（目录分享一次返回多个文件）和
+  `data.url`、`data.list[0].url` 这种嵌套。认不出来时可以手填字段路径。
+  - 如果接口直接 **302 重定向**到直链（不少解析站是这种），也会自动跟上。
+  - 已按 `qaiu/netdisk-fast-download` 的真实响应形状验证：`GET /json/parser` 的 `data.directLink`
+    和 `GET /v2/linkInfo` 的 `data.downLink` 都能识别；它的 `apiLink`（不是直链）**不会**被误认成直链。
 - **适用网盘**：不勾 = 全部；**直链默认不走接口**（本来就能直接下，送去解析只会弄坏），要走得显式勾上「直链」。
 - **优先级**：配了解析接口就先走接口，接口挂了会**自动退回内置解析**，界面上会提示失败原因。
 - **下载直链的请求头**（Referer / UA / Cookie 之类）也可以按接口单独配。
@@ -93,6 +97,8 @@ PanBox 从 v0.4.0 起支持同样的模式：
 > ⚠️ PanBox **不内置、也不推荐任何具体解析站**，接口地址完全由你提供，程序只做转发。
 > 请自行确认所用服务的合规性 —— 使用他人会员账号取链可能违反对应网盘的服务协议。
 > 作者不为任何第三方解析服务背书，也不对其可用性与合法性负责。
+> 另外：填了提取码时**提取码会连同分享链接一起发给你配置的这个接口**（否则它取不到链）；
+> 你自己的网盘 Cookie 只在本机使用，**不会**被发往接口。
 
 ---
 
@@ -192,7 +198,7 @@ Copy-Item aria2-tmp\aria2-1.37.0-win-64bit-build1\aria2c.exe resources\aria2\ari
 
 ```powershell
 node test\smoke-parsers.js                                  # 离线冒烟：25 项
-node test\verify-custom-endpoint.js                         # 自定义解析接口：19 项（起本地 http 冒充解析站，不碰第三方）
+node test\verify-custom-endpoint.js                         # 自定义解析接口：23 项（起本地 http 冒充解析站，不碰第三方）
 node test\batch-live.js --only ilanzou --dl                 # 真实链接批量解析
 node test\probe-parse-node.js <链接> --dl                   # 单条解析（纯 node）
 
@@ -216,7 +222,7 @@ Start-Process node_modules\electron\dist\electron.exe `
 | 脚本 | 用途 |
 |---|---|
 | `smoke-parsers.js` | 离线冒烟（模块加载、识别、AES 往返、crc32 向量…） |
-| `verify-custom-endpoint.js` | 自定义解析接口：19 项（本地 http 冒充解析站，覆盖字段识别/嵌套/数组/错误码/优先级/退回内置） |
+| `verify-custom-endpoint.js` | 自定义解析接口：23 项（本地 http 冒充解析站，覆盖字段识别/嵌套/数组/错误码/优先级/退回内置） |
 | `e2e-netdisk.js` | **真实网盘**端到端：解析 → 直链 → aria2 多线程 → 字节校验 |
 | `ui-e2e.js` | **界面级**端到端：开真窗口 → 填链接 → 点「解析」→ 点「开始下载」→ 校验文件 → 截图 |
 | `verify-recycle.js` | 验证"转存副本自动回收"闭环 |

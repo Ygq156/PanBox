@@ -27,10 +27,25 @@
 
 const { req, detectNetdisk } = require('./util')
 
-/** 常见「直链」字段名，按优先级排列 */
+/**
+ * 常见「直链」字段名，按优先级排列。
+ * 末尾那几个（directLink / downLink / parserUrl …）是照着
+ * qaiu/netdisk-fast-download 这类解析站的响应格式补的：
+ *   GET /json/parser  → {code,msg,success,data:{shareKey,directLink,cacheHit,expires}}
+ *   GET /v2/linkInfo  → {code,msg,data:{downLink,apiLink,cacheHitTotal,…}}
+ * 少了它们，最主流的解析站返回的 JSON 会被当成「没找到下载直链」。
+ * 注意 apiLink / parserUrl 在 NFD 里含义不同（apiLink 不是直链），
+ * 所以 apiLink 故意不收录；parserUrl 在 Java 端 FileInfo 里确实是直链，收录。
+ */
 const LINK_KEYS = [
   'url',
   'dlink',
+  'directLink',
+  'directlink',
+  'downLink',
+  'downlink',
+  'downloadLink',
+  'downloadlink',
   'download_url',
   'downloadUrl',
   'downurl',
@@ -39,10 +54,14 @@ const LINK_KEYS = [
   'directUrl',
   'real_url',
   'realUrl',
+  'realLink',
   'file_url',
   'fileUrl',
   'dl_url',
   'dlurl',
+  'dlUrl',
+  'parserUrl',
+  'parser_url',
   'link',
   'src',
 ]
