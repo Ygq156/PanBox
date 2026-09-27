@@ -40,6 +40,61 @@ const SITES = {
     // 百度登录态：BDUSS 是唯一硬指标
     logged: (list) => list.some((c) => c.name === 'BDUSS' && c.value && c.value.length > 20),
   },
+  xunlei: {
+    name: '迅雷云盘',
+    url: 'https://pan.xunlei.com/',
+    domains: ['pan.xunlei.com', 'xunlei.com'],
+    /* 迅雷的 pan 接口用 Bearer token，**不是 cookie** —— 凭证存在浏览器 localStorage 里
+     * （`credentials_<client_id>` / `deviceid`）。所以这里不用 cookie 收割，改成读 localStorage，
+     * 并存成一个 JSON 字符串塞进 settings.cookies.xunlei（复用现有的凭证管道）。 */
+    async read(ses, win) {
+      if (!win || win.isDestroyed()) return { header: '', list: [], loggedIn: false }
+      const raw = await win.webContents
+        .executeJavaScript(
+          `(() => { const o = {}; for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); o[k] = localStorage.getItem(k) } return JSON.stringify(o) })()`,
+          true,
+        )
+        .catch(() => '{}')
+      let store = {}
+      try {
+        store = JSON.parse(raw || '{}')
+      } catch {
+        /* ignore */
+      }
+      let cred = null
+      for (const [k, v] of Object.entries(store)) {
+        if (!/^credentials_/.test(k)) continue
+        try {
+          const j = JSON.parse(v)
+          if (j && j.access_token) {
+            cred = j
+            break
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+      const deviceId = store.deviceid || store.device_id || (cred && (cred.deviceid || cred.device_id)) || ''
+      if (!cred || !cred.access_token) return { header: '', list: [], loggedIn: false }
+      let userId = cred.user_id || cred.sub || ''
+      if (!userId) {
+        // 有些版本把 user_id 放在别的 key 里
+        for (const [k, v] of Object.entries(store)) {
+          if (/user_?id$/i.test(k) && /^\d{4,}$/.test(String(v))) {
+            userId = String(v)
+            break
+          }
+        }
+      }
+      const blob = JSON.stringify({
+        access_token: cred.access_token,
+        refresh_token: cred.refresh_token || '',
+        user_id: String(userId || ''),
+        device_id: String(deviceId || ''),
+      })
+      return { header: blob, list: [{ name: 'access_token', value: cred.access_token }], loggedIn: true }
+    },
+  },
 }
 
 function cookieHeader(list) {
@@ -84,6 +139,7 @@ async function openLogin(netdisk, parent) {
     }
 
     const harvest = async () => {
+      if (typeof site.read === 'function') return site.read(ses, win)
       const all = await ses.cookies.get({})
       const mine = pickCookies(all, site.domains)
       const header = cookieHeader(mine)
@@ -143,7 +199,7 @@ async function clearLogin(netdisk) {
   const site = SITES[netdisk]
   if (!site) return false
   const ses = session.fromPartition(`persist:login-${netdisk}`)
-  await ses.clearStorageData({ storages: ['cookies'] })
+  await ses.clearStorageData({ storages: ['cookies', 'localstorage'] })
   return true
 }
 
@@ -158,6 +214,8 @@ const FRESH = {
   quark: { name: '__puus', minTtlSec: 2 * 3600, warmMs: 12000 },
   uc: { name: '__puus', minTtlSec: 2 * 3600, warmMs: 12000 },
   baidu: null,
+  // 迅雷没有短效 cookie，凭证在 localStorage 里，每次重读一遍即可
+  xunlei: { name: '', minTtlSec: 0, warmMs: 0 },
 }
 
 /**
@@ -176,21 +234,24 @@ async function refreshCookie(netdisk, opts = {}) {
   const freshener = FRESH[netdisk]
 
   const harvest = async () => {
+    if (typeof site.read === 'function') return site.read(ses, null)
     const all = await ses.cookies.get({})
     const mine = pickCookies(all, site.domains)
     return { header: cookieHeader(mine), list: mine, loggedIn: site.logged(mine) }
   }
 
   const freshEnough = async () => {
-    if (!freshener) return false
+    if (!freshener || !freshener.name) return false
     const c = (await ses.cookies.get({ name: freshener.name }))[0]
     return !!(c && c.value && c.expirationDate && c.expirationDate - Date.now() / 1000 > freshener.minTtlSec)
   }
 
   if (!opts.force && (await freshEnough())) {
-    return { ...(await harvest()), refreshed: false }
+    const h = await harvest()
+    if (h && h.loggedIn) return { ...h, refreshed: false }
   }
 
+  const needRead = typeof site.read === 'function'
   let win = null
   try {
     win = new BrowserWindow({
@@ -200,12 +261,19 @@ async function refreshCookie(netdisk, opts = {}) {
       webPreferences: { partition, contextIsolation: true, nodeIntegration: false, sandbox: true },
     })
     await win.loadURL(site.url).catch(() => {})
-    if (freshener) {
+    if (freshener && freshener.name) {
       const deadline = Date.now() + freshener.warmMs
       while (Date.now() < deadline) {
         await sleep(700)
         if (await freshEnough()) break
       }
+    } else if (needRead) {
+      // localStorage 型凭证：页面加载完还要等前端脚本把 token 写进去
+      await sleep(2000)
+    }
+    if (needRead) {
+      const got = await site.read(ses, win)
+      return { ...got, refreshed: true }
     }
   } finally {
     try {

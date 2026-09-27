@@ -4,6 +4,7 @@ export type Netdisk =
   | 'quark'
   | 'uc'
   | 'baidu'
+  | 'xunlei'
   | 'aliyun'
   | '123pan'
   | 'direct'

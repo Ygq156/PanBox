@@ -106,6 +106,7 @@ const LANZOU_HOSTS = [
 
 const MATCHERS = [
   { netdisk: 'baidu', re: /(pan\.baidu\.com|yun\.baidu\.com|eyun\.baidu\.com)/i },
+  { netdisk: 'xunlei', re: /(pan\.xunlei\.com|pan-thunder\.com|(^|\/\/)xunlei\.com\/s\/)/i },
   { netdisk: 'ilanzou', re: /(www\.)?ilanzou\.com/i },
   { netdisk: 'quark', re: /(pan\.quark\.cn|drive-pc\.quark\.cn|quark\.cn)/i },
   { netdisk: 'uc', re: /((fast|drive|pc-api)\.uc\.cn|\buc\.cn\/s\/)/i },

@@ -10,6 +10,7 @@ const quark = require('./quark')
 const uc = require('./uc')
 const pan123 = require('./pan123')
 const baidu = require('./baidu')
+const xunlei = require('./xunlei')
 
 const PARSERS = {
   direct,
@@ -20,6 +21,7 @@ const PARSERS = {
   uc,
   '123pan': pan123,
   baidu,
+  xunlei,
 }
 
 /** 会话缓存：解析出来的目录树和「取直链」闭包留在主进程，渲染层只拿到可序列化的部分 */
@@ -147,6 +149,10 @@ async function resolveFiles({ sessionId, ids }) {
       url: r.url,
       headers: r.headers || {},
     })
+  }
+  // 逐条解析的解析器（迅雷）同样会转存副本，这里补登记回收器
+  if (out.length && typeof s.removeTransferred === 'function') {
+    recycler.set(sessionId, { netdisk: s.netdisk, session: s })
   }
   return out
 }

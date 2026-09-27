@@ -202,6 +202,7 @@ function registerIpc() {
     const need = []
     if (jar.quark && /pan\.quark\.cn|quark\.cn/i.test(text)) need.push('quark')
     if (jar.uc && /drive\.uc\.cn|uc\.cn/i.test(text)) need.push('uc')
+    if (jar.xunlei && /pan\.xunlei\.com/i.test(text)) need.push('xunlei')
     if (!need.length) return
     let changed = false
     for (const nd of need) {

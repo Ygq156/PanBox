@@ -13,13 +13,14 @@ const NETDISK_LABEL: Record<string, string> = {
   quark: '夸克网盘',
   uc: 'UC网盘',
   baidu: '百度网盘',
+  xunlei: '迅雷云盘',
   aliyun: '阿里云盘',
   '123pan': '123云盘',
   direct: '直链',
   unknown: '未知',
 }
 
-const LOGIN_TARGETS = ['baidu', 'quark', 'uc']
+const LOGIN_TARGETS = ['baidu', 'quark', 'uc', 'xunlei']
 
 function SettingsModal({
   initial,
@@ -54,7 +55,7 @@ function SettingsModal({
     }
   }
 
-  const cookieTargets = ['baidu', 'quark', 'uc', 'lanzou', 'aliyun', '123pan']
+  const cookieTargets = ['baidu', 'quark', 'uc', 'xunlei', 'lanzou', 'aliyun', '123pan']
 
   return (
     <div className="mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
@@ -127,7 +128,7 @@ function SettingsModal({
               </select>
               <input
                 type="text"
-                placeholder="粘贴该网盘的 Cookie 字符串（也可以点右边的登录按钮自动获取）"
+                placeholder="粘贴该网盘的 Cookie / 凭证字符串（也可以点右边的登录按钮自动获取）"
                 value={s.cookies[cookieKey] ?? ''}
                 onChange={(e) => patch({ cookies: { ...s.cookies, [cookieKey]: e.target.value } })}
               />
@@ -173,7 +174,7 @@ function SettingsModal({
             {loginMsg && <div className="desc">{loginMsg}</div>}
             <div className="desc">
               填写的是「你自己的账号」的凭证，程序只用它拿到你账号本身应有的速度，不做任何身份伪造。
-              夸克 / UC 网盘的游客直链会被 CDN 拒绝（412 / 403），必须登录后才能下载。
+              夸克 / UC 网盘的游客直链会被 CDN 拒绝（412 / 403），迅雷云盘的转存取链也必须登录 —— 这些都要登录后才能下载。
             </div>
           </div>
 
@@ -252,6 +253,11 @@ function ResultPanel({
       {needsLogin && (result.netdisk === 'quark' || result.netdisk === 'uc') && (
         <div className="result-note warn">
           这个网盘需要登录后才能下载（游客直链会被 CDN 拒绝 412 / 403）。点「开始下载」后会提示你去登录。
+        </div>
+      )}
+      {needsLogin && result.netdisk === 'xunlei' && (
+        <div className="result-note warn">
+          迅雷云盘的分享可以匿名浏览（文件名和体积都能读到），但转存和取直链必须登录。点「开始下载」后会提示你去登录。
         </div>
       )}
       {result.netdisk === 'baidu' && (
