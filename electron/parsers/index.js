@@ -11,6 +11,7 @@ const uc = require('./uc')
 const pan123 = require('./pan123')
 const baidu = require('./baidu')
 const xunlei = require('./xunlei')
+const custom = require('./custom')
 
 const PARSERS = {
   direct,
@@ -22,6 +23,8 @@ const PARSERS = {
   '123pan': pan123,
   baidu,
   xunlei,
+  /** 用户自备的「网盘解析站」适配层（见 custom.js 顶部注释） */
+  custom,
 }
 
 /** 会话缓存：解析出来的目录树和「取直链」闭包留在主进程，渲染层只拿到可序列化的部分 */
@@ -87,12 +90,30 @@ async function parseShare({ text, password, settings }) {
       continue
     }
     const { parser, netdisk } = hit
+    const ctx = {
+      password: pwd,
+      cookie: cookies[netdisk],
+      userAgent: cfg.userAgent,
+      endpoints: cfg.parseEndpoints || [],
+    }
+    /* 用户为这个网盘配了「解析接口」就**优先**用它：内置解析虽然也能成，但拿到的是
+     * 用户自己账号档位的直链（夸克 0.6–1.4 MB/s、百度 0.1 MB/s），而配接口的目的
+     * 恰恰是要绕开这个档位。接口失败就退回内置解析，别让用户两手空空。 */
+    const viaEps = custom.matchEndpoints(ctx.endpoints, url)
     try {
-      const open = await parser.open(url, {
-        password: pwd,
-        cookie: cookies[netdisk],
-        userAgent: cfg.userAgent,
-      })
+      let open = null
+      let via = ''
+      let endpointError = ''
+      if (viaEps.length) {
+        try {
+          open = await custom.open(url, ctx)
+          via = open.endpointName || viaEps[0].name || viaEps[0].url
+        } catch (e) {
+          endpointError = e && e.message ? e.message : String(e)
+          open = null
+        }
+      }
+      if (!open) open = await parser.open(url, ctx)
       const sessionId = crypto.randomUUID()
       sessions.set(sessionId, { ...open, netdisk, source: url, createdAt: Date.now() })
       results.push({
@@ -104,6 +125,9 @@ async function parseShare({ text, password, settings }) {
         source: url,
         files: open.files,
         elapsed: Date.now() - t,
+        viaEndpoint: !!(via || open.viaEndpoint),
+        endpointName: via || open.endpointName || undefined,
+        endpointError: endpointError || undefined,
       })
     } catch (e) {
       results.push({
@@ -133,6 +157,9 @@ async function resolveFiles({ sessionId, ids }) {
   if (!wanted.length) return []
 
   const out = []
+  /* 来自「自定义解析接口」的直链：下载时**不能**再套百度那套单线程限制——
+   * 用户配接口就是为了跑满带宽，限成单线程等于白配。 */
+  const viaEndpoint = !!s.viaEndpoint
   if (typeof s.resolveMany === 'function') {
     const got = await s.resolveMany(wanted.map((m) => ({ id: m.id, name: m.name })))
     /* 夸克/UC 的「转存」会在用户自己的网盘里留一份整文件拷贝。
@@ -150,6 +177,7 @@ async function resolveFiles({ sessionId, ids }) {
         size: m.size || 0,
         url: g.url,
         headers: g.headers || {},
+        viaEndpoint: viaEndpoint || !!g.viaEndpoint,
       })
     }
     if (out.length) return out
@@ -164,6 +192,7 @@ async function resolveFiles({ sessionId, ids }) {
       size: m.size || 0,
       url: r.url,
       headers: r.headers || {},
+      viaEndpoint: viaEndpoint || !!(r && r.viaEndpoint),
     })
   }
   // 逐条解析的解析器（迅雷）同样会转存副本，这里补登记回收器

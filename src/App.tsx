@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, formatEta, formatSize, formatSpeed } from './api'
-import type { DownloadTask, ParseResult, Settings, Aria2Status } from './types'
+import type { DownloadTask, ParseEndpoint, ParseResult, Settings, Aria2Status } from './types'
 
 /* ------------------------------------------------------------------ */
 /* 设置弹窗                                                             */
@@ -20,6 +20,164 @@ const NETDISK_LABEL: Record<string, string> = {
 }
 
 const LOGIN_TARGETS = ['baidu', 'quark', 'uc', 'xunlei']
+
+/** 「解析接口」可以勾选的网盘（顶层域名会被自动识别成这些代号） */
+const EP_NETDISKS = ['lanzou', 'ilanzou', 'quark', 'uc', 'baidu', 'xunlei', '123pan', 'direct']
+
+/**
+ * 「网盘解析接口」管理区。
+ *
+ * 背景：PanBox 内置解析走的是「用你自己的账号转存取直链」，速度上限就是你自己账号的档位
+ * （实测夸克 0.6–1.4 MB/s、百度 0.1 MB/s）。市面上有一类「解析站」用自己的会员账号取链，
+ * 所以能跑满；Motrix / Gopeed「不用登录还能跑满」走的正是这条路。
+ * 这里让用户自己填接口地址，程序只负责转发链接、取出直链、交给 aria2。
+ * **不内置、也不推荐任何具体解析站。**
+ */
+function EndpointSection({
+  list,
+  onChange,
+}: {
+  list: ParseEndpoint[]
+  onChange: (next: ParseEndpoint[]) => void
+}) {
+  const upd = (id: string, p: Partial<ParseEndpoint>) =>
+    onChange(list.map((x) => (x.id === id ? { ...x, ...p } : x)))
+
+  const add = () =>
+    onChange([
+      ...list,
+      {
+        id: `ep-${Date.now().toString(36)}`,
+        name: '',
+        url: '',
+        method: 'GET',
+        body: '',
+        field: '',
+        headers: '',
+        dlHeaders: '',
+        netdisks: [],
+        enabled: true,
+      },
+    ])
+
+  return (
+    <div className="field">
+      <label>
+        已保存的网盘解析接口（可选，优先于内置解析）
+        <button style={{ marginLeft: 8 }} onClick={add}>
+          ＋ 添加接口
+        </button>
+      </label>
+
+      {list.length === 0 && (
+        <div className="desc">
+          还没有配置。填一个接口地址，解析时会先把链接交给它，拿回直链再交给 aria2 —— 这样速度取决于
+          <b>对方账号</b>的档位，而不是你自己账号的档位。
+        </div>
+      )}
+
+      {list.map((ep, i) => (
+        <div className="endpoint" key={ep.id}>
+          <div className="endpoint-head">
+            <label className="ep-toggle">
+              <input
+                type="checkbox"
+                checked={ep.enabled !== false}
+                onChange={(e) => upd(ep.id, { enabled: e.target.checked })}
+              />
+              启用
+            </label>
+            <input
+              type="text"
+              placeholder={`接口名称（如：我的解析站 ${i + 1}）`}
+              value={ep.name}
+              onChange={(e) => upd(ep.id, { name: e.target.value })}
+            />
+            <select
+              value={ep.method || 'GET'}
+              onChange={(e) => upd(ep.id, { method: e.target.value as 'GET' | 'POST' })}
+              style={{ background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 6, padding: '7px 10px' }}
+            >
+              <option value="GET">GET</option>
+              <option value="POST">POST</option>
+            </select>
+            <button
+              title="删除这个接口"
+              onClick={() => onChange(list.filter((x) => x.id !== ep.id))}
+            >
+              删除
+            </button>
+          </div>
+
+          <input
+            type="text"
+            placeholder="接口地址，可用 {url} {pwd} {shareId} {netdisk} 占位，如 https://example.com/api?url={url}&pwd={pwd}"
+            value={ep.url}
+            onChange={(e) => upd(ep.id, { url: e.target.value })}
+          />
+
+          {ep.method === 'POST' && (
+            <textarea
+              rows={2}
+              placeholder={'请求体模板，如 url={url}&pwd={pwd}（默认 application/x-www-form-urlencoded）'}
+              value={ep.body || ''}
+              onChange={(e) => upd(ep.id, { body: e.target.value })}
+            />
+          )}
+
+          <div className="row">
+            <input
+              type="text"
+              placeholder="直链字段路径（留空自动识别 url / dlink / download_url …），如 data.url"
+              value={ep.field || ''}
+              onChange={(e) => upd(ep.id, { field: e.target.value })}
+            />
+          </div>
+
+          <div className="row">
+            <textarea
+              rows={2}
+              placeholder={'请求头 JSON（可选），如 {"Referer":"https://example.com/"}'}
+              value={typeof ep.headers === 'string' ? ep.headers : ep.headers ? JSON.stringify(ep.headers) : ''}
+              onChange={(e) => upd(ep.id, { headers: e.target.value })}
+            />
+            <textarea
+              rows={2}
+              placeholder={'下载直链要带的请求头 JSON（可选）。留空只用 User-Agent'}
+              value={typeof ep.dlHeaders === 'string' ? ep.dlHeaders : ep.dlHeaders ? JSON.stringify(ep.dlHeaders) : ''}
+              onChange={(e) => upd(ep.id, { dlHeaders: e.target.value })}
+            />
+          </div>
+
+          <div className="ep-netdisks">
+            <span className="ep-hint">适用网盘（不勾 = 全部；直链必须显式勾选）：</span>
+            {EP_NETDISKS.map((k) => {
+              const cur = ep.netdisks || []
+              const on = cur.includes(k)
+              return (
+                <label key={k} className={`chip ${on ? 'on' : ''}`}>
+                  <input
+                    type="checkbox"
+                    checked={on}
+                    onChange={() =>
+                      upd(ep.id, { netdisks: on ? cur.filter((x) => x !== k) : [...cur, k] })
+                    }
+                  />
+                  {NETDISK_LABEL[k] ?? k}
+                </label>
+              )
+            })}
+          </div>
+        </div>
+      ))}
+
+      <div className="desc">
+        程序不内置、也不推荐任何具体解析站，接口地址完全由你提供。请自行确认所用服务的合规性
+        —— 使用他人会员账号取链可能违反对应网盘的服务协议。
+      </div>
+    </div>
+  )
+}
 
 function SettingsModal({
   initial,
@@ -177,6 +335,8 @@ function SettingsModal({
             </div>
           </div>
 
+          <EndpointSection list={s.parseEndpoints || []} onChange={(next) => patch({ parseEndpoints: next })} />
+
           <div className="field">
             <label>aria2 RPC 端口</label>
             <input
@@ -230,7 +390,18 @@ function ResultPanel({
         <span className="title">{result.title || result.shareId || '分享内容'}</span>
         <span className="badge gray">{result.files.length} 个文件</span>
         {result.elapsed != null && <span className="badge gray">{(result.elapsed / 1000).toFixed(1)}s</span>}
+        {result.viaEndpoint && (
+          <span className="badge ok" title="直链来自你配置的解析接口，不受你自己账号的限速档位约束">
+            解析接口 · {result.endpointName || '自定义'}
+          </span>
+        )}
       </div>
+
+      {result.endpointError && (
+        <div className="result-note warn">
+          解析接口调用失败，已退回内置解析：{result.endpointError}
+        </div>
+      )}
 
       <div className="filelist">
         {result.files.map((f) => (

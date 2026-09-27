@@ -28,6 +28,9 @@ const DEFAULTS = () => ({
   cookies: {},
   aria2Port: 6800,
   openFolderWhenDone: false,
+  /* 用户自备的「网盘解析接口」（见 electron/parsers/custom.js 顶部注释）。
+   * 默认空 —— 程序不内置、也不推荐任何具体解析站。 */
+  parseEndpoints: [],
 })
 
 let cache = null

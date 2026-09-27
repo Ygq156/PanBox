@@ -39,6 +39,12 @@ export interface ParseResult {
   needCookie?: boolean
   /** 解析耗时（毫秒） */
   elapsed?: number
+  /** 这条结果的直链来自用户自备的「解析接口」而不是内置解析 */
+  viaEndpoint?: boolean
+  /** 命中的接口名 */
+  endpointName?: string
+  /** 配了解析接口但调用失败时的原因（此时已退回内置解析） */
+  endpointError?: string
 }
 
 export interface ParseResponse {
@@ -71,6 +77,32 @@ export interface DownloadTask {
   filesize?: number
 }
 
+/**
+ * 一条用户自备的「网盘解析接口」（解析站）。
+ * 请求地址 / 请求体 / 请求头里可用占位符：{url} {pwd} {shareId} {netdisk}
+ */
+export interface ParseEndpoint {
+  /** 稳定 id，UI 里用来做 key */
+  id: string
+  /** 展示名 */
+  name: string
+  /** 接口地址，如 https://example.com/api?url={url}&pwd={pwd} */
+  url: string
+  method?: 'GET' | 'POST'
+  /** POST 时的请求体模板 */
+  body?: string
+  contentType?: string
+  /** 额外请求头，JSON 字符串或对象 */
+  headers?: Record<string, string> | string
+  /** 取直链的字段路径（如 data.url）；留空则自动识别常见字段 */
+  field?: string
+  /** 下载直链时要带的请求头（JSON），留空则只用 User-Agent */
+  dlHeaders?: Record<string, string> | string
+  /** 适用的网盘；留空 = 全部（直链除外，需要在列表里显式勾选） */
+  netdisks?: string[]
+  enabled?: boolean
+}
+
 export interface Settings {
   downloadDir: string
   maxConcurrent: number
@@ -83,6 +115,8 @@ export interface Settings {
   aria2Port: number
   /** 完成后是否自动打开下载目录 */
   openFolderWhenDone: boolean
+  /** 用户自备的网盘解析接口，优先于内置解析 */
+  parseEndpoints: ParseEndpoint[]
 }
 
 export interface Aria2Status {

@@ -323,7 +323,10 @@ function registerIpc() {
       } catch {
         /* ignore */
       }
-      const isBaidu = netdisk === 'baidu'
+      /* 百度按「账号」维度限速：并发调大只会招致几小时~几天的惩罚性降速。
+       * 但如果这条直链是用户自己的「解析接口」给的（别人的会员账号出的链），
+       * 那限速档位就不是用户的账号了，再限成单线程等于白配——所以跳过这个限制。 */
+      const isBaidu = netdisk === 'baidu' && !session.some((f) => f.viaEndpoint)
       const options = {
         dir: subdir,
         out: sanitizeName(f.name),
