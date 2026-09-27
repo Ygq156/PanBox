@@ -240,6 +240,18 @@ class Aria2 {
     return this.rpc('aria2.forceRemove', [gid]).catch(() => this.rpc('aria2.remove', [gid]))
   }
 
+  /**
+   * 把一条任务从 aria2 的结果列表里**彻底**清除。
+   *
+   * ⚠️ 只调 `remove` / `forceRemove` 是不够的：那两个方法对「已完成 / 已出错」的任务
+   * 会直接报错（它不在活动列表里），对「正在下载」的任务则只是把它**挪进**停止列表。
+   * 而 taskManager 每 800ms 会 `tellStopped` 把停止列表读回来，于是任务永远赖在界面上
+   * —— 用户看到的现象就是「点了移除，毫无反应」。
+   */
+  removeDownloadResult(gid) {
+    return this.rpc('aria2.removeDownloadResult', [gid])
+  }
+
   purgeDownloadResult() {
     return this.rpc('aria2.purgeDownloadResult').catch(() => null)
   }

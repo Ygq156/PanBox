@@ -5,6 +5,7 @@ const { app, shell } = require('electron')
 const fs = require('node:fs')
 const path = require('node:path')
 const aria2 = require('./aria2')
+const seg = require('./segmentDownloader')
 
 const META_FILE = () => path.join(app.getPath('userData'), 'tasks.json')
 const POLL_MS = 800
@@ -54,6 +55,8 @@ class TaskManager extends EventEmitter {
 
   forget(gid) {
     this.meta.delete(gid)
+    /* 一并忘掉「已经通知过完成」，这样同一个 gid 万一被复用还能再通知一次 */
+    this._notifiedComplete.delete(gid)
     this._saveMeta()
   }
 
@@ -83,6 +86,8 @@ class TaskManager extends EventEmitter {
       gid: st.gid,
       name: String(name).replace(/^.*[\\/]/, ''),
       netdisk: m.netdisk || 'unknown',
+      /** 哪个引擎在跑：'aria2' | 'seg'。暂停/继续/移除要按它路由 */
+      engine: m.engine || (String(st.gid).startsWith('seg-') ? 'seg' : 'aria2'),
       source: m.source,
       dir: st.dir || '',
       total,
@@ -100,12 +105,20 @@ class TaskManager extends EventEmitter {
     if (this.running) return
     this.running = true
     try {
+      /* aria2 的 RPC 偶尔会抽风（比如被 changeUri 动过之后会丢端点），
+       * 单条失败不应该让整个列表空掉——所以各自兜底成空数组。 */
       const [active, waiting, stopped] = await Promise.all([
-        aria2.tellActive(),
-        aria2.tellWaiting(0, 200),
-        aria2.tellStopped(0, 100),
+        aria2.tellActive().catch(() => []),
+        aria2.tellWaiting(0, 200).catch(() => []),
+        aria2.tellStopped(0, 100).catch(() => []),
       ])
-      const all = [...active, ...waiting, ...stopped].map((s) => this._normalize(s))
+      let segList = []
+      try {
+        segList = seg.list()
+      } catch {
+        /* ignore */
+      }
+      const all = [...active, ...waiting, ...stopped, ...segList].map((s) => this._normalize(s))
       // 稳定排序：下载中 / 排队 / 暂停 在前，其次按加入时间倒序
       const rank = { active: 0, waiting: 1, paused: 2, error: 3, complete: 4, removed: 5 }
       all.sort((a, b) => {

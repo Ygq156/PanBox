@@ -75,6 +75,8 @@ export interface DownloadTask {
   errorMessage?: string
   connections?: number
   filesize?: number
+  /** 哪个引擎在跑：'aria2' 或 'seg'（自研分段下载器） */
+  engine?: 'aria2' | 'seg'
 }
 
 /**
@@ -123,6 +125,12 @@ export interface Settings {
    * 有启用中的接口但这里为 false 时，设置页不允许保存。
    */
   endpointAck?: boolean
+  /**
+   * 自研分段下载器的连接数（按网盘）。
+   * 夸克/UC 的 CDN 按每条连接发额度，aria2 只能开到 16 条，
+   * 所以这两个网盘改用自研引擎开更多连接。百度不在此列（账号级限速，加连接会 403）。
+   */
+  segConnections?: Record<string, number>
 }
 
 export interface Aria2Status {

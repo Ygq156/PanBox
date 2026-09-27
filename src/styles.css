@@ -650,6 +650,22 @@ input[type='checkbox'] {
   color: #d8c08a;
 }
 
+/* 分段下载连接数（夸克 / UC 专用） */
+.seg-conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 2px;
+}
+
+.seg-conn .meta {
+  white-space: nowrap;
+}
+
+.seg-conn input {
+  width: 84px;
+}
+
 .chip {
   display: inline-flex;
   align-items: center;

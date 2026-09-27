@@ -251,15 +251,31 @@ function makeParser(key) {
     return hit ? hit.fid : '0'
   }
 
-  /** 删除转存进用户网盘的副本 */
+  /** 删除转存进用户网盘的副本。
+   * 会重试：转存刚落盘时立刻删，夸克偶发回非 0（索引还没就绪），
+   * 实测隔几秒再删就成功 —— 「用完就删」这条承诺不能因为一次抖动就断掉。 */
   async function removeFids(fids, cookie) {
     if (!fids || !fids.length) return false
-    const r = await reqJson(api('/1/clouddrive/file/delete'), {
-      method: 'POST',
-      headers: headers(cookie, true),
-      body: JSON.stringify({ action_type: 2, filelist: fids.slice(), exclude_fids: [] }),
-    }).catch(() => null)
-    return !!(r && r.json && r.json.code === 0)
+    let last = null
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const r = await reqJson(api('/1/clouddrive/file/delete'), {
+        method: 'POST',
+        headers: headers(cookie, true),
+        body: JSON.stringify({ action_type: 2, filelist: fids.slice(), exclude_fids: [] }),
+      }).catch(() => null)
+      last = r
+      if (r && r.json && r.json.code === 0) break
+      if (attempt < 3) await new Promise((res) => setTimeout(res, 1200))
+    }
+    if (process.env.PANBOX_DEBUG_DL) {
+      try {
+        require('node:fs').writeFileSync(
+          `${process.env.PANBOX_DEBUG_DL}.${P.netdisk}.delete.json`,
+          JSON.stringify({ fids, response: last }, null, 2),
+        )
+      } catch {}
+    }
+    return !!(last && last.json && last.json.code === 0)
   }
 
   /* 转存进用户网盘的副本 fid，下载完成后由 removeTransferred() 回收 */
@@ -335,23 +351,74 @@ function makeParser(key) {
       if (Number(d.status) === 2 || Number(d.status) === 3) break
     }
 
-    /* ⚠️ 转存响应里的 `save_as_select_top_fids` / `save_as_top_fids`
-     * **不是**可以直接喂给 `file/download` 的 fid —— 实测对它调下载接口会回
-     * `404 {"code":21001,"message":"file not found [38a61b16…]"}`。
-     * 而 `/1/clouddrive/file/sort` 又有索引延迟，转存刚返回时列目录还看不到新文件。
-     * 结论：只能**轮询目录**，等新出现的文件落进列表里。 */
+    /* 转存响应里的 `save_as_top_fids` / `save_as_select_top_fids` 就是**落盘后的 fid**。
+     * 早前踩过的坑：转存刚返回就拿着这个 fid 调 `file/download` 会回
+     * `404 {"code":21001,"message":"file not found [38a61b16…]"}` —— 那不是 fid 错了，
+     * 是索引还没就绪。下面的下载重试循环（10 次 × 900ms）就是为它准备的。
+     * 只有拿不到 fid（比如转存的是目录、条目数对不上）时才退回**轮询目录**：
+     * `/1/clouddrive/file/sort` 索引有延迟，转存刚返回时列目录还看不到新文件。
+     * ⚠️ 曾经只用轮询，结果夸克索引慢于 25×700ms 时直接报「未返回下载直链」，
+     * 而且那份副本因为没被登记而永久留在用户网盘里 —— 这条快路同时修掉了这两个问题。 */
     const taskData = (sj.data && sj.data.task_resp && sj.data.task_resp.data) || {}
     const saveAs = taskData.save_as || {}
+    const hinted = [...(saveAs.save_as_top_fids || []), ...(saveAs.save_as_select_top_fids || [])]
+      .filter(Boolean)
+      .filter((v, i, a) => a.indexOf(v) === i)
 
-    let list = await listAll(toFid, cookie)
-    let freshList = list.filter((x) => !beforeIds.has(x.fid))
-    for (let i = 0; i < 25 && !freshList.length; i++) {
-      await new Promise((r) => setTimeout(r, 700))
-      list = await listAll(toFid, cookie)
-      freshList = list.filter((x) => !beforeIds.has(x.fid))
+    /**
+     * 对一批 fid 取直链。`file/download` 偶尔会先回空（转存刚落盘、索引还没就绪），
+     * 所以每个 fid 都重试；返回 Map<entryFid, url>。
+     */
+    async function downloadByFids(pairs) {
+      const got = new Map()
+      for (const it of pairs) {
+        let dl = null
+        for (let attempt = 0; attempt < 8; attempt++) {
+          dl = await reqJson(api('/1/clouddrive/file/download'), {
+            method: 'POST',
+            headers: headers(cookie, true),
+            body: JSON.stringify({ fids: [it.fid] }),
+          }).catch(() => null)
+          const a = (dl && dl.json && dl.json.data) || []
+          if (a[0] && a[0].download_url) break
+          if (attempt < 7) await new Promise((r) => setTimeout(r, 900))
+        }
+        if (process.env.PANBOX_DEBUG_DL) {
+          try {
+            require('node:fs').writeFileSync(
+              `${process.env.PANBOX_DEBUG_DL}.${P.netdisk}.transfer.json`,
+              JSON.stringify({ hit: { fid: it.fid, file_name: it.entry && it.entry.name }, response: dl }, null, 2),
+            )
+          } catch {}
+        }
+        const arr = (dl && dl.json && dl.json.data) || []
+        if (arr[0] && arr[0].download_url) got.set(it.entry.fid, arr[0].download_url)
+      }
+      return got
     }
 
-    if (process.env.PANBOX_DEBUG_DL) {
+    /** 列目录、按文件名认领 → 返回可直接喂下载的 {entry, fid, ours} 列表 */
+    async function collectByPolling() {
+      let list = await listAll(toFid, cookie)
+      let freshList = list.filter((x) => !beforeIds.has(x.fid))
+      for (let i = 0; i < 25 && !freshList.length; i++) {
+        await new Promise((r) => setTimeout(r, 700))
+        list = await listAll(toFid, cookie)
+        freshList = list.filter((x) => !beforeIds.has(x.fid))
+      }
+      debugDump(list, freshList, false)
+      /* 只把「转存前不存在的新文件」登记为待删；命中的若是用户原有的同名文件则绝不删。 */
+      const out = []
+      for (const e of entries) {
+        const fresh = freshList.find((x) => sameName(x.file_name, e.name))
+        const hit = fresh || list.find((x) => sameName(x.file_name, e.name))
+        if (hit) out.push({ entry: e, fid: hit.fid, ours: !!fresh })
+      }
+      return out
+    }
+
+    function debugDump(list, freshList, usedHint) {
+      if (!process.env.PANBOX_DEBUG_DL) return
       try {
         require('node:fs').writeFileSync(
           `${process.env.PANBOX_DEBUG_DL}.save.json`,
@@ -366,6 +433,9 @@ function makeParser(key) {
               list: list.map((x) => ({ fid: x.fid, name: x.file_name, type: x.file_type })),
               freshCount: freshList.length,
               fresh: freshList.map((x) => ({ fid: x.fid, name: x.file_name, size: x.size })),
+              hinted,
+              searchExit: saveAs.search_exit,
+              usedHint,
               want: entries.map((e) => ({ fid: e.fid, name: e.name })),
             },
             null,
@@ -375,41 +445,47 @@ function makeParser(key) {
       } catch {}
     }
 
-    /* 组装「解析用的 entry → 网盘上的 fid」+「这份是不是我们造的副本」。
-     * 只把「转存前不存在的新文件」登记为待删；命中的若是用户原有的同名文件则绝不删。 */
-    const items = []
-    for (const e of entries) {
-      const fresh = freshList.find((x) => sameName(x.file_name, e.name))
-      const hit = fresh || list.find((x) => sameName(x.file_name, e.name))
-      if (hit) items.push({ entry: e, fid: hit.fid, ours: !!fresh })
+    const map = new Map()
+    let usedHint = false
+    let polled = []
+
+    /* ── 快路：`share/save` 的响应里就带了落盘 fid（`save_as_top_fids`），
+     * 省掉等目录索引的时间（`/file/sort` 是最终一致的，实测能慢到 25×700ms 都看不见新文件）。
+     * ⚠️ 但这个 fid **不能盲信**：实测同一次转存，服务端有时给回一个拿去
+     * `file/download` 就是 `404 code 21001 file not found` 的 fid。
+     * 所以快路也是「试」出来的 —— 拿不到直链就退回轮询，绝不因为快路失败就报错。 */
+    if (hinted.length === entries.length) {
+      usedHint = true
+      const pairs = entries.map((e, i) => ({ entry: e, fid: hinted[i], ours: true }))
+      const got = await downloadByFids(pairs)
+      for (const [k, v] of got) map.set(k, v)
     }
 
-    const map = new Map()
-    for (const it of items) {
-      if (it.ours) transferred.push(it.fid)
-      /* file/download 偶尔会先回空（转存刚落盘、索引还没就绪），重试几次再放弃 */
-      let dl = null
-      for (let attempt = 0; attempt < 5; attempt++) {
-        dl = await reqJson(api('/1/clouddrive/file/download'), {
-          method: 'POST',
-          headers: headers(cookie, true),
-          body: JSON.stringify({ fids: [it.fid] }),
-        }).catch(() => null)
-        const a = (dl && dl.json && dl.json.data) || []
-        if (a[0] && a[0].download_url) break
-        if (attempt < 4) await new Promise((r) => setTimeout(r, 800))
-      }
-      if (process.env.PANBOX_DEBUG_DL) {
-        try {
-          require('node:fs').writeFileSync(
-            `${process.env.PANBOX_DEBUG_DL}.${P.netdisk}.transfer.json`,
-            JSON.stringify({ hit: { fid: it.fid, file_name: it.entry.name }, response: dl }, null, 2),
-          )
-        } catch {}
-      }
-      const arr = (dl && dl.json && dl.json.data) || []
-      if (arr[0] && arr[0].download_url) map.set(it.entry.fid, arr[0].download_url)
+    /* ── 慢路：列目录、按名字认领。快路没拿全时走这里，它同时给出「哪个 fid 是我们造的」的可靠依据。 */
+    if (map.size < entries.length) {
+      polled = await collectByPolling()
+      const todo = polled.filter((it) => !map.has(it.entry.fid))
+      const got = await downloadByFids(todo)
+      for (const [k, v] of got) map.set(k, v)
     }
+    if (!polled.length) debugDump([], [], usedHint)
+
+    /* ── 登记待删。两套依据，都要求「这份副本确实是我们刚造的」：
+     *   ① 轮询结果：转存前不存在同名文件 → ours=true（最可靠）；
+     *   ② 快路：`search_exit === false` = 服务端没找到同名文件、确实新落了一份盘。
+     *      `search_exit === true` 意味着查重命中、根本没有新副本，不需要（也不该）登记。 */
+    if (polled.length) {
+      for (const it of polled) if (it.ours && map.has(it.entry.fid)) transferred.push(it.fid)
+    } else if (usedHint && saveAs.search_exit === false) {
+      entries.forEach((e, i) => {
+        if (map.has(e.fid)) transferred.push(hinted[i])
+      })
+    } else if (usedHint && map.size) {
+      console.warn(
+        `[${P.netdisk}] search_exit=${saveAs.search_exit}，未登记回收（保守：绝不误删用户文件）`,
+      )
+    }
+
     return { map }
   }
 
@@ -528,7 +604,21 @@ function makeParser(key) {
          * 所以：**有凭证就直接转存**，没凭证才试游客直取，且拿到 guest 域名就当失败。 */
         let got
         if (cookie) {
-          got = await dlinkByTransfer(pwdId, stoken, items, cookie)
+          let transferErr = null
+          got = await dlinkByTransfer(pwdId, stoken, items, cookie).catch((e) => {
+            transferErr = e
+            return null
+          })
+          /* 转存这条路也是会坏的：夸克的同名查重索引在副本被删掉之后仍会命中，
+           * 于是 `share/save` 回 `search_exit: true` + 一个**已经不存在**的 fid，
+           * 快路 `file/download` 回 `404 code 21001`，轮询列目录也找不到文件（实测）。
+           * 这时退回「用分享自己的 fid 直接取直链」——带 Cookie 的 CDN 回调会放行
+           * （游客态那条 dl-guest 直链才会被 412 拒）。 */
+          if (!got || !got.map || !got.map.size) {
+            const d = await dlinkDirect(pwdId, stoken, items, cookie).catch(() => null)
+            if (d && d.map && d.map.size) got = d
+            else if (transferErr && !(got && got.map && got.map.size)) throw transferErr
+          }
         } else {
           got = await dlinkDirect(pwdId, stoken, items, cookie).catch((e) => ({ error: -1, message: e.message }))
           if (got.map && got.map.size) {
@@ -543,8 +633,8 @@ function makeParser(key) {
             }
           }
         }
-        if (!got.map || !got.map.size) {
-          got = await dlinkByTransfer(pwdId, stoken, items, cookie)
+        if (!got || !got.map || !got.map.size) {
+          got = await dlinkByTransfer(pwdId, stoken, items, cookie).catch((e) => ({ error: -1, message: e.message }))
         }
         const out = []
         for (const e of items) {

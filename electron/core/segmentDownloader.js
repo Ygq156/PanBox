@@ -1,0 +1,626 @@
+'use strict'
+
+/**
+ * 自研分段下载器 —— 绕开 aria2 的 `--max-connection-per-server` 16 连接硬上限。
+ *
+ * 为什么需要它
+ * ------------
+ * 实测（test/probe-quark-threads2.js、test/probe-thread-scaling.js）：
+ * 夸克 / UC 这类网盘的 CDN 是**按每条 TCP 连接**发额度的 ——
+ *   夸克 ≈ 50 KB/s/连接，UC ≈ 64 KB/s/连接。
+ * 总速度 ≈ 连接数 × 每连接额度，实测线性关系：
+ *   夸克  16 连接 0.82 MB/s → 64 连接 3.30 → 128 连接 6.90 MB/s
+ *   UC    8 连接 0.77 MB/s → 128 连接 3.85 MB/s
+ * 而 aria2 的 `--max-connection-per-server` 最大只能填 16（填 60 直接报错），
+ * 于是经过 aria2 永远被钉在 16 × 额度 ≈ 0.8 MB/s。这个模块就是来解这个天花板的。
+ *
+ * 反面教材（不要对它加连接数）
+ * ----------------------------
+ * 百度：8 连接 0.10 MB/s，32 连接起一律 HTTP 403 —— 它对高并发是**惩罚**而不是分摊，
+ * 所以百度必须走低并发（见 main.js 里的 per-netdisk 默认值）。
+ * 迅雷：并发上去会回 HTTP 503，同样走低并发。
+ *
+ * 设计要点
+ * --------
+ * - 用 `node:http(s)` 而不是 `fetch`：只有自己管 Agent 才能保证「N 个请求 = N 条 TCP
+ *   连接」。全局 fetch（undici）在 HTTP/2 上会把并发请求复用进同一条连接，
+ *   那样连接数就白加了。
+ * - 文件按 `chunkSize` 等分成若干片，工作池里有几个空位就发几个 Range 请求；
+ *   每片下完按绝对偏移写进目标文件。
+ * - 断点续传靠同目录下的 `<文件名>.panbox.json`（记录分片大小与已完成的下标）。
+ * - 状态对象刻意做成 aria2 `tellStatus` 的形状，好让 `taskManager` 无改动地合并两套引擎。
+ * - 并发被服务端拒绝（403/412/429/503）时自动减半重试，最低降到 4 —— 这样即使某天
+ *   某个网盘改了策略，也不会整个任务失败，只是慢一点。
+ */
+
+const { EventEmitter } = require('node:events')
+const fsp = require('node:fs/promises')
+const path = require('node:path')
+const crypto = require('node:crypto')
+const http = require('node:http')
+const https = require('node:https')
+
+const TICK_MS = 500
+const PERSIST_MS = 2000
+const MIN_CHUNK = 128 * 1024
+const MAX_CHUNK = 4 * 1024 * 1024
+/** 单个分片的失败重试次数 */
+const CHUNK_TRIES = 5
+/** 并发被拒时最低降到几条 */
+const MIN_CONN = 4
+/** 探测真实大小时请求的字节数（`Range: bytes=0-0`） */
+const PROBE_BYTES = 1
+/** 「不支持分段下载」这个错误要能被上层认出来，好回退到 aria2 */
+const NO_RANGE = 'NO_RANGE'
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * 裸的 HTTP(S) GET，只暴露「状态码 + 响应头 + 响应流」。
+ * `agent:false` 让每个请求都新开一条 socket —— 这正是我们要的「N 请求 = N 连接」。
+ * 自己跟重定向（最多 5 跳），因为 node:https 不会跟。
+ */
+function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5 } = {}) {
+  return new Promise((resolve, reject) => {
+    let parsed
+    try {
+      parsed = new URL(url)
+    } catch {
+      return reject(new Error('下载地址不是合法 URL'))
+    }
+    const mod = parsed.protocol === 'http:' ? http : https
+    const req = mod.request(
+      parsed,
+      { method: 'GET', headers, agent: false, rejectUnauthorized: false, timeout },
+      (res) => {
+        const code = res.statusCode || 0
+        if (code >= 300 && code < 400 && res.headers.location && redirects > 0) {
+          res.resume()
+          const next = new URL(res.headers.location, url).toString()
+          return openStream(next, { headers, signal, timeout, redirects: redirects - 1 }).then(resolve, reject)
+        }
+        resolve({ status: code, headers: res.headers, stream: res })
+      },
+    )
+    req.on('timeout', () => req.destroy(new Error('连接超时')))
+    req.on('error', reject)
+    if (signal) {
+      if (signal.aborted) {
+        req.destroy(new Error('已取消'))
+        return
+      }
+      signal.addEventListener('abort', () => req.destroy(new Error('已取消')), { once: true })
+    }
+    req.end()
+  })
+}
+
+/** 读一小段响应体（探测用），读完主动断掉 */
+async function readAll(stream, limit = 1 << 20) {
+  const chunks = []
+  let n = 0
+  try {
+    for await (const c of stream) {
+      chunks.push(c)
+      n += c.length
+      if (n >= limit) break
+    }
+  } catch {
+    /* ignore */
+  }
+  stream.destroy()
+  return Buffer.concat(chunks)
+}
+
+/** 把 HTTP 状态码翻译成人话 */
+function httpError(status) {
+  const map = {
+    401: '需要登录（401）',
+    403: '被拒绝（403）——通常是并发太高或直链已过期',
+    404: '文件不存在（404）',
+    412: '被 CDN 拒绝（412）——游客直链或并发过高',
+    416: '分段范围无效（416）',
+    429: '请求太频繁（429）',
+    503: '服务端暂时不可用（503）——通常是并发太高',
+  }
+  return map[status] || `HTTP ${status}`
+}
+
+class SegmentDownloader extends EventEmitter {
+  constructor() {
+    super()
+    /** gid -> task */
+    this.tasks = new Map()
+    this._seq = 0
+    this._timer = null
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 对外：aria2 形状的接口                                               */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 加入下载。**会先探测一次（含 Range 支持与真实大小）再返回**，
+   * 所以不支持分段下载的直链会在这里抛错，调用方可以据此回退到 aria2。
+   */
+  async add(opts) {
+    const {
+      url,
+      headers = {},
+      dir,
+      out,
+      connections = 96,
+      netdisk = 'unknown',
+      source = '',
+      knownSize = 0,
+    } = opts
+    if (!url) throw new Error('缺少下载地址')
+    const gid = 'seg-' + (++this._seq).toString(36) + '-' + crypto.randomBytes(4).toString('hex')
+
+    const filePath = path.join(dir, out)
+    const task = {
+      gid,
+      url,
+      headers: { ...headers },
+      dir,
+      out,
+      filePath,
+      partPath: filePath + '.panbox-part',
+      sidecarPath: filePath + '.panbox.json',
+      netdisk,
+      source,
+      status: 'waiting',
+      errorCode: 0,
+      errorMessage: '',
+      total: Number(knownSize) || 0,
+      completed: 0,
+      liveBytes: 0,
+      chunkSize: 0,
+      chunkCount: 0,
+      done: new Set(),
+      inflight: new Set(),
+      running: new Set(),
+      connWanted: Math.max(1, Math.min(256, Number(connections) || 96)),
+      connLimit: Math.max(1, Math.min(256, Number(connections) || 96)),
+      active: 0,
+      speed: 0,
+      samples: [],
+      fh: null,
+      cursor: 0,
+      _persistAt: 0,
+      createdAt: Date.now(),
+    }
+    this.tasks.set(gid, task)
+    this._ensureTimer()
+
+    try {
+      await this._prepare(task)
+    } catch (e) {
+      this.tasks.delete(gid)
+      await this._close(task)
+      throw e
+    }
+    if (task.status !== 'complete') {
+      task.status = 'active'
+      this._pool(task).catch((e) => this._fail(task, e))
+    }
+    return gid
+  }
+
+  /** aria2 形状：一份列表把 active / waiting / paused / error / complete 全包了 */
+  list() {
+    return [...this.tasks.values()].map((t) => this._status(t))
+  }
+
+  tellStatus(gid) {
+    const t = this.tasks.get(gid)
+    if (!t) throw new Error(`GID ${gid} 不存在`)
+    return this._status(t)
+  }
+
+  has(gid) {
+    return this.tasks.has(gid)
+  }
+
+  async pause(gid) {
+    const t = this.tasks.get(gid)
+    if (!t) throw new Error('任务不存在')
+    if (t.status === 'active' || t.status === 'waiting') {
+      t.status = 'paused'
+      this._settleLive(t)
+      this._abortInflight(t)
+      await this._persist(t, true)
+    }
+    return true
+  }
+
+  async unpause(gid) {
+    const t = this.tasks.get(gid)
+    if (!t) throw new Error('任务不存在')
+    if (t.status === 'paused') {
+      t.status = 'active'
+      t.connLimit = t.connWanted
+      t.speed = 0
+      t.samples = []
+      this._pool(t).catch((e) => this._fail(t, e))
+    }
+    return true
+  }
+
+  async pauseAll() {
+    for (const t of [...this.tasks.values()]) await this.pause(t.gid).catch(() => {})
+    return true
+  }
+
+  async unpauseAll() {
+    for (const t of [...this.tasks.values()]) await this.unpause(t.gid).catch(() => {})
+    return true
+  }
+
+  /** 彻底移除（连同未下完的分片文件与断点信息） */
+  async remove(gid) {
+    const t = this.tasks.get(gid)
+    if (!t) return false
+    t.status = 'removed'
+    this._abortInflight(t)
+    this.tasks.delete(gid)
+    await this._close(t)
+    await fsp.rm(t.partPath, { force: true }).catch(() => {})
+    await fsp.rm(t.sidecarPath, { force: true }).catch(() => {})
+    return true
+  }
+
+  /** 应用退出时把断点信息落盘，下次启动可以续传 */
+  async flush() {
+    for (const t of [...this.tasks.values()]) {
+      if (t.status === 'active' || t.status === 'waiting') {
+        t.status = 'paused'
+        this._settleLive(t)
+        this._abortInflight(t)
+      }
+      await this._persist(t, true).catch(() => {})
+      await this._close(t)
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 状态包装                                                             */
+  /* ------------------------------------------------------------------ */
+
+  _progress(t) {
+    return Math.min(t.total || 0, t.completed + t.liveBytes)
+  }
+
+  _status(t) {
+    return {
+      gid: t.gid,
+      status: t.status,
+      totalLength: String(t.total || 0),
+      completedLength: String(this._progress(t)),
+      downloadSpeed: String(Math.round(t.speed || 0)),
+      connections: String(t.active || 0),
+      filesize: String(t.total || 0),
+      errorCode: t.errorCode ? String(t.errorCode) : '0',
+      errorMessage: t.errorMessage || '',
+      dir: t.dir,
+      files: [
+        {
+          path: t.filePath,
+          length: String(t.total || 0),
+          completedLength: String(this._progress(t)),
+        },
+      ],
+    }
+  }
+
+  _ensureTimer() {
+    if (this._timer) return
+    this._timer = setInterval(() => this._tick(), TICK_MS)
+    if (this._timer.unref) this._timer.unref()
+  }
+
+  _tick() {
+    const now = Date.now()
+    for (const t of [...this.tasks.values()]) {
+      if (t.fh && (t.status === 'active' || t.status === 'waiting')) this._persist(t).catch(() => {})
+      if (t.status !== 'active' && t.status !== 'waiting') continue
+      t.active = t.running.size
+      t.samples.push({ t: now, n: this._progress(t) })
+      while (t.samples.length > 2 && now - t.samples[0].t > 5000) t.samples.shift()
+      const a = t.samples[0]
+      const b = t.samples[t.samples.length - 1]
+      const dt = (b.t - a.t) / 1000
+      if (dt > 0.4) t.speed = Math.max(0, (b.n - a.n) / dt)
+    }
+  }
+
+  /** 把「在飞分片已写入的字节」并进 completed（暂停/结束时调用，避免重复计数） */
+  _settleLive(t) {
+    t.liveBytes = 0
+  }
+
+  _abortInflight(t) {
+    for (const ac of t.running) {
+      try {
+        ac.abort()
+      } catch {
+        /* ignore */
+      }
+    }
+    t.running.clear()
+    t.inflight.clear()
+    t.active = 0
+  }
+
+  async _close(t) {
+    if (t.fh) {
+      const fh = t.fh
+      t.fh = null
+      await fh.close().catch(() => {})
+    }
+  }
+
+  async _fail(t, e) {
+    if (t.status === 'removed') return
+    t.status = 'error'
+    t.errorMessage = (e && e.message) || String(e)
+    t.errorCode = t.errorCode || 1
+    t.speed = 0
+    this._abortInflight(t)
+    await this._persist(t, true).catch(() => {})
+    await this._close(t)
+  }
+
+  async _persist(t, force = false) {
+    if (!t.chunkCount) return
+    const now = Date.now()
+    if (!force && now - t._persistAt < PERSIST_MS) return
+    t._persistAt = now
+    const body = {
+      v: 1,
+      url: t.url,
+      total: t.total,
+      chunkSize: t.chunkSize,
+      chunkCount: t.chunkCount,
+      out: t.out,
+      done: [...t.done],
+    }
+    await fsp.writeFile(t.sidecarPath, JSON.stringify(body), 'utf8').catch(() => {})
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 主流程                                                               */
+  /* ------------------------------------------------------------------ */
+
+  /** 探测大小、决定分片、打开（或恢复）分片文件 */
+  async _prepare(t) {
+    await fsp.mkdir(t.dir, { recursive: true }).catch(() => {})
+
+    /* 目标文件已经完整存在 → 直接算完成 */
+    try {
+      const st = await fsp.stat(t.filePath)
+      if (st.isFile() && st.size > 0 && (!t.total || st.size === t.total)) {
+        t.total = t.total || st.size
+        t.completed = st.size
+        t.status = 'complete'
+        return
+      }
+    } catch {
+      /* 不存在，正常 */
+    }
+
+    const ac = new AbortController()
+    let total = Number(t.total) || 0
+    let acceptRanges = false
+    try {
+      const res = await openStream(t.url, {
+        headers: { ...t.headers, Range: `bytes=0-${PROBE_BYTES - 1}` },
+        signal: ac.signal,
+        timeout: 30000,
+      })
+      const cr = String(res.headers['content-range'] || '')
+      const m = /\/(\d+)\s*$/.exec(cr)
+      if (res.status === 206 && m) {
+        total = Number(m[1])
+        acceptRanges = true
+      } else if (res.status === 200) {
+        const cl = Number(res.headers['content-length'] || 0)
+        if (cl) total = cl
+        acceptRanges = false
+      }
+      const status = res.status
+      await readAll(res.stream, 2048)
+      if (status >= 400) throw new Error(httpError(status))
+    } catch (e) {
+      const err = new Error('探测文件大小失败：' + ((e && e.message) || e))
+      err.code = 'PROBE_FAILED'
+      throw err
+    }
+
+    if (!total) throw new Error('服务端没有返回文件大小，无法分段下载')
+
+    if (!acceptRanges) {
+      const err = new Error(
+        '这个直链不支持分段下载（服务端不认 Range），已回退到 aria2',
+      )
+      err.code = NO_RANGE
+      throw err
+    }
+
+    /* 断点续传：读回上次的分片信息（分片大小与地址都必须一致才认） */
+    const done = new Set()
+    let chunkSize = 0
+    try {
+      const sc = JSON.parse(await fsp.readFile(t.sidecarPath, 'utf8'))
+      if (sc && sc.v === 1 && Number(sc.total) === total && sc.url === t.url) {
+        chunkSize = Number(sc.chunkSize) || 0
+        for (const i of sc.done || []) if (i >= 0 && i < Number(sc.chunkCount)) done.add(Number(i))
+      }
+    } catch {
+      /* 没有断点信息，从头来 */
+    }
+
+    if (!chunkSize) {
+      /* 分片大小随并发走：片数至少是连接数的 2 倍，工作池才喂得饱 */
+      const want = Math.floor(total / Math.max(1, t.connWanted * 2))
+      chunkSize = Math.max(MIN_CHUNK, Math.min(MAX_CHUNK, Math.floor(want / 65536) * 65536 || MIN_CHUNK))
+    }
+    const chunkCount = Math.max(1, Math.ceil(total / chunkSize))
+
+    t.total = total
+    t.chunkSize = chunkSize
+    t.chunkCount = chunkCount
+    t.done = done
+    t.completed = 0
+    t.liveBytes = 0
+    for (const i of done) t.completed += this._chunkLen(t, i)
+
+    t.fh = await fsp.open(t.partPath, 'r+').catch(() => fsp.open(t.partPath, 'w+'))
+    try {
+      const st = await t.fh.stat()
+      if (st.size !== total) await t.fh.truncate(total)
+    } catch {
+      /* ignore */
+    }
+  }
+
+  _chunkLen(t, i) {
+    const start = i * t.chunkSize
+    return Math.min(t.chunkSize, t.total - start)
+  }
+
+  /** 工作池：保持 connLimit 个在飞的 Range 请求，直到所有分片下完 */
+  async _pool(t) {
+    const workers = []
+    for (let k = 0; k < t.connLimit; k++) workers.push(this._worker(t, k))
+    const results = await Promise.allSettled(workers)
+    if (t.status !== 'active') return
+    const bad = results.find((r) => r.status === 'rejected')
+    if (bad) {
+      await this._fail(t, bad.reason)
+      return
+    }
+    if (t.done.size >= t.chunkCount) await this._finish(t)
+    else await this._fail(t, new Error('还有分片没下完，但工作池已退出'))
+  }
+
+  async _worker(t, k) {
+    while (t.status === 'active' && k < t.connLimit) {
+      const idx = this._nextChunk(t)
+      if (idx < 0) return
+      let written = 0
+      try {
+        written = await this._fetchChunk(t, idx)
+        this._commitChunk(t, idx, written)
+        t.errorCode = 0
+        t.errorMessage = ''
+      } catch (e) {
+        t.inflight.delete(idx)
+        t.liveBytes = Math.max(0, t.liveBytes - written)
+        if (t.status !== 'active') return // pause / remove，安静退出
+        const msg = (e && e.message) || String(e)
+        /* 并发被服务端拒绝 → 减半重试。百度/迅雷这类「并发惩罚」靠这一步兜住，
+         * 不至于因为连接数配高了就整个任务失败。 */
+        if (/\b(403|412|429|503)\b/.test(msg) && t.connLimit > MIN_CONN) {
+          t.connLimit = Math.max(MIN_CONN, Math.floor(t.connLimit / 2))
+          t.errorMessage = `${msg}，已把并发降到 ${t.connLimit} 重试`
+          await sleep(500)
+          continue
+        }
+        throw new Error(`分片 ${idx} 失败：${msg}`)
+      }
+    }
+  }
+
+  /** 一片下完：计入进度、写断点 */
+  _commitChunk(t, idx, written) {
+    t.inflight.delete(idx)
+    t.liveBytes = Math.max(0, t.liveBytes - written)
+    t.done.add(idx)
+    t.completed += this._chunkLen(t, idx)
+    this._persist(t).catch(() => {})
+  }
+
+  /** 取下一个待下分片（轮转扫描，避免所有 worker 都从 0 开始抢） */
+  _nextChunk(t) {
+    const n = t.chunkCount
+    for (let k = 0; k < n; k++) {
+      const i = (t.cursor + k) % n
+      if (!t.done.has(i) && !t.inflight.has(i)) {
+        t.inflight.add(i)
+        t.cursor = (i + 1) % n
+        return i
+      }
+    }
+    return -1
+  }
+
+  /** 下好一片，返回实际写入的字节数 */
+  async _fetchChunk(t, idx) {
+    const start = idx * t.chunkSize
+    const end = Math.min(t.total - 1, start + t.chunkSize - 1)
+    const need = end - start + 1
+    let lastErr = null
+    for (let attempt = 0; attempt < CHUNK_TRIES; attempt++) {
+      if (t.status !== 'active') throw new Error('已取消')
+      const ac = new AbortController()
+      t.running.add(ac)
+      let written = 0
+      try {
+        const res = await openStream(t.url, {
+          headers: { ...t.headers, Range: `bytes=${start}-${end}` },
+          signal: ac.signal,
+          timeout: 45000,
+        })
+        if (res.status >= 400) {
+          const body = await readAll(res.stream, 4096)
+          const detail = body.length ? `：${body.toString('utf8').slice(0, 120)}` : ''
+          throw new Error(httpError(res.status) + detail)
+        }
+        if (res.status === 200 && t.chunkCount > 1) {
+          throw new Error('服务端不支持 Range（返回了 200 整文件）')
+        }
+        for await (const buf of res.stream) {
+          if (t.status !== 'active') throw new Error('已取消')
+          if (!buf.length) continue
+          const remain = need - written
+          const chunk = buf.length > remain ? buf.subarray(0, remain) : buf
+          await t.fh.write(chunk, 0, chunk.length, start + written)
+          written += chunk.length
+          t.liveBytes += chunk.length
+          if (written >= need) break
+        }
+        res.stream.destroy()
+        if (written < need) throw new Error(`只收到 ${written}/${need} 字节`)
+        return written
+      } catch (e) {
+        lastErr = e
+        if (t.status !== 'active') throw e
+        t.liveBytes = Math.max(0, t.liveBytes - written)
+        await sleep(300 * (attempt + 1))
+      } finally {
+        t.running.delete(ac)
+      }
+    }
+    throw lastErr || new Error('未知错误')
+  }
+
+  async _finish(t) {
+    t.completed = t.total
+    t.liveBytes = 0
+    t.status = 'complete'
+    t.speed = 0
+    await this._close(t)
+    try {
+      await fsp.rm(t.filePath, { force: true })
+      await fsp.rename(t.partPath, t.filePath)
+    } catch (e) {
+      await this._fail(t, new Error('下载完成但改名失败：' + ((e && e.message) || e)))
+      return
+    }
+    await fsp.rm(t.sidecarPath, { force: true }).catch(() => {})
+  }
+}
+
+module.exports = new SegmentDownloader()
+module.exports.NO_RANGE = NO_RANGE

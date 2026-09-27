@@ -6,6 +6,7 @@ const fs = require('node:fs')
 
 const settings = require('./core/settings')
 const aria2 = require('./core/aria2')
+const seg = require('./core/segmentDownloader')
 const tasks = require('./core/taskManager')
 const parsers = require('./parsers')
 const login = require('./core/login')
@@ -14,6 +15,39 @@ const login = require('./core/login')
 const downloadsCleanup = new Map()
 /* 有些网盘的下载需要先把文件「转存」到用户自己的网盘，取完直链再删。 */
 const { cleanupDownloaded } = parsers
+
+/**
+ * 哪些网盘该用自研分段下载器，以及开多少条连接。
+ *
+ * 起因（实测见 test/probe-quark-threads2.js、test/probe-thread-scaling.js）：
+ * 夸克和 UC 的 CDN 是**按每条 TCP 连接**发额度的 ——
+ *   夸克 ≈ 50 KB/s/连接：16 连接 0.82 MB/s → 64 连接 3.30 → 128 连接 6.90
+ *   UC   ≈ 64 KB/s/连接：8 连接 0.77 MB/s → 128 连接 3.85（提速 5 倍）
+ * 而 aria2 的 `--max-connection-per-server` **最大只能填 16**（填 60 直接报错），
+ * 于是经过 aria2 永远被钉在 16 × 额度 ≈ 0.8 MB/s —— 这不是网盘只给 0.8，
+ * 是 aria2 只肯开 16 条连接。
+ *
+ * 所以这两家改走 `core/segmentDownloader.js`（自己管连接，不受 16 限制）。
+ * 其余网盘**没有**这个收益，继续走 aria2：
+ *   百度 1 条和 8 条都是 0.08 MB/s（账号级总量限速），16 条起直接 403；
+ *   迅雷 8 条最好，16 条以上回 503；
+ *   直链/网盘直链在 16 条时已经接近服务端上限（npmmirror 16→3.99、64→4.86 MB/s）。
+ */
+const SEG_CONNECTIONS = { quark: 96, uc: 96 }
+
+/**
+ * 某个网盘该用自研分段引擎开多少连接（0 = 不用这个引擎，继续走 aria2）。
+ * 用户可在设置里覆盖 `settings.segConnections`。约定：
+ * 表里**没有**这个网盘 → 不走分段引擎；表里有且 **> 0** 才走。
+ */
+function segConnectionsFor(cfg, netdisk) {
+  const table = (cfg && cfg.segConnections) || SEG_CONNECTIONS
+  const n = Number(table[netdisk] || 0)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
+}
+
+/** 这几家的 aria2 并发要单独调（默认的 16 会招来 503/403） */
+const ARIA2_SPLIT_OVERRIDE = { baidu: 1, xunlei: 8 }
 
 /**
  * 回收某次下载对应的转存副本（幂等：同一名字只回收一次）。
@@ -41,8 +75,19 @@ async function recycleTransferCopy(name, tag) {
   }
 }
 
-/* 启动诊断日志：打包版是 GUI 子系统程序，stdout 拿不到，只能写文件。 */
-const BOOT_LOG = process.env.PANBOX_BOOT_LOG || path.join(require('node:os').tmpdir(), 'panbox-boot.log')
+/**
+ * 这个任务跑在哪个引擎上（'aria2' 还是 'seg'）。
+ * 暂停/继续/移除都要按它路由 —— 两个引擎的 gid 互不认识，
+ * 把 seg 的 gid 丢给 aria2 只会静默失败（界面上看就是「点了没反应」）。
+ */
+function isSegTask(gid) {
+  const m = tasks.info(gid)
+  if (m && m.engine) return m.engine === 'seg'
+  if (seg.has(gid)) return true
+  return String(gid).startsWith('seg-')
+}
+
+/* 启动诊断日志：打包版是 GUI 子系统程序，stdout 拿不到，只能写文件。 */const BOOT_LOG = process.env.PANBOX_BOOT_LOG || path.join(require('node:os').tmpdir(), 'panbox-boot.log')
 function boot(...a) {
   try {
     fs.appendFileSync(BOOT_LOG, `[${new Date().toISOString()}] ${a.join(' ')}\n`)
@@ -326,27 +371,54 @@ function registerIpc() {
       /* 百度按「账号」维度限速：并发调大只会招致几小时~几天的惩罚性降速。
        * 但如果这条直链是用户自己的「解析接口」给的（别人的会员账号出的链），
        * 那限速档位就不是用户的账号了，再限成单线程等于白配——所以跳过这个限制。 */
-      const isBaidu = netdisk === 'baidu' && !session.some((f) => f.viaEndpoint)
+      const perEndpoint = session.some((x) => x.viaEndpoint)
+      const isBaidu = netdisk === 'baidu' && !perEndpoint
+      /* 不用分段引擎的那几家，aria2 的并发也要按网盘调（默认 16 会招来 503/403） */
+      const split = isBaidu ? 1 : perEndpoint ? cfg.split : ARIA2_SPLIT_OVERRIDE[netdisk] || cfg.split
       const options = {
         dir: subdir,
         out: sanitizeName(f.name),
         continue: 'true',
-        // 百度按「账号」维度限速：并发调大只会招致几小时~几天的惩罚性降速
-        split: String(isBaidu ? 1 : cfg.split),
-        'max-connection-per-server': String(isBaidu ? 1 : cfg.maxConnectionPerServer),
+        split: String(split),
+        'max-connection-per-server': String(split),
         'min-split-size': cfg.minSplitSize,
         'user-agent': cfg.userAgent,
         'check-certificate': 'false',
       }
       const header = buildHeaders(f.headers)
       if (header.length) options.header = header
+      const segConns = perEndpoint ? 0 : segConnectionsFor(cfg, netdisk)
       try {
-        const gid = await aria2.addUri([f.url], options)
+        let gid = ''
+        let engine = 'aria2'
+        if (segConns && f.url) {
+          try {
+            gid = await seg.add({
+              url: f.url,
+              headers: f.headers || {},
+              dir: subdir,
+              out: sanitizeName(f.name),
+              connections: segConns,
+              netdisk,
+              source,
+            })
+            engine = 'seg'
+          } catch (e) {
+            /* 不支持 Range（老服务器）、或者探测失败 → 回退 aria2，别让任务加不进来 */
+            boot('seg-fallback', netdisk, f.name, (e && e.message) || String(e))
+            gid = ''
+          }
+        }
+        if (!gid) {
+          gid = await aria2.addUri([f.url], options)
+          engine = 'aria2'
+        }
         tasks.remember(gid, {
           name: f.name,
           netdisk,
           source,
           dir: subdir,
+          engine,
           /* 重新解析直链所需的一切：网盘直链（夸克/UC/百度/迅雷）会过期，
            * 或者节点太慢时，可以「换直链」重新取一条。 */
           origin: {
@@ -355,6 +427,7 @@ function registerIpc() {
             title: shareTitle,
             name: f.name,
             dir: f.dir || '',
+            engine,
             opts: { ...options },
           },
         })
@@ -371,8 +444,12 @@ function registerIpc() {
   })
 
   ipcMain.handle('downloads:list', () => tasks.list())
-  ipcMain.handle('downloads:pause', (_e, gid) => aria2.pause(gid).then(() => true).catch(() => false))
-  ipcMain.handle('downloads:resume', (_e, gid) => aria2.unpause(gid).then(() => true).catch(() => false))
+  ipcMain.handle('downloads:pause', (_e, gid) =>
+    (isSegTask(gid) ? seg.pause(gid) : aria2.pause(gid)).then(() => true).catch(() => false),
+  )
+  ipcMain.handle('downloads:resume', (_e, gid) =>
+    (isSegTask(gid) ? seg.unpause(gid) : aria2.unpause(gid)).then(() => true).catch(() => false),
+  )
 
   /* 「换直链」：重新解析同一条分享、拿一条新的下载地址替换掉当前任务的地址。
    * 直链过期、或者某次分到的 CDN 节点太慢时用得上（也相当于迅雷客户端那套
@@ -411,7 +488,14 @@ function registerIpc() {
     try {
       st = await aria2.tellStatus(gid)
     } catch {
-      /* 任务可能已经被删了，照样走重新加入的路径 */
+      /* 任务可能已经被删了，或者本来就在分段引擎上，照样走重新加入的路径 */
+    }
+    if (!st) {
+      try {
+        st = seg.tellStatus(gid)
+      } catch {
+        /* ignore */
+      }
     }
     const live = st && (st.status === 'active' || st.status === 'paused' || st.status === 'waiting')
     try {
@@ -420,14 +504,48 @@ function registerIpc() {
        * `changeUri` 之后，aria2 进程会失联——紧接着所有 RPC 都报 `TypeError: fetch failed`，
        * 任务进度停在原地。所以统一改成「先移除、再用新地址重新加入」：
        * `.aria2` 控制文件还在，`--continue=true` 会让它从断点续传，不会白下。 */
-      await aria2.remove(gid).catch(() => {})
+      if (isSegTask(gid)) {
+        await seg.remove(gid).catch(() => {})
+      } else {
+        await aria2.remove(gid).catch(() => {})
+        /* 同样要把旧 gid 的结果从停止列表里清掉，否则旧任务会以「已停止」的形态赖在界面上 */
+        await aria2.removeDownloadResult(gid).catch(() => {})
+      }
       tasks.forget(gid)
       downloadsCleanup.delete(String(o.name))
-      const ngid = await aria2.addUri([fresh.url], opts)
-      tasks.remember(ngid, { name: o.name, netdisk: o.netdisk, source: o.source, dir: opts.dir, origin: o })
+      let ngid = ''
+      let nengine = 'aria2'
+      if (o.engine === 'seg') {
+        try {
+          ngid = await seg.add({
+            url: fresh.url,
+            headers: fresh.headers || {},
+            dir: opts.dir,
+            out: sanitizeName(o.name),
+            connections: segConnectionsFor(settings.load(), o.netdisk) || 96,
+            netdisk: o.netdisk,
+            source: o.source,
+          })
+          nengine = 'seg'
+        } catch (e) {
+          boot('seg-fallback', 'refresh', o.name, (e && e.message) || String(e))
+        }
+      }
+      if (!ngid) {
+        ngid = await aria2.addUri([fresh.url], opts)
+        nengine = 'aria2'
+      }
+      tasks.remember(ngid, {
+        name: o.name,
+        netdisk: o.netdisk,
+        source: o.source,
+        dir: opts.dir,
+        engine: nengine,
+        origin: { ...o, engine: nengine },
+      })
       if (newSession) downloadsCleanup.set(String(o.name), newSession)
       await tasks._tick().catch(() => {})
-      boot('refresh', o.name, `re-add ok gid=${ngid} was=${st ? st.status : 'gone'} live=${!!live}`)
+      boot('refresh', o.name, `re-add ok gid=${ngid} engine=${nengine} was=${st ? st.status : 'gone'} live=${!!live}`)
       return { ok: true, gid: ngid, message: '已用新的下载地址重新加入队列（会从断点接着下）' }
     } catch (e) {
       boot('refresh-err', (e && e.stack) || String(e))
@@ -438,13 +556,52 @@ function registerIpc() {
     /* ⚠️ 必须**先**取名字再 forget：否则中途撤销任务时，那份转到用户网盘里的副本
      * 就再也没人认领，会永久留在 `/PanBox` 里。 */
     const meta = tasks.info(gid)
-    const r = await aria2.remove(gid).then(() => true).catch(() => false)
+    const onSeg = isSegTask(gid)
+
+    /* ① 还在下载/排队中的任务：先停掉（forceRemove 对已停止的任务会报错，所以吞掉） */
+    let stopped = false
+    let purged = false
+    if (onSeg) {
+      /* 分段引擎：remove 本身就会停掉在飞请求、关掉文件、清掉分片与断点 */
+      stopped = await seg.remove(gid).catch(() => false)
+      purged = stopped
+    } else {
+      try {
+        await aria2.remove(gid)
+        stopped = true
+      } catch {
+        /* 任务早就不在活动列表里了（已完成/已失败/已停止），正常情况 */
+      }
+
+      /* ② 关键一步：把结果从 aria2 的停止列表里清掉。
+       * 不做这一步的话，taskManager 每 800ms 的 tellStopped 会把它原样读回来，
+       * 界面上那个任务根本不会消失 —— 这就是「点了移除毫无反应」的根因。
+       * 刚停掉的任务结果不一定立刻可清，所以重试几次。 */
+      for (let i = 0; i < 4 && !purged; i++) {
+        try {
+          await aria2.removeDownloadResult(gid)
+          purged = true
+        } catch {
+          await new Promise((r) => setTimeout(r, 250))
+        }
+      }
+    }
+
     tasks.forget(gid)
     if (meta && meta.name) await recycleTransferCopy(meta.name, 'remove').catch(() => {})
-    return r
+    /* 立刻推一次，别让用户等下一个 800ms 轮询 */
+    await tasks._tick().catch(() => {})
+    boot('remove', gid, `stopped=${stopped} purged=${purged} name=${(meta && meta.name) || ''}`)
+
+    /* 只要 aria2 的结果清掉了就算成功；停不掉也没关系（本来就已停止） */
+    return purged || stopped
   })
-  ipcMain.handle('downloads:pauseAll', () => aria2.pauseAll().then(() => true).catch(() => false))
-  ipcMain.handle('downloads:resumeAll', () => aria2.unpauseAll().then(() => true).catch(() => false))
+  ipcMain.handle('downloads:pauseAll', () =>
+    Promise.all([aria2.pauseAll().catch(() => {}), seg.pauseAll().catch(() => {})]).then(() => true),
+  )
+  ipcMain.handle('downloads:resumeAll', () =>
+    Promise.all([aria2.unpauseAll().catch(() => {}), seg.unpauseAll().catch(() => {})]).then(() => true),
+  )
 }
 
 /* ------------------------------------------------------------------ */
@@ -534,6 +691,8 @@ if (!gotLock) {
       }
     }
     tasks.stop()
+    /* 分段引擎要把断点信息落盘、关掉文件句柄，下次启动才能接着下 */
+    await seg.flush().catch(() => {})
     await aria2.stop()
   })
 }

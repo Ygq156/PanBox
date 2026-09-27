@@ -21,6 +21,9 @@ const NETDISK_LABEL: Record<string, string> = {
 
 const LOGIN_TARGETS = ['baidu', 'quark', 'uc', 'xunlei']
 
+/** 走自研分段引擎的网盘（按连接数发额度的那些）。百度不在此列：它是账号级总量限速。 */
+const SEG_TARGETS = ['quark', 'uc']
+
 /** 「解析接口」可以勾选的网盘（顶层域名会被自动识别成这些代号） */
 const EP_NETDISKS = ['lanzou', 'ilanzou', 'quark', 'uc', 'baidu', 'xunlei', '123pan', 'direct']
 
@@ -285,6 +288,34 @@ function SettingsModal({
             <div className="field">
               <label>最小分片大小</label>
               <input type="text" value={s.minSplitSize} onChange={(e) => patch({ minSplitSize: e.target.value })} />
+            </div>
+          </div>
+
+          <div className="field">
+            <label>分段下载连接数（夸克 / UC 专用，绕开 aria2 的 16 连接上限）</label>
+            <div className="ep-netdisks">
+              {SEG_TARGETS.map((k) => (
+                <span key={k} className="seg-conn">
+                  <span className="meta">{NETDISK_LABEL[k] ?? k}</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={256}
+                    value={s.segConnections?.[k] ?? 0}
+                    onChange={(e) =>
+                      patch({
+                        segConnections: { ...(s.segConnections || {}), [k]: Number(e.target.value) || 0 },
+                      })
+                    }
+                  />
+                </span>
+              ))}
+            </div>
+            <div className="hint">
+              夸克 / UC 的 CDN 是<strong>按每条 TCP 连接</strong>发额度的（实测夸克 ≈50KB/s、UC ≈64KB/s 一条），
+              而 aria2 的「每服务器最大连接数」最多只能填 16 —— 于是速度被钉在 ~0.8 MB/s。
+              这两个网盘改由 PanBox 自带的分段引擎下载，连接数由这里决定（默认 96）。填 0 = 退回 aria2。
+              百度是账号级总量限速，加连接只会招来 403，所以不在此列。
             </div>
           </div>
 
@@ -778,6 +809,7 @@ export default function App() {
                       </div>
                       <div className="tsub">
                         {NETDISK_LABEL[t.netdisk] ?? t.netdisk}
+                        {t.engine === 'seg' ? ' · 分段引擎' : ''}
                         {t.connections ? ` · ${t.connections} 连接` : ''}
                         {t.errorMessage ? ` · ${t.errorMessage}` : ''}
                       </div>
@@ -845,7 +877,21 @@ export default function App() {
                           {refreshing === t.gid ? '…' : '⟳'}
                         </button>
                       )}
-                      <button className="ghost tiny" title="移除" onClick={() => api.removeTask(t.gid)}>
+                      <button
+                        className="ghost tiny"
+                        title="移除（下到一半的会立刻回收转存副本）"
+                        onClick={async () => {
+                          /* 必须等 IPC 回来再刷新：移除要先把结果从引擎的停止列表里清掉，
+                           * 否则下一次 800ms 轮询会把它原样读回来，看起来像「点了没反应」。 */
+                          try {
+                            await api.removeTask(t.gid)
+                            const list = await api.listDownloads()
+                            setTasks(list || [])
+                          } catch (e) {
+                            setHint({ kind: 'err', msg: `移除失败：${String((e as Error)?.message || e)}` })
+                          }
+                        }}
+                      >
                         ✕
                       </button>
                     </div>
