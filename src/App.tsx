@@ -269,6 +269,12 @@ function ResultPanel({
           迅雷云盘的分享可以匿名浏览（文件名和体积都能读到），但转存和取直链必须登录。点「开始下载」后会提示你去登录。
         </div>
       )}
+      {result.netdisk === 'xunlei' && !needsLogin && (
+        <div className="result-note">
+          下载走「转存到你自己的迅雷云盘 → 取直链 → aria2 多线程」，实测 8 连接约 1.1–1.6 MB/s（比夸克/UC 快）。
+          下载完成后程序会自动删掉转存进来的副本，不会在你的网盘里留垃圾。
+        </div>
+      )}
       {result.netdisk === 'baidu' && (
         <div className="result-note warn">
           百度网盘按「账号」维度限速：本程序已对该任务强制单线程（split=1）。调大线程只会招致几小时到几天的惩罚性降速。

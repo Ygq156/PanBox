@@ -30,7 +30,7 @@
 | **UC 网盘**（drive.uc.cn） | ✅ | ✅ 实测通过 | **需要** | **0.82 MB/s**（25 MB 文件 42 秒，字节数完全一致） |
 | **123 云盘**（123pan.com） | ✅ | ✅ | 不需要 | 真不限速，但受**分享者**每月 10 GB 提取配额限制 |
 | **百度网盘**（pan.baidu.com） | ✅ 实测通过（含目录递归） | ⚠️ 取直链未验证 | **下载需要**（BDUSS），解析不需要 | 免费账号约 100–170 KB/s，已强制单线程 |
-| **迅雷云盘**（pan.xunlei.com） | ✅ 实测通过（含目录递归） | ⚠️ 取直链未验证 | **下载需要**（账号 token），解析不需要 | — |
+| **迅雷云盘**（pan.xunlei.com） | ✅ 实测通过（含目录递归） | ✅ 实测通过 | **需要**（账号 token），解析不需要 | **1.08 MB/s 平均、1.23 MB/s 峰值**（395 MB 文件，8 连接） |
 | **直链**（任意 HTTP/HTTPS 文件地址） | ✅ | ✅ 实测通过 | 不需要 | 取决于源站（实测 3.22 MB/s） |
 | 天翼 / 移动云盘 | ⬜ 未实现 | ⬜ | — | — |
 
@@ -39,7 +39,7 @@
 - **夸克**：CDN（`dl-*-zb.drive.quark.cn`）校验一个叫 `__puus` 的 cookie，而它是**网页 JS 动态生成的、登录时抓不到**。本程序在每次解析前会先在后台静默打开一次网盘首页，把这个令牌"暖"回来（实测约 2 秒），然后走「转存到你的网盘 → 取直链 → 下载 → **自动删除转存副本**」。
 - **UC**：CDN 会把你的 Referer/Cookie/IP 拿去做回调鉴权（`auth-cdn.uc.cn/outer/oss/checkplay`），游客态一律回 `403 RequestDeniedByCallback: require login [auth not found]`。
 - **百度**：官方接口的 dlink **必须**带 `User-Agent: pan.baidu.com`，且**按账号维度限速**——本程序对该任务强制 `split=1`、`max-connection-per-server=1`，因为并发调大只会招致几小时到几天的**惩罚性降速**。
-- **迅雷**：分享可以完全匿名浏览（文件名、体积、目录都能读到），但**转存和取直链的接口一律回 401**，必须用你自己的账号。凭证在浏览器 localStorage 里（不是 cookie），所以登录窗口走的是读 localStorage 的通道。
+- **迅雷**：分享可以完全匿名浏览（文件名、体积、目录都能读到），但**转存和取直链的接口一律回 401**，必须用你自己的账号。凭证在浏览器 localStorage 里（不是 cookie），所以登录窗口走的是读 localStorage 的通道。取直链的 `client_id` 也必须跟网页版一致（`Xqp0kJBXWhwaTpB6`），安卓 App 的 `captcha_sign` 配上网页 `client_id` 会被服务端判 `invalid captcha_sign`。下载时直链**只认安卓 Dalvik UA**，用浏览器 UA 会在十几秒后回 `503`。
 
 ### 怎么登录
 
@@ -115,7 +115,7 @@ panbox/
 │     ├─ index.js            会话管理、批量解析、转存回收出口
 │     ├─ lanzou.js / ilanzou.js
 │     ├─ clouddrive.js       夸克 + UC
-│     ├─ pan123.js / baidu.js / direct.js
+│     ├─ pan123.js / baidu.js / xunlei.js / direct.js
 │     ├─ util.js             HTTP/UA/Jar/识别
 │     └─ esa.js              ESA 反爬 acw_sc__v2
 ├─ src/                      渲染层（React + TS）
@@ -195,8 +195,8 @@ Start-Process node_modules\electron\dist\electron.exe `
 
 ## 已知限制
 
-- **夸克/UC/百度必须登录**，游客直链会被 CDN 拒绝（412 / 403）。
+- **夸克/UC/百度/迅雷必须登录**，游客直链会被 CDN 拒绝（412 / 403 / 401）。
 - **123 云盘**的直链受**分享者**的每月提取流量配额限制（免费 10GB/月），配额用完就是"分享方提取流量包不足"，无解。
-- **迅雷云盘 / 天翼 / 移动云盘**尚未实现。
+- **天翼云盘 / 移动云盘**尚未实现。
 - 应用未做代码签名，首次运行会触发 SmartScreen。
 - 不支持（也不打算支持）任何"破解会员""秒传""变速外挂"类功能——技术上对 2026 年的服务端限速模型已失效，且 `PanDownload` 作者 2020 年因《刑法》第 285 条第 3 款被捕。

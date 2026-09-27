@@ -60,8 +60,13 @@ const APP_UA =
   '(KHTML, like Gecko) Version/4.0 Chrome/100.0.4896.58 Mobile Safari/537.36 ' +
   'xunlei/v8.31.0.9726 appid/40'
 
-/** 直链下载只需要这个 UA，不需要 Referer（alist 实证） */
+/** 直链下载只需要这个 UA，不需要 Referer（alist 实证）。换成 Chrome UA 会被回 HTTP 503。 */
 const DL_UA = 'Dalvik/2.1.0 (Linux; U; Android 12; M2004J7AC Build/SP1A.210812.016)'
+
+/** 网盘网页版 client_id（抓包实证；同时也是 localStorage 里 `credentials_<client_id>` 的后缀） */
+const WEB_CLIENT_ID = 'Xqp0kJBXWhwaTpB6'
+const WEB_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
 const SHARE_RE = /pan\.xunlei\.com\/s\/([A-Za-z0-9_-]+)/i
 const PWD_RE = /[?&](?:pwd|password|pass_code)=([A-Za-z0-9]+)/i
@@ -73,8 +78,8 @@ function buildDeviceSign(deviceId) {
   return 'div101.' + deviceId + md5(sha1(deviceId + APP_PACKAGE_NAME + APPID + APP_KEY))
 }
 
-function buildCaptchaSign(deviceId, timestampMs) {
-  let h = APP_CLIENT_ID + APP_CLIENT_VERSION + APP_PACKAGE_NAME + deviceId + String(timestampMs)
+function buildCaptchaSign(deviceId, timestampMs, clientId) {
+  let h = (clientId || APP_CLIENT_ID) + APP_CLIENT_VERSION + APP_PACKAGE_NAME + deviceId + String(timestampMs)
   for (const salt of CAPTCHA_SALTS) h = md5(h + salt)
   return '1.' + h
 }
@@ -85,6 +90,18 @@ const newDeviceId = () => crypto.randomBytes(16).toString('hex')
 /* 凭证                                                                */
 /* ------------------------------------------------------------------ */
 
+/** 解出 JWT 的 payload：access_token 是 JWT，`aud` = 签发它的 client_id，`sub` = user_id */
+function jwtPayload(token) {
+  try {
+    const part = String(token || '').split('.')[1]
+    if (!part) return null
+    const b = part.replace(/-/g, '+').replace(/_/g, '/')
+    return JSON.parse(Buffer.from(b + '='.repeat((4 - (b.length % 4)) % 4), 'base64').toString('utf8'))
+  } catch {
+    return null
+  }
+}
+
 /** 从 settings.cookies.xunlei 解析出凭证；兼容直接粘贴 access_token 的情况 */
 function readCred(raw) {
   const s = String(raw || '').trim()
@@ -93,11 +110,21 @@ function readCred(raw) {
     try {
       const j = JSON.parse(s)
       if (j && j.access_token) {
+        const p = jwtPayload(j.access_token) || {}
         return {
           accessToken: String(j.access_token),
           refreshToken: String(j.refresh_token || ''),
-          userId: String(j.user_id || ''),
+          userId: String(j.user_id || p.sub || ''),
           deviceId: String(j.device_id || j.deviceid || ''),
+          /* ⚠️ access_token 的 aud 就是签发它的 client_id，必须原样回传。
+             实测：网盘网页版登录拿到的凭证 aud = `XpQpkJBXWhaTpB6`，
+             而安卓 App（我们用的这套算法）的 client_id = `Xp6vsxz_7IYVw2BB`；
+             凭证配上错误的 client_id 会被服务端回 `验证码无效（client_id not match）`。 */
+          clientId: String(j.client_id || p.aud || ''),
+          /* 网页版那枚「带 client info」的完整 captcha_token（localStorage 里 `captcha_<client_id>`）。
+           * 空 token 去 init 只能拿到 282 字符的残废 token，服务端会回
+           * `验证码无效（no client info found）`；拿完整 token 去 init 能换回可用的新 token。 */
+          captchaToken: String(j.captcha_token || ''),
         }
       }
     } catch {
@@ -105,7 +132,10 @@ function readCred(raw) {
     }
   }
   // 纯 token 字符串：deviceId 只能临时生成（大概率会被服务端拒绝，但至少给出明确报错）
-  if (/^[A-Za-z0-9._-]{16,}$/.test(s)) return { accessToken: s, refreshToken: '', userId: '', deviceId: '' }
+  if (/^[A-Za-z0-9._-]{16,}$/.test(s)) {
+    const p = jwtPayload(s) || {}
+    return { accessToken: s, refreshToken: '', userId: String(p.sub || ''), deviceId: '', clientId: String(p.aud || '') }
+  }
   return null
 }
 
@@ -113,12 +143,26 @@ function readCred(raw) {
 /* 请求管道                                                            */
 /* ------------------------------------------------------------------ */
 
-function baseHeaders(deviceId, cred) {
+function baseHeaders(scheme, deviceId, cred, clientId) {
+  if (scheme === 'web') {
+    /* 网页版方案：桌面 Chrome UA + 网页版 client_id + 浏览器实际用的 device_id。
+     * 抓包实证：网页版就是这么发的（Bearer + x-device-id + x-client-id + x-captcha-token）。 */
+    const h = {
+      'User-Agent': WEB_UA,
+      Accept: 'application/json, text/plain, */*',
+      'X-Device-Id': deviceId,
+      'X-Client-Id': clientId || WEB_CLIENT_ID,
+      Origin: 'https://pan.xunlei.com',
+      Referer: 'https://pan.xunlei.com/',
+    }
+    if (cred && cred.accessToken) h.Authorization = 'Bearer ' + cred.accessToken
+    return h
+  }
   const h = {
     'User-Agent': APP_UA,
     Accept: 'application/json;charset=UTF-8',
     'X-Device-Id': deviceId,
-    'X-Client-Id': APP_CLIENT_ID,
+    'X-Client-Id': clientId || APP_CLIENT_ID,
     'X-Client-Version': APP_CLIENT_VERSION,
     Origin: 'https://pan.xunlei.com',
     Referer: 'https://pan.xunlei.com/',
@@ -127,8 +171,38 @@ function baseHeaders(deviceId, cred) {
   return h
 }
 
-/** captcha_token 与 action 绑定，所以每个动作都现取一个 */
-async function fetchCaptcha(deviceId, action, userId) {
+/**
+ * 取 captcha_token。两种方案差别很大（都是真服务器实测）：
+ *   - `app`（安卓 App，匿名）：必须带 meta + 10 盐 captcha_sign，否则 400 invalid captcha_sign
+ *   - `web`（网盘网页版，需登录）：**极简 body、不要 captcha_sign**，Content-Type 还得是 text/plain
+ *     （带上 sign 反而 400 invalid captcha_sign —— 这是「登录后迅雷反而下不动」的根因）
+ */
+async function fetchCaptcha(deviceId, action, userId, clientId, scheme, seed) {
+  if (scheme === 'web') {
+    const r = await reqJson(`${AUTH_BASE}/v1/shield/captcha/init`, {
+      method: 'POST',
+      headers: {
+        'User-Agent': WEB_UA,
+        Accept: 'application/json, text/plain, */*',
+        'Content-Type': 'text/plain;charset=UTF-8',
+        Origin: 'https://pan.xunlei.com',
+        Referer: 'https://pan.xunlei.com/',
+      },
+      body: JSON.stringify({
+        client_id: clientId || WEB_CLIENT_ID,
+        action,
+        device_id: deviceId,
+        // 用已有完整 token 做种子 → 换回一枚可用的新 token；空种子只能拿到残废 token
+        captcha_token: seed || '',
+      }),
+      timeout: 25000,
+    })
+    const j = r.json || {}
+    if (!j.captcha_token) throw new Error(`迅雷 captcha 初始化失败：${r.text.slice(0, 120)}`)
+    return j.captcha_token
+  }
+
+  const cid = clientId || APP_CLIENT_ID
   const ts = Date.now()
   const r = await reqJson(`${AUTH_BASE}/v1/shield/captcha/init`, {
     method: 'POST',
@@ -136,12 +210,12 @@ async function fetchCaptcha(deviceId, action, userId) {
       'User-Agent': APP_UA,
       Accept: 'application/json;charset=UTF-8',
       'Content-Type': 'application/json',
-      'X-Client-Id': APP_CLIENT_ID,
+      'X-Client-Id': cid,
       'X-Device-Id': deviceId,
       'X-Client-Version': APP_CLIENT_VERSION,
     },
     body: JSON.stringify({
-      client_id: APP_CLIENT_ID,
+      client_id: cid,
       action,
       device_id: deviceId,
       redirect_uri: 'xlaccsdk01://xunlei.com/callback?state=harbor',
@@ -149,7 +223,7 @@ async function fetchCaptcha(deviceId, action, userId) {
         client_version: APP_CLIENT_VERSION,
         package_name: APP_PACKAGE_NAME,
         timestamp: String(ts),
-        captcha_sign: buildCaptchaSign(deviceId, ts),
+        captcha_sign: buildCaptchaSign(deviceId, ts, cid),
         user_id: String(userId || ''),
       },
       captcha_token: '',
@@ -165,11 +239,22 @@ async function fetchCaptcha(deviceId, action, userId) {
  * 带 captcha 的 pan 调用。响应统一从 `data` 取（无 data 则用根对象）；
  * `captcha_invalid` 时重取一次 captcha 再试。
  */
-async function panCall({ path, method = 'GET', action, deviceId, cred, body, timeout = 30000 }) {
+async function panCall({ path, method = 'GET', action, deviceId, cred, clientId, scheme, body, timeout = 30000 }) {
+  const sch = scheme || (cred && cred.accessToken ? 'web' : 'app')
+  const cid = clientId || (cred && cred.clientId) || (sch === 'web' ? WEB_CLIENT_ID : APP_CLIENT_ID)
   let last = null
   for (let attempt = 0; attempt < 2; attempt++) {
-    const token = await fetchCaptcha(deviceId, action || `${method}:${path.split('?')[0]}`, cred && cred.userId)
-    const headers = { ...baseHeaders(deviceId, cred), 'X-Captcha-Token': token }
+    const token = await fetchCaptcha(
+      deviceId,
+      action || `${method}:${path.split('?')[0]}`,
+      cred && cred.userId,
+      cid,
+      sch,
+      sch === 'web' ? (cred && cred.captchaToken) || '' : '',
+    )
+    // 换到的新 token 存回凭证，让同一次运行里的后续调用继续自举
+    if (sch === 'web' && cred) cred.captchaToken = token
+    const headers = { ...baseHeaders(sch, deviceId, cred, cid), 'X-Captcha-Token': token }
     if (body) headers['Content-Type'] = 'application/json'
     const r = await reqJson(`${PAN_BASE}${path}`, {
       method,
@@ -183,6 +268,14 @@ async function panCall({ path, method = 'GET', action, deviceId, cred, body, tim
     if (err === 'captcha_invalid' && attempt === 0) {
       await sleep(400)
       continue
+    }
+    if (err === 'captcha_invalid' && sch === 'web') {
+      const e = new Error(
+        '迅雷云盘的登录凭证需要重新验证（captcha 令牌已失效）。' +
+          '请在「设置 → 网盘账号」里重新登录一次迅雷云盘，然后重新解析。',
+      )
+      e.needCookie = true
+      throw e
     }
     if (err === 'unauthenticated') {
       const e = new Error('迅雷云盘需要登录：分享可以匿名浏览，但转存/取直链必须用你自己的账号。')
@@ -222,8 +315,17 @@ async function open(url, ctx = {}) {
   const shareId = m[1]
 
   const cred = readCred(ctx.cookie)
-  // 登录态下必须沿用浏览器里的 device_id（access_token 与设备绑定）；匿名则每次随机
+  /* 两套方案（均由真服务器实测确定，不可混用 —— 混用就是之前
+   * 「登录后反而解析失败（client_id not match / invalid captcha_sign）」的根因）：
+   *   - 无凭证 → `app`：安卓 App 的 client_id + 10 盐 captcha_sign。**能匿名列分享/详情**，
+   *     但转存与取直链一律 401 unauthenticated。
+   *   - 有凭证 → `web`：网盘网页版的 client_id + 极简 captcha body（不要 sign）+ Bearer。
+   *     列分享、转存、取直链全部可用。网页版 client_id **匿名调用会被回
+   *     `验证码无效（no client info found）`**，所以匿名时只能走 app 方案。 */
+  const scheme = cred && cred.accessToken ? 'web' : 'app'
+  // 登录态下必须沿用浏览器里的 device_id（captcha 与设备绑定）；匿名则每次随机
   const deviceId = (cred && cred.deviceId && /^[0-9a-f]{32}$/i.test(cred.deviceId) ? cred.deviceId : '') || newDeviceId()
+  const clientId = scheme === 'web' ? cred.clientId || WEB_CLIENT_ID : APP_CLIENT_ID
 
   const pwd = String(ctx.password || '').trim() || (PWD_RE.exec(u)?.[1] ?? '')
 
@@ -238,6 +340,8 @@ async function open(url, ctx = {}) {
       action: parentId === undefined ? 'GET:/drive/v1/share' : 'GET:/drive/v1/share/detail',
       deviceId,
       cred,
+      clientId,
+      scheme,
     })
 
   const root = await listShare(undefined)
@@ -344,43 +448,64 @@ function makeResolver({ shareId, passToken, flat, cred, deviceId, transferred })
         specify_parent_id: true,
       },
     })
-    const traceIds = deepFind(restored, 'trace_file_ids')
-    if (!traceIds) throw new Error('迅雷转存没有返回 trace_file_ids')
-
-    // ② 转存后需要按名字在根目录里找到新文件（返回的是任务 trace id，不是文件 id）
-    const listFiles = () =>
-      panCall({
-        path: '/drive/v1/files?parent_id=&filters=%7B%22trashed%22%3A%7B%22eq%22%3Afalse%7D%7D&with_audit=true&limit=200' +
-          '&thumbnail_size=SIZE_SMALL&page_token=',
-        action: 'GET:/drive/v1/files',
-        deviceId,
-        cred,
-      })
-
-    const same = (a, b) => {
-      if (a === b) return true
-      const stem = (s) => String(s).replace(/(\.[^.]*)$/, '')
-      const ext = (s) => (/(\.[^.]*)$/.exec(String(s)) || ['', ''])[0]
-      const re = new RegExp('^' + stem(b).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '( \\(\\d+\\))?' + ext(b).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$')
-      return re.test(a)
+    /* 转存会把「分享内的文件 id」映射到「你网盘里的新文件 id」，直接给在
+     * `params.trace_file_ids` 里（一个 JSON **字符串**，如
+     * `{"VNANFk…A1":"VP2XR0nLGTrAlEVfHLVKV7OPA1"}`）。拿到它就不用再轮询根目录了。 */
+    const traceRaw =
+      (restored.params && restored.params.trace_file_ids) || deepFind(restored, 'trace_file_ids')
+    let fid = ''
+    try {
+      const map = typeof traceRaw === 'string' ? JSON.parse(traceRaw) : traceRaw
+      if (map && typeof map === 'object') fid = String(map[e.id] || Object.values(map)[0] || '')
+    } catch {
+      /* 落到下面的轮询兜底 */
     }
+    if (!fid && traceRaw && typeof traceRaw === 'string' && !traceRaw.startsWith('{')) fid = traceRaw
 
-    let hit = null
-    for (let i = 0; i < 20 && !hit; i++) {
-      const page = await listFiles()
-      const arr = Array.isArray(page) ? page : (page.files || [])
-      hit = arr.map(toEntry).find((x) => !x.isDir && same(x.name, e.name))
-      if (!hit) await sleep(600)
+    if (!fid) {
+      // 兜底：按文件名在根目录里轮询找新文件
+      const listFiles = () =>
+        panCall({
+          path:
+            '/drive/v1/files?parent_id=&filters=%7B%22trashed%22%3A%7B%22eq%22%3Afalse%7D%7D&with_audit=true&limit=200' +
+            '&thumbnail_size=SIZE_SMALL&page_token=',
+          action: 'get:/drive/v1/files',
+          deviceId,
+          cred,
+        })
+      const same = (a, b) => {
+        if (a === b) return true
+        const stem = (s) => String(s).replace(/(\.[^.]*)$/, '')
+        const ext = (s) => (/(\.[^.]*)$/.exec(String(s)) || ['', ''])[0]
+        const re = new RegExp(
+          '^' + stem(b).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '( \\(\\d+\\))?' + ext(b).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$',
+        )
+        return re.test(a)
+      }
+      let hit = null
+      for (let i = 0; i < 20 && !hit; i++) {
+        const page = await listFiles()
+        const arr = Array.isArray(page) ? page : page.files || []
+        hit = arr.map(toEntry).find((x) => !x.isDir && same(x.name, e.name))
+        if (!hit) await sleep(600)
+      }
+      if (!hit) {
+        const st = String(restored.restore_status || '')
+        throw new Error(
+          `迅雷转存后没有在网盘里找到该文件（restore_status=${st || '未知'}，可能是账号空间不足）：` +
+            JSON.stringify(restored).slice(0, 200),
+        )
+      }
+      fid = hit.id
     }
-    if (!hit) throw new Error('迅雷转存后没有在网盘里找到该文件（可能是账号空间不足）')
-    transferred.push({ fid: hit.id, deviceId, cred })
+    transferred.push({ fid, deviceId, cred })
 
     // ③ 取直链
     const detail = await panCall({
       path:
-        `/drive/v1/files/${encodeURIComponent(hit.id)}?_magic=2021&usage=PLAY&thumbnail_size=SIZE_LARGE` +
+        `/drive/v1/files/${encodeURIComponent(fid)}?_magic=2021&usage=PLAY&thumbnail_size=SIZE_LARGE` +
         `&with=hdr10&with=subtitle_files&with=task&with=public_share_tag`,
-      action: `GET:/drive/v1/files/${hit.id}`,
+      action: `get:/drive/v1/files/${fid}`,
       deviceId,
       cred,
     })

@@ -230,6 +230,8 @@ module.exports = {
     const title = decodeEntities(String(locals.title || (root.length === 1 ? root[0].name : `百度分享 ${shareId}`)))
 
     const entries = flat
+    /* 转存到用户自己网盘的文件——下载完必须删掉，否则会在用户的网盘里留一堆垃圾 */
+    const transferred = []
     return {
       title,
       shareId,
@@ -276,6 +278,12 @@ module.exports = {
         const rl = (rootList.json && rootList.json.list) || []
         const hit = rl.find((x) => x.server_filename === e.name) || rl[0]
         if (!hit) throw new Error('转存后未能在 /PanBox 里定位到文件')
+        const fsId = String(hit.fs_id)
+        const hitPath = String(hit.path || `/PanBox/${hit.server_filename}`)
+        /* 转存前就存在的同名文件不算我们的（errno 12 分支）——只有新出现的才登记回收 */
+        if (!(transfer.json || {}).errno && !transferred.some((x) => x.fsId === fsId)) {
+          transferred.push({ fsId, path: hitPath, name: String(hit.server_filename || e.name) })
+        }
 
         /* 4) 取 dlink */
         const dl = await reqJson(
@@ -289,8 +297,43 @@ module.exports = {
         return {
           url: dj.dlink[0].dlink,
           headers: { Referer: 'https://pan.baidu.com/', 'User-Agent': BAIDU_UA, Cookie: mergeCookie(cookie, bduss) },
-          _transferred: { fsId: String(hit.fs_id), cookie: mergeCookie(cookie, bduss) },
+          _transferred: { fsId, cookie: mergeCookie(cookie, bduss) },
         }
+      },
+      /* 删掉我们转存到 /PanBox 的副本（下载完成后调用） */
+      removeTransferred: async () => {
+        if (!transferred.length || !bduss) return 0
+        const delH = {
+          ...h,
+          Cookie: mergeCookie(cookie, bduss),
+          Accept: 'application/json, text/plain, */*',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'X-Requested-With': 'XMLHttpRequest',
+        }
+        let n = 0
+        for (const t of transferred.splice(0)) {
+          try {
+            const r = await reqJson(
+              `https://pan.baidu.com/api/filemanager?opera=delete&async=2&onnest=fail&bdstoken=${bdstoken}&${APP_QS}`,
+              {
+                method: 'POST',
+                headers: delH,
+                body: 'filelist=' + encodeURIComponent(JSON.stringify([t.path])),
+              },
+            )
+            const info = (r.json && r.json.info) || []
+            const bad = info.filter((x) => x && x.errno)
+            if ((r.json || {}).errno === 0 && !bad.length) n++
+            else
+              console.error(
+                `[baidu] 删除 /PanBox 副本失败：${t.path} ->`,
+                JSON.stringify(r.json || r.text).slice(0, 200),
+              )
+          } catch (e) {
+            console.error('[baidu] 删除 /PanBox 副本异常：', t.path, e && e.message)
+          }
+        }
+        return n
       },
     }
   },

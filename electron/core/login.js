@@ -62,19 +62,43 @@ const SITES = {
         /* ignore */
       }
       let cred = null
+      let clientId = ''
       for (const [k, v] of Object.entries(store)) {
         if (!/^credentials_/.test(k)) continue
         try {
           const j = JSON.parse(v)
           if (j && j.access_token) {
             cred = j
+            // 键名后缀就是网页版真正使用的 client_id（实测 Xqp0kJBXWhwaTpB6，与 JWT aud 不一定相同）
+            clientId = k.slice('credentials_'.length)
             break
           }
         } catch {
           /* ignore */
         }
       }
-      const deviceId = store.deviceid || store.device_id || (cred && (cred.deviceid || cred.device_id)) || ''
+      if (!clientId && cred) {
+        try {
+          const p = JSON.parse(Buffer.from(String(cred.access_token).split('.')[1], 'base64url').toString())
+          clientId = p.aud || p.client_id || ''
+        } catch {
+          /* ignore */
+        }
+      }
+      /* device_id：网页版用的是 cookie `deviceid`（形如 `wdi10.<32位hex><2位>`）里去掉前缀的 32 位 hex。
+       * localStorage 里那个 `deviceid` 实测取不到，必须从 cookie 拿。 */
+      let deviceId = ''
+      try {
+        const all = await ses.cookies.get({})
+        const c = all.find((x) => x.name === 'deviceid' && x.value)
+        if (c) {
+          const m = /^wdi\d+\.([0-9a-f]{32})/i.exec(c.value)
+          deviceId = m ? m[1] : c.value
+        }
+      } catch {
+        /* ignore */
+      }
+      if (!deviceId) deviceId = store.deviceid || store.device_id || (cred && (cred.deviceid || cred.device_id)) || ''
       if (!cred || !cred.access_token) return { header: '', list: [], loggedIn: false }
       let userId = cred.user_id || cred.sub || ''
       if (!userId) {
@@ -86,11 +110,39 @@ const SITES = {
           }
         }
       }
+      /* 迅雷的 pan 接口要一个「带 client info 的完整 captcha_token」（~784 字符）。
+       * **空 token 去 init 只能拿到 282 字符的残废 token**，服务端回
+       * `验证码无效（no client info found）`。网页版把这个完整 token 存在
+       * localStorage 的 `captcha_<client_id>` 里（值是 `{"token":"ck0.…"}`），
+       * 实测直接拿来用就是 200。所以这里顺手一并收割。 */
+      let captchaToken = ''
+      try {
+        const raw2 = store['captcha_' + clientId]
+        if (raw2) {
+          const o = JSON.parse(raw2)
+          captchaToken = String((o && (o.token || o.captcha_token)) || '')
+        }
+      } catch {
+        /* ignore */
+      }
+      if (!captchaToken) {
+        for (const [k, v] of Object.entries(store)) {
+          if (!/^captcha_/.test(k)) continue
+          const m = /ck0\.[A-Za-z0-9_.\-]+/.exec(String(v))
+          if (m) {
+            captchaToken = m[0]
+            break
+          }
+        }
+      }
+
       const blob = JSON.stringify({
         access_token: cred.access_token,
         refresh_token: cred.refresh_token || '',
         user_id: String(userId || ''),
         device_id: String(deviceId || ''),
+        client_id: String(clientId || ''),
+        captcha_token: captchaToken,
       })
       return { header: blob, list: [{ name: 'access_token', value: cred.access_token }], loggedIn: true }
     },

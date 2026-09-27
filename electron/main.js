@@ -202,7 +202,18 @@ function registerIpc() {
     const need = []
     if (jar.quark && /pan\.quark\.cn|quark\.cn/i.test(text)) need.push('quark')
     if (jar.uc && /drive\.uc\.cn|uc\.cn/i.test(text)) need.push('uc')
-    if (jar.xunlei && /pan\.xunlei\.com/i.test(text)) need.push('xunlei')
+    if (jar.xunlei && /pan\.xunlei\.com/i.test(text)) {
+      /* 迅雷预热要开一次网页版窗口（~2-6s），只在凭证里缺 captcha 令牌时才值得做。
+       * 平时 fetchCaptcha 会拿它当种子换新令牌，所以存一份就够用很久。 */
+      let missing = true
+      try {
+        const j = JSON.parse(jar.xunlei)
+        missing = !j.captcha_token
+      } catch {
+        missing = true
+      }
+      if (missing) need.push('xunlei')
+    }
     if (!need.length) return
     let changed = false
     for (const nd of need) {
