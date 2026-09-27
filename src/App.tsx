@@ -255,6 +255,15 @@ function ResultPanel({
           这个网盘需要登录后才能下载（游客直链会被 CDN 拒绝 412 / 403）。点「开始下载」后会提示你去登录。
         </div>
       )}
+      {result.netdisk === 'quark' && !needsLogin && (
+        <div className="result-note warn">
+          实测：夸克这条下载通道是按「账号」总量限速的——连接数从 1 加到 16，吞吐几乎不变（平均 0.46 → 0.72 MB/s），
+          本程序已经用满 aria2 允许的 16 连接。
+          <br />
+          大文件想要更快，只能用夸克官方 PC 客户端的「快传 → 发送网盘文件 → 发送 → 下载到本地」（实测 4–5 MB/s）——
+          它走的是客户端自带的加速通道，不对外开放，本程序拿不到。
+        </div>
+      )}
       {needsLogin && result.netdisk === 'xunlei' && (
         <div className="result-note warn">
           迅雷云盘的分享可以匿名浏览（文件名和体积都能读到），但转存和取直链必须登录。点「开始下载」后会提示你去登录。
