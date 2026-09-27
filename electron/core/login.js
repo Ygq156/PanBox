@@ -19,6 +19,8 @@ const SITES = {
     name: '夸克网盘',
     url: 'https://pan.quark.cn/',
     domains: ['pan.quark.cn', 'drive-pc.quark.cn', 'quark.cn'],
+    // 解析器实际会打这些 host，收割时按这些 URL 作用域取 cookie（见 harvestCookies）
+    cookieUrls: ['https://pan.quark.cn/', 'https://drive-pc.quark.cn/'],
     // 夸克的登录态：__pus / __puus 系列
     logged: (list) => list.some((c) => /^__(puus|pus|uid)$/.test(c.name)),
   },
@@ -26,6 +28,7 @@ const SITES = {
     name: 'UC网盘',
     url: 'https://drive.uc.cn/',
     domains: ['drive.uc.cn', 'pc-api.uc.cn', 'uc.cn'],
+    cookieUrls: ['https://drive.uc.cn/', 'https://pc-api.uc.cn/'],
     /* UC 登录后会下发 __puus / __pus 以及 UDRIVE_* 令牌。
      * 注意：匿名访问也会种下 `UDRIVE_TRANSFER_SESS`，它**不是**登录标志（实测误报过），
      * 所以这里要求 __puus/__pus 有值，或出现 TRANSFER_SESS 之外的 UDRIVE_ 令牌。 */
@@ -37,6 +40,12 @@ const SITES = {
     name: '百度网盘',
     url: 'https://pan.baidu.com/',
     domains: ['pan.baidu.com', 'baidu.com'],
+    /* ⚠️ 百度必须按 URL 作用域收割：`cookies.get({})` 会把 passport.baidu.com /
+     * pcs.baidu.com 等域的 cookie（STOKEN_BFESS、PTOKEN、UBI、HMACCOUNT…）一起塞进来，
+     * 发给 pan.baidu.com 时百度直接判 errno=-6（身份验证错误）——实测：
+     *   全量 2068 字符 → errno=-6；按 https://pan.baidu.com/ 作用域 1410 字符 → errno=0。
+     * 浏览器自己也只发作用域内那 13 条。 */
+    cookieUrls: ['https://pan.baidu.com/'],
     // 百度登录态：BDUSS 是唯一硬指标
     logged: (list) => list.some((c) => c.name === 'BDUSS' && c.value && c.value.length > 20),
   },
@@ -155,10 +164,23 @@ function cookieHeader(list) {
   return [...seen.entries()].map(([k, v]) => `${k}=${v}`).join('; ')
 }
 
-function pickCookies(all, domains) {
-  return all.filter((c) =>
-    domains.some((d) => c.domain === d || c.domain === '.' + d || c.domain.endsWith('.' + d) || c.domain.replace(/^\./, '') === d),
-  )
+/**
+ * 按 **URL 作用域** 收割 cookie —— 等价于浏览器真正会发给该站点的集合。
+ *
+ * 这里不能用 `cookies.get({})` + 域名后缀过滤：那会把别的子域专属的 cookie 也带上，
+ * 百度的接口会因此判「身份验证错误」(errno=-6)。详见 SITES.baidu 的注释。
+ *
+ * @param {import('electron').Session} ses
+ * @param {{url:string, cookieUrls?:string[]}} site
+ */
+async function harvestCookies(ses, site) {
+  const urls = site.cookieUrls && site.cookieUrls.length ? site.cookieUrls : [site.url]
+  const seen = new Map()
+  for (const url of urls) {
+    const list = await ses.cookies.get({ url })
+    for (const c of list) if (!seen.has(c.name)) seen.set(c.name, c)
+  }
+  return [...seen.values()]
 }
 
 /**
@@ -192,10 +214,8 @@ async function openLogin(netdisk, parent) {
 
     const harvest = async () => {
       if (typeof site.read === 'function') return site.read(ses, win)
-      const all = await ses.cookies.get({})
-      const mine = pickCookies(all, site.domains)
-      const header = cookieHeader(mine)
-      return { header, list: mine, loggedIn: site.logged(mine) }
+      const mine = await harvestCookies(ses, site)
+      return { header: cookieHeader(mine), list: mine, loggedIn: site.logged(mine) }
     }
 
     win = new BrowserWindow({
@@ -287,8 +307,7 @@ async function refreshCookie(netdisk, opts = {}) {
 
   const harvest = async () => {
     if (typeof site.read === 'function') return site.read(ses, null)
-    const all = await ses.cookies.get({})
-    const mine = pickCookies(all, site.domains)
+    const mine = await harvestCookies(ses, site)
     return { header: cookieHeader(mine), list: mine, loggedIn: site.logged(mine) }
   }
 

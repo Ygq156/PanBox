@@ -57,6 +57,11 @@ class TaskManager extends EventEmitter {
     this._saveMeta()
   }
 
+  /** 读某个任务的元信息（含 origin：重新解析直链所需的一切） */
+  info(gid) {
+    return this.meta.get(gid) || null
+  }
+
   start() {
     if (this.timer) return
     this.timer = setInterval(() => this._tick().catch(() => {}), POLL_MS)

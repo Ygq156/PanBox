@@ -207,6 +207,15 @@ class Aria2 {
     return this.rpc('aria2.tellStopped', [offset, num, ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'connections', 'errorCode', 'errorMessage', 'dir', 'files']], 8000)
   }
 
+  /** 单个任务的状态（「换直链」需要先知道任务当前是不是还活着） */
+  tellStatus(gid) {
+    return this.rpc(
+      'aria2.tellStatus',
+      [gid, ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'connections', 'errorCode', 'errorMessage', 'dir', 'files']],
+      8000,
+    )
+  }
+
   getGlobalStat() {
     return this.rpc('aria2.getGlobalStat')
   }
@@ -237,6 +246,18 @@ class Aria2 {
 
   changeGlobalOption(opts) {
     return this.rpc('aria2.changeGlobalOption', [opts])
+  }
+
+  /** 换掉某个任务的下载地址（fileIndex 从 1 开始）。用于「直链过期 / 想换节点」时重新解析。 */
+  changeUri(gid, fileIndex, delUris = [], addUris = [], position = 1) {
+    const params = [gid, fileIndex, delUris, addUris]
+    if (addUris.length && (delUris.length || position > 1)) params.push(position)
+    return this.rpc('aria2.changeUri', params)
+  }
+
+  /** 改单个任务的选项（header / user-agent 等） */
+  changeOption(gid, opts) {
+    return this.rpc('aria2.changeOption', [gid, opts])
   }
 }
 

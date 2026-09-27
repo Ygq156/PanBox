@@ -14,7 +14,6 @@ const NETDISK_LABEL: Record<string, string> = {
   uc: 'UC网盘',
   baidu: '百度网盘',
   xunlei: '迅雷云盘',
-  aliyun: '阿里云盘',
   '123pan': '123云盘',
   direct: '直链',
   unknown: '未知',
@@ -55,7 +54,7 @@ function SettingsModal({
     }
   }
 
-  const cookieTargets = ['baidu', 'quark', 'uc', 'xunlei', 'lanzou', 'aliyun', '123pan']
+  const cookieTargets = ['baidu', 'quark', 'uc', 'xunlei', 'lanzou', '123pan']
 
   return (
     <div className="mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
@@ -341,6 +340,7 @@ export default function App() {
   const [hint, setHint] = useState<{ kind: '' | 'err' | 'ok'; msg: string }>({ kind: '', msg: '' })
   const [needLogin, setNeedLogin] = useState<string | null>(null)
   const [tasks, setTasks] = useState<DownloadTask[]>([])
+  const [refreshing, setRefreshing] = useState<string | null>(null)
   const [aria2, setAria2] = useState<Aria2Status>({ running: false })
 
   useEffect(() => {
@@ -615,6 +615,29 @@ export default function App() {
                       {(t.status === 'paused' || t.status === 'waiting') && (
                         <button className="ghost tiny" title="继续" onClick={() => api.resumeTask(t.gid)}>
                           ▶
+                        </button>
+                      )}
+                      {(t.status === 'active' || t.status === 'paused' || t.status === 'error') && t.source && (
+                        <button
+                          className="ghost tiny"
+                          title="换直链：重新解析这条分享，用新的下载地址替换掉当前地址。直链过期、或这次分到的节点太慢时用得上。"
+                          disabled={refreshing === t.gid}
+                          onClick={async () => {
+                            setRefreshing(t.gid)
+                            setHint({ kind: '', msg: `正在为「${t.name}」重新解析直链…` })
+                            try {
+                              const r = await api.refreshTask(t.gid)
+                              setHint({
+                                kind: r.ok ? 'ok' : 'err',
+                                msg: r.message || (r.ok ? '已换成新的下载地址' : '换直链失败'),
+                              })
+                            } catch (e) {
+                              setHint({ kind: 'err', msg: String((e as Error)?.message || e) })
+                            }
+                            setRefreshing(null)
+                          }}
+                        >
+                          {refreshing === t.gid ? '…' : '⟳'}
                         </button>
                       )}
                       <button className="ghost tiny" title="移除" onClick={() => api.removeTask(t.gid)}>

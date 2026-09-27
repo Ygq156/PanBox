@@ -10,8 +10,36 @@ const tasks = require('./core/taskManager')
 const parsers = require('./parsers')
 const login = require('./core/login')
 
-/** 下载文件名 -> 解析会话 id：任务 complete 时用来回收「转存副本」 */
+/** 下载产物文件名 -> 解析会话 id，交给下面的 recycleTransferCopy 消费 */
 const downloadsCleanup = new Map()
+/* 有些网盘的下载需要先把文件「转存」到用户自己的网盘，取完直链再删。 */
+const { cleanupDownloaded } = parsers
+
+/**
+ * 回收某次下载对应的转存副本（幂等：同一名字只回收一次）。
+ *
+ * 触发时机有三处，缺一不可：
+ *   ① 下载完成（`tasks.on('update')` 里 status === 'complete'）
+ *   ② 用户**撤销/删除**任务（`downloads:remove`）——否则中途取消会把副本永久留在用户网盘里
+ *   ③ 程序退出前对已完成任务兜底（`before-quit`）
+ *
+ * @param {string} name 下载产物文件名
+ * @param {string} tag  日志来源标记
+ */
+async function recycleTransferCopy(name, tag) {
+  const key = String(name)
+  const sid = downloadsCleanup.get(key)
+  if (!sid) return false
+  downloadsCleanup.delete(key)
+  try {
+    const ok = await cleanupDownloaded(sid)
+    boot('recycle', key, `${tag} ok=${ok}`)
+    return !!ok
+  } catch (e) {
+    boot('recycle-err', key, tag, String((e && e.message) || e))
+    return false
+  }
+}
 
 /* 启动诊断日志：打包版是 GUI 子系统程序，stdout 拿不到，只能写文件。 */
 const BOOT_LOG = process.env.PANBOX_BOOT_LOG || path.join(require('node:os').tmpdir(), 'panbox-boot.log')
@@ -311,7 +339,22 @@ function registerIpc() {
       if (header.length) options.header = header
       try {
         const gid = await aria2.addUri([f.url], options)
-        tasks.remember(gid, { name: f.name, netdisk, source, dir: subdir })
+        tasks.remember(gid, {
+          name: f.name,
+          netdisk,
+          source,
+          dir: subdir,
+          /* 重新解析直链所需的一切：网盘直链（夸克/UC/百度/迅雷）会过期，
+           * 或者节点太慢时，可以「换直链」重新取一条。 */
+          origin: {
+            source,
+            netdisk,
+            title: shareTitle,
+            name: f.name,
+            dir: f.dir || '',
+            opts: { ...options },
+          },
+        })
         /* 夸克/UC 是「转存→取直链」，用户网盘里会多一份拷贝；登记下来，
          * 等这个任务 complete 时回收（见下面的 tasks.on('update')）。 */
         if (payload && payload.sessionId) downloadsCleanup.set(String(f.name), payload.sessionId)
@@ -327,9 +370,74 @@ function registerIpc() {
   ipcMain.handle('downloads:list', () => tasks.list())
   ipcMain.handle('downloads:pause', (_e, gid) => aria2.pause(gid).then(() => true).catch(() => false))
   ipcMain.handle('downloads:resume', (_e, gid) => aria2.unpause(gid).then(() => true).catch(() => false))
+
+  /* 「换直链」：重新解析同一条分享、拿一条新的下载地址替换掉当前任务的地址。
+   * 直链过期、或者某次分到的 CDN 节点太慢时用得上（也相当于迅雷客户端那套
+   * 「重建任务重新调度节点」的合法等价物）。 */
+  ipcMain.handle('downloads:refresh', async (_e, gid) => {
+    const meta = tasks.info(gid)
+    const o = meta && meta.origin
+    if (!o || !o.source) {
+      return { ok: false, message: '这个任务没有可重新解析的来源（只有经「解析 → 开始下载」加入的任务支持换直链）' }
+    }
+    const cfg = settings.load()
+    let fresh = null
+    let newSession = ''
+    try {
+      const { results } = await parsers.parseShare({ text: o.source, password: '', settings: cfg })
+      const r = (results || []).find((x) => x.ok)
+      if (!r) throw new Error((results && results[0] && results[0].message) || '重新解析失败')
+      const plain = (s) => String(s || '').replace(/^.*[\\/]/, '')
+      let idx = r.files.findIndex((f) => f.name === o.name && String(f.dir || '') === String(o.dir || ''))
+      if (idx < 0) idx = r.files.findIndex((f) => plain(f.name) === plain(o.name))
+      if (idx < 0) throw new Error(`重新解析后没有找到同名文件：${o.name}`)
+      const got = await parsers.resolveFiles({ sessionId: r.sessionId, ids: [String(idx)] })
+      if (!got.length) throw new Error('重新解析没有拿到新直链')
+      fresh = got[0]
+      newSession = r.sessionId
+    } catch (e) {
+      return { ok: false, message: (e && e.message) || String(e) }
+    }
+
+    const header = buildHeaders(fresh.headers)
+    const opts = { ...(o.opts || {}) }
+    delete opts.gid
+    if (header.length) opts.header = header
+
+    let st = null
+    try {
+      st = await aria2.tellStatus(gid)
+    } catch {
+      /* 任务可能已经被删了，照样走重新加入的路径 */
+    }
+    const live = st && (st.status === 'active' || st.status === 'paused' || st.status === 'waiting')
+    try {
+      /* ⚠️ 这里**故意不用** aria2 的 `changeUri` 热替换。
+       * 实测（aria2 1.37，见 test/ui-refresh.js 的 B 分支）：对一个正在下载的任务调
+       * `changeUri` 之后，aria2 进程会失联——紧接着所有 RPC 都报 `TypeError: fetch failed`，
+       * 任务进度停在原地。所以统一改成「先移除、再用新地址重新加入」：
+       * `.aria2` 控制文件还在，`--continue=true` 会让它从断点续传，不会白下。 */
+      await aria2.remove(gid).catch(() => {})
+      tasks.forget(gid)
+      downloadsCleanup.delete(String(o.name))
+      const ngid = await aria2.addUri([fresh.url], opts)
+      tasks.remember(ngid, { name: o.name, netdisk: o.netdisk, source: o.source, dir: opts.dir, origin: o })
+      if (newSession) downloadsCleanup.set(String(o.name), newSession)
+      await tasks._tick().catch(() => {})
+      boot('refresh', o.name, `re-add ok gid=${ngid} was=${st ? st.status : 'gone'} live=${!!live}`)
+      return { ok: true, gid: ngid, message: '已用新的下载地址重新加入队列（会从断点接着下）' }
+    } catch (e) {
+      boot('refresh-err', (e && e.stack) || String(e))
+      return { ok: false, message: '换直链失败：' + ((e && e.message) || String(e)) }
+    }
+  })
   ipcMain.handle('downloads:remove', async (_e, gid) => {
+    /* ⚠️ 必须**先**取名字再 forget：否则中途撤销任务时，那份转到用户网盘里的副本
+     * 就再也没人认领，会永久留在 `/PanBox` 里。 */
+    const meta = tasks.info(gid)
     const r = await aria2.remove(gid).then(() => true).catch(() => false)
     tasks.forget(gid)
+    if (meta && meta.name) await recycleTransferCopy(meta.name, 'remove').catch(() => {})
     return r
   })
   ipcMain.handle('downloads:pauseAll', () => aria2.pauseAll().then(() => true).catch(() => false))
@@ -367,13 +475,7 @@ if (!gotLock) {
        * 回收从来没真正跑过。 */
       for (const t of list) {
         if (!t || t.status !== 'complete') continue
-        const sid = downloadsCleanup.get(String(t.name))
-        if (!sid) continue
-        downloadsCleanup.delete(String(t.name))
-        parsers
-          .cleanupDownloaded(sid)
-          .then((ok) => boot('recycle', t.name, 'ok=' + ok))
-          .catch((e) => boot('recycle-err', t.name, String((e && e.message) || e)))
+        recycleTransferCopy(t.name, 'complete')
       }
     })
 

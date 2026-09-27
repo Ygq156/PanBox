@@ -23,6 +23,7 @@ export interface PanboxAPI {
   addDownloads(p: AddPayload): Promise<{ ok: boolean; added: string[]; errors: string[] }>
   pauseTask(gid: string): Promise<boolean>
   resumeTask(gid: string): Promise<boolean>
+  refreshTask(gid: string): Promise<{ ok: boolean; gid?: string; message?: string }>
   removeTask(gid: string, deleteFile?: boolean): Promise<boolean>
   pauseAll(): Promise<boolean>
   resumeAll(): Promise<boolean>

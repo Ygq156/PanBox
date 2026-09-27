@@ -232,75 +232,175 @@ module.exports = {
     const entries = flat
     /* 转存到用户自己网盘的文件——下载完必须删掉，否则会在用户的网盘里留一堆垃圾 */
     const transferred = []
+
+    const DIR = '/PanBox'
+    const dh = { ...h, Cookie: mergeCookie(cookie, bduss), Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+    const fh = { ...dh, 'Content-Type': 'application/x-www-form-urlencoded' }
+
+    /** 列自己网盘里的目录（/api/list）。目录不存在时返回 []（errno -9 / -7）。 */
+    const listOwn = async (dirPath) => {
+      const r = await reqJson(
+        `https://pan.baidu.com/api/list?dir=${encodeURIComponent(dirPath)}&order=time&desc=1&showempty=0` +
+          `&web=1&page=1&num=1000&t=${Date.now()}&bdstoken=${bdstoken}&${APP_QS}`,
+        { headers: dh },
+      )
+      const j = r.json || {}
+      if (j.errno !== 0 && j.errno !== -9 && j.errno !== -7) throw new Error(errnoText(j.errno, j.errmsg))
+      return j.list || []
+    }
+
+    /** `/share/transfer` 要求目标目录**已经存在**（实测不存在时报 `errno=2 转存路径不存在`），所以先建。 */
+    const ensureDir = async (dirPath) => {
+      const probe = await reqJson(
+        `https://pan.baidu.com/api/list?dir=${encodeURIComponent(dirPath)}&order=time&desc=1&showempty=0` +
+          `&web=1&page=1&num=1&t=${Date.now()}&bdstoken=${bdstoken}&${APP_QS}`,
+        { headers: dh },
+      )
+      if ((probe.json || {}).errno === 0) return
+      const mk = await reqJson(`https://pan.baidu.com/api/create?bdstoken=${bdstoken}&${APP_QS}`, {
+        method: 'POST',
+        headers: fh,
+        body: `path=${encodeURIComponent(dirPath)}&isdir=1&block_list=%5B%5D&size=`,
+      })
+      const mj = mk.json || {}
+      // errno -8 = 目录已存在
+      if (mj.errno !== 0 && mj.errno !== -8) {
+        throw new Error(`创建目录 ${dirPath} 失败（errno=${mj.errno}）：${mj.errmsg || mj.show_msg || ''}`)
+      }
+      await sleep(600)
+    }
+
+    /** 同名冲突时百度会存成 `名字(1).ext`，所以要能把 `名字(2).zip` 认回 `名字.zip`。 */
+    const variant = (n) => {
+      const m = /^(.*?)(?:\((\d+)\))?(\.[^.]+)$/.exec(String(n))
+      return m ? { base: m[1], ext: m[3] } : null
+    }
+
+    /**
+     * 批量解析：**一次**转存 + **一次** filemetas 把一整批文件全拿下来。
+     *
+     * 旧实现是每个文件各转存一次、各取一次 dlink —— 一个 8 文件的目录分享要打 16 轮 API，
+     * 又慢又更容易触发百度风控。`/share/transfer` 的 `fsidlist` 和 `/api/filemetas` 的 `fsids`
+     * 本来就支持数组，批量是顺手的事。
+     *
+     * @param {Array<{id?:string,name?:string,fsId?:string}>} list 文件索引或内部 entry
+     * @returns {Promise<Array<{entry:object,url:string|null,headers:object}>>} 与入参同序
+     */
+    const resolveManyBatch = async (list) => {
+      const items = list
+        .map((x) => {
+          if (x && x.fsId) return x
+          const idx = Number(x && x.id !== undefined ? x.id : x.fid)
+          return Number.isFinite(idx) ? entries[idx] : undefined
+        })
+        .filter(Boolean)
+      if (!items.length) throw new Error('文件索引无效')
+      if (!bduss) {
+        const err = new Error(
+          '百度网盘的文件没有直链，必须先「转存到你自己的网盘」才能取下载地址，所以需要登录。' +
+            '请在「设置 → 网盘账号」里登录百度网盘。',
+        )
+        err.needCookie = true
+        throw err
+      }
+
+      await ensureDir(DIR)
+      /* 转存**之前**先记下目录里已有的 fs_id —— 只有新出现的才是我们转存进去的副本，
+       * 绝不能把用户本来就有的同名文件当成副本删掉。 */
+      const beforeIds = new Set((await listOwn(DIR)).map((x) => String(x.fs_id)))
+
+      /* 1) 一次转存整批文件到自己的 /PanBox */
+      const transfer = await reqJson(
+        `https://pan.baidu.com/share/transfer?shareid=${shareid}&from=${share_uk}&bdstoken=${bdstoken}&${APP_QS}`,
+        {
+          method: 'POST',
+          headers: fh,
+          body: `fsidlist=%5B${items.map((x) => x.fsId).join(',')}%5D&path=${encodeURIComponent(DIR)}`,
+        },
+      )
+      const tj = transfer.json || {}
+      /* errno 12 = 目标目录已存在同名文件；errno 4 = "文件已转存"（同一份额里同一个文件之前转过）。
+       * 两者都视为成功——复用 /PanBox 里已有的那份继续取直链。
+       * 注意：这种情况命中的文件在 beforeIds 里，**不会**被登记回收（绝不删用户本来就有的东西）。 */
+      if (tj.errno !== 0 && tj.errno !== 12 && tj.errno !== 4) {
+        throw new Error(`转存失败（errno=${tj.errno}）：${tj.errmsg || tj.show_msg || ''}`)
+      }
+      await sleep(900)
+
+      /* 2) 在 /PanBox 里把每个文件认领到具体的 fs_id。
+       * `used` 保证两个不同的文件不会同时认领到同一份副本。 */
+      const owned = await listOwn(DIR)
+      const fresh = owned.filter((x) => !beforeIds.has(String(x.fs_id)))
+      const used = new Set()
+      const claimed = []
+      for (const e of items) {
+        const want = variant(e.name)
+        const pick = (pool) =>
+          pool.find((x) => !used.has(String(x.fs_id)) && x.server_filename === e.name) ||
+          (want
+            ? pool.find((x) => {
+                if (used.has(String(x.fs_id))) return false
+                const v = variant(x.server_filename)
+                return v && v.base === want.base && v.ext === want.ext
+              })
+            : null)
+        /* 单文件时允许退化成「新出现的第一份」；多文件时绝不乱认领（宁可报错，也不下错文件） */
+        const hit =
+          pick(fresh) || pick(owned) || (items.length === 1 ? fresh.find((x) => !used.has(String(x.fs_id))) : null)
+        if (!hit) {
+          claimed.push({ entry: e, fsId: null })
+          continue
+        }
+        used.add(String(hit.fs_id))
+        const fsId = String(hit.fs_id)
+        /* 只有**新出现**的文件才登记回收（命中用户原有的同名文件时绝不删） */
+        if (!beforeIds.has(fsId) && !transferred.some((x) => x.fsId === fsId)) {
+          transferred.push({
+            fsId,
+            path: String(hit.path || `${DIR}/${hit.server_filename}`),
+            name: String(hit.server_filename || e.name),
+          })
+        }
+        claimed.push({ entry: e, fsId })
+      }
+
+      /* 3) 取 dlink（**一次请求拿回整批**）。
+       * ⚠️ 2026 年 `/api/download?type=dlink&sign=…` 已经失效：`/api/gettemplatevariable`
+       * 不再返回 `sign` 字段（`fields=["sign"]` 回空数组），少了 sign 就只会得到 errno=113/2。
+       * 现在网页端用的是 **`/api/filemetas?dlink=1&fsids=[…]`**，实测 errno=0 并直接给出
+       * `https://d.pcs.baidu.com/file/…?fid=…&sign=…` 直链。 */
+      const links = new Map()
+      const fsIds = claimed.map((c) => c.fsId).filter(Boolean)
+      if (fsIds.length) {
+        const fm = await reqJson(`https://pan.baidu.com/api/filemetas?dlink=1&fsids=%5B${fsIds.join(',')}%5D&${APP_QS}`, {
+          headers: dh,
+        })
+        const fj = fm.json || {}
+        if (fj.errno !== 0) throw new Error(`取直链失败（errno=${fj.errno}）：${fj.errmsg || ''}`)
+        for (const it of fj.info || []) links.set(String(it.fs_id), it.dlink)
+      }
+
+      const dheaders = {
+        Referer: 'https://pan.baidu.com/',
+        'User-Agent': BAIDU_UA,
+        Cookie: mergeCookie(cookie, bduss),
+      }
+      return claimed.map((c) => ({ entry: c.entry, url: links.get(c.fsId) || null, headers: dheaders }))
+    }
+
     return {
       title,
       shareId,
       files: entries.map((e, i) => ({ id: String(i), name: e.name, size: e.size, isDir: false, dir: e.dir || '' })),
+      resolveMany: resolveManyBatch,
       resolve: async (id) => {
-        const e = entries[Number(id)]
-        if (!e) throw new Error('文件索引无效')
-        if (!bduss) {
-          const err = new Error(
-            '百度网盘的文件没有直链，必须先「转存到你自己的网盘」才能取下载地址，所以需要登录。' +
-              '请在「设置 → 网盘账号」里登录百度网盘。',
-          )
-          err.needCookie = true
-          throw err
-        }
-        const dh = { ...h, Cookie: mergeCookie(cookie, bduss), Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
-
-        /* 1) 转存到自己网盘的 /PanBox */
-        const transfer = await reqJson(
-          `https://pan.baidu.com/share/transfer?shareid=${shareid}&from=${share_uk}&bdstoken=${bdstoken}&${APP_QS}`,
-          {
-            method: 'POST',
-            headers: { ...dh, 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `fsidlist=%5B${e.fsId}%5D&path=%2FPanBox`,
-          },
-        )
-        const tj = transfer.json || {}
-        // errno 12 = 目标目录已存在同名文件，视为成功
-        if (tj.errno !== 0 && tj.errno !== 12) throw new Error(`转存失败（errno=${tj.errno}）：${tj.errmsg || tj.show_msg || ''}`)
-        await sleep(900)
-
-        /* 2) sign / timestamp */
-        const tv = await reqJson(
-          `https://pan.baidu.com/api/gettemplatevariable?${APP_QS}&fields=%5B%22sign%22%2C%22timestamp%22%5D`,
-          { headers: dh },
-        )
-        const tvj = (tv.json && tv.json.result) || {}
-
-        /* 3) 在 /PanBox 里找到转存后的 fs_id */
-        const rootList = await reqJson(
-          `https://pan.baidu.com/api/list?dir=%2FPanBox&order=time&desc=1&showempty=0&web=1&page=1&num=1000&t=${Date.now()}&bdstoken=${bdstoken}&${APP_QS}`,
-          { headers: dh },
-        )
-        const rl = (rootList.json && rootList.json.list) || []
-        const hit = rl.find((x) => x.server_filename === e.name) || rl[0]
-        if (!hit) throw new Error('转存后未能在 /PanBox 里定位到文件')
-        const fsId = String(hit.fs_id)
-        const hitPath = String(hit.path || `/PanBox/${hit.server_filename}`)
-        /* 转存前就存在的同名文件不算我们的（errno 12 分支）——只有新出现的才登记回收 */
-        if (!(transfer.json || {}).errno && !transferred.some((x) => x.fsId === fsId)) {
-          transferred.push({ fsId, path: hitPath, name: String(hit.server_filename || e.name) })
-        }
-
-        /* 4) 取 dlink */
-        const dl = await reqJson(
-          `https://pan.baidu.com/api/download?sign=${tvj.sign}&timestamp=${tvj.timestamp}&fidlist=%5B${hit.fs_id}%5D&type=dlink&${APP_QS}`,
-          { headers: dh },
-        )
-        const dj = dl.json || {}
-        if (dj.errno !== 0 || !dj.dlink || !dj.dlink[0]) {
-          throw new Error(`取直链失败（errno=${dj.errno}）：${dj.errmsg || ''}`)
-        }
-        return {
-          url: dj.dlink[0].dlink,
-          headers: { Referer: 'https://pan.baidu.com/', 'User-Agent': BAIDU_UA, Cookie: mergeCookie(cookie, bduss) },
-          _transferred: { fsId, cookie: mergeCookie(cookie, bduss) },
-        }
+        const out = await resolveManyBatch([{ id }])
+        const r = out[0]
+        if (!r || !r.url) throw new Error('取直链失败：未能解析出下载地址')
+        return { url: r.url, headers: r.headers }
       },
-      /* 删掉我们转存到 /PanBox 的副本（下载完成后调用） */
+      /* 删掉我们转存到 /PanBox 的副本（下载完成后调用）。
+       * 一次请求把整批路径都删掉（`filelist` 收数组），失败才退化成逐个删。 */
       removeTransferred: async () => {
         if (!transferred.length || !bduss) return 0
         const delH = {
@@ -310,25 +410,34 @@ module.exports = {
           'Content-Type': 'application/x-www-form-urlencoded',
           'X-Requested-With': 'XMLHttpRequest',
         }
+        const del = async (paths) => {
+          const r = await reqJson(
+            `https://pan.baidu.com/api/filemanager?opera=delete&async=2&onnest=fail&bdstoken=${bdstoken}&${APP_QS}`,
+            {
+              method: 'POST',
+              headers: delH,
+              body: 'filelist=' + encodeURIComponent(JSON.stringify(paths)),
+            },
+          )
+          const info = (r.json && r.json.info) || []
+          const bad = info.filter((x) => x && x.errno)
+          return { ok: (r.json || {}).errno === 0 && !bad.length, raw: r.json || r.text, bad }
+        }
+        const todo = transferred.splice(0)
         let n = 0
-        for (const t of transferred.splice(0)) {
+        try {
+          const one = await del(todo.map((t) => t.path))
+          if (one.ok) return todo.length
+          /* 批量失败（常见于某个路径已不存在）→ 退化成逐个删，尽量把能删的都删掉 */
+          console.error('[baidu] 批量删除 /PanBox 副本未全部成功，改为逐个删除：', JSON.stringify(one.raw).slice(0, 200))
+        } catch (e) {
+          console.error('[baidu] 批量删除 /PanBox 副本异常，改为逐个删除：', e && e.message)
+        }
+        for (const t of todo) {
           try {
-            const r = await reqJson(
-              `https://pan.baidu.com/api/filemanager?opera=delete&async=2&onnest=fail&bdstoken=${bdstoken}&${APP_QS}`,
-              {
-                method: 'POST',
-                headers: delH,
-                body: 'filelist=' + encodeURIComponent(JSON.stringify([t.path])),
-              },
-            )
-            const info = (r.json && r.json.info) || []
-            const bad = info.filter((x) => x && x.errno)
-            if ((r.json || {}).errno === 0 && !bad.length) n++
-            else
-              console.error(
-                `[baidu] 删除 /PanBox 副本失败：${t.path} ->`,
-                JSON.stringify(r.json || r.text).slice(0, 200),
-              )
+            const r = await del([t.path])
+            if (r.ok) n++
+            else console.error(`[baidu] 删除 /PanBox 副本失败：${t.path} ->`, JSON.stringify(r.raw).slice(0, 200))
           } catch (e) {
             console.error('[baidu] 删除 /PanBox 副本异常：', t.path, e && e.message)
           }

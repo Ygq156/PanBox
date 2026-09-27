@@ -29,7 +29,7 @@
 | **夸克网盘**（pan.quark.cn） | ✅ | ✅ 实测通过 | **需要** | 免费账号约 0.8–1.3 MB/s（账号级令牌限速） |
 | **UC 网盘**（drive.uc.cn） | ✅ | ✅ 实测通过 | **需要** | **0.82 MB/s**（25 MB 文件 42 秒，字节数完全一致） |
 | **123 云盘**（123pan.com） | ✅ | ✅ | 不需要 | 真不限速，但受**分享者**每月 10 GB 提取配额限制 |
-| **百度网盘**（pan.baidu.com） | ✅ 实测通过（含目录递归） | ⚠️ 取直链未验证 | **下载需要**（BDUSS），解析不需要 | 免费账号约 100–170 KB/s，已强制单线程 |
+| **百度网盘**（pan.baidu.com） | ✅ 实测通过（含目录递归） | ✅ 实测通过 | **下载需要**（BDUSS），解析不需要 | 免费账号 **0.10 MB/s 平均、0.35 MB/s 峰值**（实测 60 秒 4.9 MB，已强制单线程） |
 | **迅雷云盘**（pan.xunlei.com） | ✅ 实测通过（含目录递归） | ✅ 实测通过 | **需要**（账号 token），解析不需要 | **1.08 MB/s 平均、1.23 MB/s 峰值**（395 MB 文件，8 连接） |
 | **直链**（任意 HTTP/HTTPS 文件地址） | ✅ | ✅ 实测通过 | 不需要 | 取决于源站（实测 3.22 MB/s） |
 | 天翼 / 移动云盘 | ⬜ 未实现 | ⬜ | — | — |
@@ -38,7 +38,9 @@
 
 - **夸克**：CDN（`dl-*-zb.drive.quark.cn`）校验一个叫 `__puus` 的 cookie，而它是**网页 JS 动态生成的、登录时抓不到**。本程序在每次解析前会先在后台静默打开一次网盘首页，把这个令牌"暖"回来（实测约 2 秒），然后走「转存到你的网盘 → 取直链 → 下载 → **自动删除转存副本**」。
 - **UC**：CDN 会把你的 Referer/Cookie/IP 拿去做回调鉴权（`auth-cdn.uc.cn/outer/oss/checkplay`），游客态一律回 `403 RequestDeniedByCallback: require login [auth not found]`。
-- **百度**：官方接口的 dlink **必须**带 `User-Agent: pan.baidu.com`，且**按账号维度限速**——本程序对该任务强制 `split=1`、`max-connection-per-server=1`，因为并发调大只会招致几小时到几天的**惩罚性降速**。
+- **百度**：官方接口的 dlink **必须**带 `User-Agent: pan.baidu.com`，且**按账号维度限速**——本程序对该任务强制 `split=1`、`max-connection-per-server=1`，因为并发调大只会招致几小时到几天的**惩罚性降速**。实测免费账号单线程只有 **0.10 MB/s**（60 秒下 4.9 MB），这是百度给免费账号的额度；想要快只能开会员，或在**官方 PC 客户端**里打开「设置 → 传输 → 下载提速」（见下面的 FAQ）。
+  - 另外两个 2026 年的坑：① 取直链**不再**用 `/api/download?type=dlink&sign=…`（`/api/gettemplatevariable` 已经不返回 `sign` 字段，只会得到 `errno=113/2`），要改用 **`/api/filemetas?dlink=1&fsids=[…]`**，它直接返回 `https://d.pcs.baidu.com/file/…?fid=…&sign=…`；② 收割 cookie 必须**按 URL 作用域**（`cookies.get({url:'https://pan.baidu.com/'})`），把 `passport.baidu.com`/`pcs.baidu.com` 那些域的 cookie 一起发给 `pan.baidu.com` 会被判 **`errno=-6 身份验证错误`**（实测 2068 字符全量 → -6，1410 字符作用域内 → 成功）。
+  - 转存目标目录 `/PanBox` 不存在时 `/share/transfer` 会回 `errno=2 转存路径不存在`，所以程序会先调 `/api/create` 建目录；`errno=12`（同名文件已存在）和 `errno=4`（文件已转存）都按成功处理，并且**只有本次新出现的 fs_id 才会被登记回收**，绝不会删掉你本来就有的文件。
 - **迅雷**：分享可以完全匿名浏览（文件名、体积、目录都能读到），但**转存和取直链的接口一律回 401**，必须用你自己的账号。凭证在浏览器 localStorage 里（不是 cookie），所以登录窗口走的是读 localStorage 的通道。取直链的 `client_id` 也必须跟网页版一致（`Xqp0kJBXWhwaTpB6`），安卓 App 的 `captcha_sign` 配上网页 `client_id` 会被服务端判 `invalid captcha_sign`。下载时直链**只认安卓 Dalvik UA**，用浏览器 UA 会在十几秒后回 `503`。
 
 ### 怎么登录
@@ -50,12 +52,13 @@
 
 ### 不会污染你的网盘
 
-夸克 / UC 只能靠「转存到你自己网盘 → 取直链」拿到可下载的地址，这会往你网盘里放一份副本。本程序保证**下载一完成就把它删掉**：
+夸克 / UC / 百度 / 迅雷 只能靠「转存到你自己网盘 → 取直链」拿到可下载的地址，这会往你网盘里放一份副本。本程序保证**用完就删**：
 
 - 转存**之前**先给目标目录拍快照，只有「转存之后新出现的文件」才会被登记为待删——**用户自己原有的同名文件绝不会被误删**。
 - 转存后若因同名冲突被系统改名成 `xxx(1).zip`，也能正确认领并回收（早期版本会漏掉这种，已在 `electron/parsers/clouddrive.js` 的 `sameName()` 里修好）。
-- 任务列表 `complete` 后 800ms 内触发回收；若你恰好在这瞬间关掉程序，`before-quit` 会补收一次。
-- **只回收已下载完成的任务**——没下完的还需要那份副本续传，绝不能删。
+- 三个回收时机都覆盖到了：① 任务 `complete` 后 800ms 内；② **你在下载途中点「✕ 删除」撤销任务时立刻回收**（早期版本漏了这条，中途取消会把副本永久留在网盘里）；③ 退出程序时 `before-quit` 对已完成任务补收一次。
+- **未完成又被撤销的任务会回收，未完成且还在队列里的不会回收**——后者还需要那份副本续传，绝不能删。
+- 百度/迅雷这类「一次转存整批」的网盘只发**一次**转存请求和**一次**取直链请求（早期版本是每个文件各来一遍，8 个文件的目录分享要打 16 轮 API）；回收时也是一次请求删掉整批。
 - 兜底工具：`electron test/cleanup-quark-junk.js [文件名关键词]`（不带参数只列出、带参数才删，且不碰文件夹）。
 
 ### 其他开关
@@ -185,6 +188,10 @@ Start-Process node_modules\electron\dist\electron.exe `
 | `e2e-netdisk.js` | **真实网盘**端到端：解析 → 直链 → aria2 多线程 → 字节校验 |
 | `ui-e2e.js` | **界面级**端到端：开真窗口 → 填链接 → 点「解析」→ 点「开始下载」→ 校验文件 → 截图 |
 | `verify-recycle.js` | 验证"转存副本自动回收"闭环 |
+| `verify-baidu-recycle.js` | 百度：批量转存 + 取直链 + 回收闭环（目录分享一次转存 8 个文件） |
+| `verify-uc-recycle.js` | UC / 夸克：转存 + 取直链 + 回收闭环 |
+| `verify-xunlei-recycle.js` | 迅雷：转存 + 取直链 + 回收闭环 |
+| `ui-cancel-recycle.js` | **界面级**：下载途中撤销任务 → 确认转存副本也被回收 |
 | `verify-login-refresh.js` | 验证 `__puus` 重新生成 + UC 凭证探查 |
 | `login-and-save.js` | 打开登录窗口并把 cookie 写进 settings |
 | `batch-live.js` | 批量真实链接解析 |

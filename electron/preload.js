@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('panbox', {
   addDownloads: (p) => invoke('downloads:add', p),
   pauseTask: (gid) => invoke('downloads:pause', gid),
   resumeTask: (gid) => invoke('downloads:resume', gid),
+  refreshTask: (gid) => invoke('downloads:refresh', gid),
   removeTask: (gid) => invoke('downloads:remove', gid),
   pauseAll: () => invoke('downloads:pauseAll'),
   resumeAll: () => invoke('downloads:resumeAll'),

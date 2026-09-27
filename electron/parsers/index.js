@@ -35,10 +35,16 @@ function gc() {
   for (const [k, v] of sessions) if (now - v.createdAt > SESSION_TTL) sessions.delete(k)
 }
 
+/* 已经认得出域名、但**没有实现**解析器的网盘。
+ * 必须在这里显式拦掉，否则会被下面的「兜底当直链」分支接手，
+ * 拿分享页 URL 去 HEAD 一番，给用户一个莫名其妙的结果。 */
+const KNOWN_UNSUPPORTED = { aliyun: '阿里云盘' }
+
 function pickParser(url) {
   const nd = detectNetdisk(url)
   const p = PARSERS[nd]
   if (p) return { parser: p, netdisk: nd }
+  if (KNOWN_UNSUPPORTED[nd]) return { parser: null, netdisk: nd, unsupported: KNOWN_UNSUPPORTED[nd] }
   // 兜底：直接当直链
   if (/^https?:\/\//i.test(url)) return { parser: direct, netdisk: 'direct' }
   return null
@@ -66,6 +72,16 @@ async function parseShare({ text, password, settings }) {
   for (const url of urls) {
     const t = Date.now()
     const hit = pickParser(url)
+    if (hit && hit.unsupported) {
+      results.push({
+        ok: false,
+        netdisk: 'unknown',
+        files: [],
+        source: url,
+        message: `暂不支持${hit.unsupported}：这个网盘的解析器还没实现（本项目当前支持蓝奏云 / 蓝奏优享 / 夸克 / UC / 百度 / 迅雷 / 123云盘 / 直链）。`,
+      })
+      continue
+    }
     if (!hit) {
       results.push({ ok: false, netdisk: 'unknown', files: [], source: url, message: `不支持的链接：${url}` })
       continue
