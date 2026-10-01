@@ -283,12 +283,22 @@ async function clearLogin(netdisk) {
  * 而 `__puus` 会过期，settings.json 里存的那份迟早失效，所以每次取直链前都要「暖」一次。
  */
 const FRESH = {
-  quark: { name: '__puus', minTtlSec: 2 * 3600, warmMs: 12000 },
-  uc: { name: '__puus', minTtlSec: 2 * 3600, warmMs: 12000 },
+  quark: { name: '__puus', minTtlSec: 2 * 3600, warmMs: 15000 },
+  uc: { name: '__puus', minTtlSec: 2 * 3600, warmMs: 15000 },
   baidu: null,
   // 迅雷没有短效 cookie，凭证在 localStorage 里，每次重读一遍即可
   xunlei: { name: '', minTtlSec: 0, warmMs: 0 },
 }
+
+/**
+ * 本进程内「这个令牌是我刚预热出来的」记录：netdisk -> { value, at }。
+ *
+ * 为什么需要它：`__puus` 这类令牌**多半是会话型 cookie（没有 expirationDate）**，
+ * Chromium 不会把它写进磁盘，程序一重启分区里就没有了 —— 于是 `freshEnough()` 永远为假，
+ * 「每次解析都开一次隐藏窗口预热」既慢又容易失败（失败还会被上层当成「没登录」）。
+ * 只要**本次运行内**刚预热过、分区里那个值也没变，就认为它够新。
+ */
+const warmedAt = new Map()
 
 /**
  * 让网盘首页把短效令牌重新种进登录分区，然后回收完整 cookie。
@@ -311,10 +321,26 @@ async function refreshCookie(netdisk, opts = {}) {
     return { header: cookieHeader(mine), list: mine, loggedIn: site.logged(mine) }
   }
 
+  const cookieNow = async () => {
+    if (!freshener || !freshener.name) return null
+    return (await ses.cookies.get({ name: freshener.name }))[0] || null
+  }
+
   const freshEnough = async () => {
-    if (!freshener || !freshener.name) return false
-    const c = (await ses.cookies.get({ name: freshener.name }))[0]
-    return !!(c && c.value && c.expirationDate && c.expirationDate - Date.now() / 1000 > freshener.minTtlSec)
+    const c = await cookieNow()
+    if (!c || !c.value) return false
+    /* ① 有明确有效期且还够久 → 直接用 */
+    if (c.expirationDate && c.expirationDate - Date.now() / 1000 > freshener.minTtlSec) return true
+    /* ② 会话型 cookie：只要**本次运行内**刚预热出这个值，就当它够新 */
+    const w = warmedAt.get(netdisk)
+    if (w && w.value === c.value && Date.now() - w.at < freshener.minTtlSec * 1000) return true
+    return false
+  }
+
+  const rememberWarm = async () => {
+    const c = await cookieNow()
+    if (c && c.value) warmedAt.set(netdisk, { value: c.value, at: Date.now() })
+    else warmedAt.delete(netdisk)
   }
 
   if (!opts.force && (await freshEnough())) {
@@ -329,15 +355,41 @@ async function refreshCookie(netdisk, opts = {}) {
       show: false,
       width: 1100,
       height: 780,
-      webPreferences: { partition, contextIsolation: true, nodeIntegration: false, sandbox: true },
+      webPreferences: {
+        partition,
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        /* 关键：隐藏窗口默认会被 Chromium 降频（计时器被拉长到 1 秒甚至 1 分钟一档）。
+         * `__puus` 是页面脚本现场算出来种下的，降频会让「前台几百毫秒」的预热
+         * 拖到十几秒还没完成 —— 上层就会以为用户没登录（0.6.6 之前每次重启后
+         * 首次解析都失败、甚至把已存的凭证抹掉，根因就在这里）。 */
+        backgroundThrottling: false,
+      },
+    })
+    /* 先把页面等出来再轮询令牌：SPA 首屏要几秒，之前是从打开窗口那一刻就开始掐 12 秒，
+     * 网络稍慢就必然超时。 */
+    const pageSettled = new Promise((resolve) => {
+      let done = false
+      const fin = () => {
+        if (!done) {
+          done = true
+          resolve(true)
+        }
+      }
+      win.webContents.once('did-finish-load', fin)
+      win.webContents.once('did-fail-load', fin)
+      setTimeout(fin, 15000)
     })
     await win.loadURL(site.url).catch(() => {})
+    await pageSettled
     if (freshener && freshener.name) {
       const deadline = Date.now() + freshener.warmMs
       while (Date.now() < deadline) {
         await sleep(700)
         if (await freshEnough()) break
       }
+      await rememberWarm()
     } else if (needRead) {
       // localStorage 型凭证：页面加载完还要等前端脚本把 token 写进去
       await sleep(2000)

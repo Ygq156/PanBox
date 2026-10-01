@@ -499,6 +499,14 @@ function SettingsModal({
               />
               下载完成后自动打开下载目录
             </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={s.closeToTray !== false}
+                onChange={(e) => patch({ closeToTray: e.target.checked })}
+              />
+              点 × 关闭窗口后留在后台继续下载（托盘图标可再打开）
+            </label>
           </Section>
 
           <Section title="下载引擎">

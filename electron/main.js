@@ -1,6 +1,6 @@
 'use strict'
 
-const { app, BrowserWindow, ipcMain, dialog, shell, session } = require('electron')
+const { app, BrowserWindow, ipcMain, dialog, shell, session, Tray, Menu, nativeImage } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 
@@ -194,6 +194,14 @@ boot('=== boot ===', 'pid=' + process.pid, 'isPackaged=' + app.isPackaged, 'exe=
 
 const isDev = !app.isPackaged
 let win = null
+/* 托盘。为什么要有：下载引擎是要长时间跑的（aria2 + 自研分段器），
+ * 关窗口就退出会把没下完的任务全掐死；同时浏览器插件的本地通道也要一直在。
+ * 默认「点 × 收进托盘」，真退出走托盘菜单里的「退出 PanBox」。可在设置里关掉。 */
+let tray = null
+/* 真正要退出了（托盘退出 / 系统关机 / app.quit()）。窗口的 close 处理靠它放行。 */
+let isQuitting = false
+/* 只在本次运行里弹一次「还在后台跑」的气泡，别每次关窗口都弹 */
+let trayHinted = false
 let aria2Ready = false
 let aria2Error = ''
 
@@ -337,6 +345,27 @@ function createWindow() {
   win.once('ready-to-show', () => win.show())
   win.on('closed', () => {
     win = null
+  })
+  /* 点 × 不退出，收进托盘继续下载（设置里可以关掉这个行为）。
+   * 注意判 isQuitting：托盘菜单的「退出」、系统关机都走 app.quit()，
+   * 那时候必须真的关掉窗口，否则程序退不出去。 */
+  win.on('close', (e) => {
+    if (isQuitting) return
+    if (!settings.load().closeToTray) return
+    e.preventDefault()
+    win.hide()
+    ensureTray()
+    if (!trayHinted) {
+      trayHinted = true
+      try {
+        tray.displayBalloon({
+          title: 'PanBox 仍在后台运行',
+          content: '下载不会中断，点托盘图标可以再打开窗口；要彻底退出请用托盘菜单的「退出」。',
+        })
+      } catch {
+        /* 某些系统不支持气泡，忽略 */
+      }
+    }
   })
 
   /* 导航管控：界面是单页应用，任何「整页跳转」都不是正常行为
@@ -710,22 +739,22 @@ function registerIpc() {
     for (const nd of need) {
       try {
         const r = await login.refreshCookie(nd)
-        /* 分区里没有登录态时收回来的只是匿名 cookie（UC 匿名访问也会种
-         * `UDRIVE_TRANSFER_SESS` 之类），留着它只会让 UI 误以为「已经登录」，
-         * 所以直接丢掉，让 needCookie 提示正常浮出来。 */
-        if (r && r.loggedIn === false) {
-          if (jar[nd]) {
-            delete jar[nd]
+        /* ⚠️ 这里绝对**不能**因为「这次预热没拿到登录态」就删掉用户已存的凭证。
+         *
+         * 0.6.6 及以前是 `if (r.loggedIn === false) delete jar[nd]`：隐藏窗口预热
+         * 一旦超时（网络慢、令牌是会话型 cookie 重启后没了），就会把用户刚登录好的
+         * 夸克/UC 凭证从 settings.json 里抹掉 —— 表现就是「每次退出重进都要重新登录」。
+         * 现在只有**明确拿到登录态**时才覆盖；拿不到就原样保留，让解析器拿旧凭证去试，
+         * 真失效了会由解析器给出「凭证已失效，请重新登录」的明确提示。 */
+        if (r && r.loggedIn === true && r.header) {
+          if (r.header !== jar[nd]) {
+            jar[nd] = r.header
             changed = true
-            boot('warm-drop', nd, '匿名凭证已丢弃')
+            boot('warm', nd, 'refreshed=' + r.refreshed, 'loggedIn=true', 'len=' + r.header.length)
           }
           continue
         }
-        if (r && r.header && r.header !== jar[nd]) {
-          jar[nd] = r.header
-          changed = true
-          boot('warm', nd, 'refreshed=' + r.refreshed, 'loggedIn=' + r.loggedIn, 'len=' + r.header.length)
-        }
+        boot('warm-keep', nd, jar[nd] ? '预热未拿到登录态，保留原凭证' : '没有登录态，不收匿名凭证')
       } catch (e) {
         boot('warm-fail', nd, e && e.message ? e.message : String(e))
       }
@@ -947,6 +976,68 @@ function registerIpc() {
 }
 
 /* ------------------------------------------------------------------ */
+/* 托盘 / 窗口显隐                                                      */
+/* ------------------------------------------------------------------ */
+
+/** 托盘图标：`build/` 不进安装包，所以打包版从 extraResources 里取。 */
+function trayIconPath() {
+  const packed = path.join(process.resourcesPath || '', 'tray.png')
+  if (app.isPackaged && fs.existsSync(packed)) return packed
+  const dev = path.join(__dirname, '..', 'resources', 'tray.png')
+  if (fs.existsSync(dev)) return dev
+  // 兜底：仓库里的应用图标（打包版里没有，只在开发目录有效）
+  const fallback = path.join(__dirname, '..', 'build', 'icon.png')
+  return fs.existsSync(fallback) ? fallback : ''
+}
+
+/** 把主窗口弄出来（没有就新建，有就恢复+聚焦）。托盘菜单、二次启动、activate 都用它。 */
+function showMain() {
+  if (!win || win.isDestroyed()) {
+    createWindow()
+    return
+  }
+  if (win.isMinimized()) win.restore()
+  if (!win.isVisible()) win.show()
+  win.focus()
+}
+
+function quitApp() {
+  isQuitting = true
+  app.quit()
+}
+
+function ensureTray() {
+  if (tray && !tray.isDestroyed()) return tray
+  const p = trayIconPath()
+  let img = nativeImage.createFromPath(p || undefined)
+  if (img.isEmpty()) img = nativeImage.createEmpty()
+  else img = img.resize({ width: 16, height: 16 })
+  tray = new Tray(img)
+  tray.setToolTip('PanBox 网盘快取')
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: '显示主界面', click: () => showMain() },
+      {
+        label: '打开下载目录',
+        click: () => {
+          try {
+            shell.openPath(settings.load().downloadDir)
+          } catch {
+            /* ignore */
+          }
+        },
+      },
+      { type: 'separator' },
+      { label: '退出 PanBox', click: () => quitApp() },
+    ]),
+  )
+  // 左键单击/双击都能把窗口叫回来
+  tray.on('click', () => showMain())
+  tray.on('double-click', () => showMain())
+  return tray
+}
+
+/* ------------------------------------------------------------------ */
 /* 启动                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -956,10 +1047,7 @@ if (!gotLock) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    if (win) {
-      if (win.isMinimized()) win.restore()
-      win.focus()
-    }
+    showMain()
   })
 
   app.whenReady().then(async () => {
@@ -998,20 +1086,26 @@ if (!gotLock) {
     await startBridge().catch((e) => boot('bridge-err', String((e && e.message) || e)))
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+      showMain()
     })
   })
 
+  /* 窗口全关了要不要退出，取决于「关闭到后台」这个设置：
+   * 打开时留在托盘继续下载（下载引擎与插件通道都在主进程，跟窗口无关）；
+   * 关掉时保持老行为，关窗口就退出。 */
   app.on('window-all-closed', () => {
-    app.quit()
+    if (isQuitting) return
+    if (!settings.load().closeToTray) app.quit()
   })
 
   /* 退出前把「已下载完成但还没轮到回收」的转存副本补收一次，
    * 免得用户关得快就留下一份垃圾。**只收已 complete 的**：
    * 没下完的任务还需要那份转存文件来续传，绝不能删。 */
-  let quitting = false
+  let cleanupDone = false
   app.on('before-quit', async (e) => {
-    if (!quitting) {
+    /* 先立旗：窗口的 close 处理看到它才会真的关窗，而不是收进托盘 */
+    isQuitting = true
+    if (!cleanupDone) {
       const sids = new Set()
       for (const t of tasks.list()) {
         if (!t || t.status !== 'complete') continue
@@ -1022,7 +1116,7 @@ if (!gotLock) {
       }
       if (sids.size) {
         e.preventDefault()
-        quitting = true
+        cleanupDone = true
         const rs = await Promise.all([...sids].map((sid) => parsers.cleanupDownloaded(sid).catch(() => false)))
         boot('recycle-quit', [...sids].join(','), 'ok=' + rs.filter(Boolean).length)
         app.quit()
