@@ -1,7 +1,7 @@
 {
   "name": "panbox",
   "productName": "PanBox",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "PanBox 网盘快取 —— 多网盘分享链接解析 + aria2 多线程下载桌面客户端",
   "main": "electron/main.js",
@@ -31,6 +31,10 @@
       {
         "from": "resources/aria2",
         "to": "aria2"
+      },
+      {
+        "from": "resources/extension",
+        "to": "extension"
       }
     ],
     "win": {

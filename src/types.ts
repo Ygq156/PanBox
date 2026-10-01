@@ -131,6 +131,13 @@ export interface Settings {
    * 所以这两个网盘改用自研引擎开更多连接。百度不在此列（账号级限速，加连接会 403）。
    */
   segConnections?: Record<string, number>
+  /**
+   * 浏览器插件接收通道（见 electron/core/bridge.js）。
+   * 只监听 127.0.0.1，投递任务要带 bridgeToken。
+   */
+  bridgeEnabled?: boolean
+  bridgePort?: number
+  bridgeToken?: string
 }
 
 export interface Aria2Status {

@@ -468,12 +468,19 @@ function makeParser(key) {
       const got = await downloadByFids(todo)
       for (const [k, v] of got) map.set(k, v)
     }
+    /* `search_exit === true`（查重命中）**不等于**「盘上没有新副本」：
+     * 查重索引命中的可能是同内容但**已经被删/改名**的那一份，夸克照样会新落一份 `xxx(1).zip`。
+     * 实测（`electron test/cleanup-quark-junk.js`）就抓到过这种泄漏：副本躺在用户网盘里
+     * 永远没人回收。所以只要走了快路又没拿到轮询结果，就补一次列目录 ——
+     * `collectByPolling()` 的 `ours` 判据（转存前不存在同名文件）是唯一可靠的回收依据，
+     * 宁可多花一次列目录的时间，也不能把副本留在用户网盘里。 */
+    if (!polled.length && usedHint) polled = await collectByPolling()
     if (!polled.length) debugDump([], [], usedHint)
 
     /* ── 登记待删。两套依据，都要求「这份副本确实是我们刚造的」：
      *   ① 轮询结果：转存前不存在同名文件 → ours=true（最可靠）；
      *   ② 快路：`search_exit === false` = 服务端没找到同名文件、确实新落了一份盘。
-     *      `search_exit === true` 意味着查重命中、根本没有新副本，不需要（也不该）登记。 */
+     *      `search_exit === true` 时**不再**直接放弃登记，而是靠上面补的那次轮询来判定。 */
     if (polled.length) {
       for (const it of polled) if (it.ours && map.has(it.entry.fid)) transferred.push(it.fid)
     } else if (usedHint && saveAs.search_exit === false) {

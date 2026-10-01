@@ -10,6 +10,8 @@ const seg = require('./core/segmentDownloader')
 const tasks = require('./core/taskManager')
 const parsers = require('./parsers')
 const login = require('./core/login')
+const bridge = require('./core/bridge')
+const { detectNetdisk } = require('./parsers/util')
 
 /** 下载产物文件名 -> 解析会话 id，交给下面的 recycleTransferCopy 消费 */
 const downloadsCleanup = new Map()
@@ -121,6 +123,15 @@ function indexHtml() {
   return path.join(__dirname, '..', 'dist', 'index.html')
 }
 
+/** 浏览器插件（未打包的扩展目录）在哪儿 —— 「设置 → 浏览器插件」上的按钮就打开它 */
+function extensionDir() {
+  const candidates = isDev
+    ? [path.join(__dirname, '..', 'resources', 'extension')]
+    : [path.join(process.resourcesPath, 'extension'), path.join(__dirname, '..', 'resources', 'extension')]
+  for (const c of candidates) if (fs.existsSync(c)) return c
+  return candidates[0]
+}
+
 /* ------------------------------------------------------------------ */
 /* 工具                                                                */
 /* ------------------------------------------------------------------ */
@@ -197,6 +208,187 @@ function createWindow() {
 /* IPC                                                                 */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 把一批已经拿到直链的文件真正排进下载队列。
+ * 两个入口共用：渲染层的 `downloads:add`，和浏览器插件的 HTTP 通道（bridge）。
+ */
+async function addResolved(cfg, { session, netdisk, source, title, sessionId }) {
+  const added = []
+  const errors = []
+  const shareTitle = sanitizeName(title || 'PanBox')
+  /* 只有一个文件、且它没有目录归属时，直接落在下载根目录。
+   * 否则会出现「下载目录/文件名/文件名」这种多此一举的嵌套——
+   * 蓝奏优享这类「分享标题就等于文件名」的网盘必然踩到。 */
+  const nest = session.length > 1 || session.some((f) => f.dir)
+
+  for (const f of session) {
+    const subdir = nest
+      ? path.join(cfg.downloadDir, shareTitle, ...(f.dir ? String(f.dir).split(/[\\/]/).filter(Boolean).map(sanitizeName) : []))
+      : cfg.downloadDir
+    try {
+      fs.mkdirSync(subdir, { recursive: true })
+    } catch {
+      /* ignore */
+    }
+    /* 百度按「账号」维度限速：并发调大只会招致几小时~几天的惩罚性降速。
+     * 但如果这条直链是用户自己的「解析接口」给的（别人的会员账号出的链），
+     * 那限速档位就不是用户的账号了，再限成单线程等于白配——所以跳过这个限制。 */
+    const perEndpoint = session.some((x) => x.viaEndpoint)
+    const isBaidu = netdisk === 'baidu' && !perEndpoint
+    /* 不用分段引擎的那几家，aria2 的并发也要按网盘调（默认 16 会招来 503/403） */
+    const split = isBaidu ? 1 : perEndpoint ? cfg.split : ARIA2_SPLIT_OVERRIDE[netdisk] || cfg.split
+    const options = {
+      dir: subdir,
+      out: sanitizeName(f.name),
+      continue: 'true',
+      split: String(split),
+      'max-connection-per-server': String(split),
+      'min-split-size': cfg.minSplitSize,
+      'user-agent': cfg.userAgent,
+      'check-certificate': 'false',
+    }
+    const header = buildHeaders(f.headers)
+    if (header.length) options.header = header
+    const segConns = perEndpoint ? 0 : segConnectionsFor(cfg, netdisk)
+    try {
+      let gid = ''
+      let engine = 'aria2'
+      if (segConns && f.url) {
+        try {
+          gid = await seg.add({
+            url: f.url,
+            headers: f.headers || {},
+            dir: subdir,
+            out: sanitizeName(f.name),
+            connections: segConns,
+            netdisk,
+            source,
+          })
+          engine = 'seg'
+        } catch (e) {
+          /* 不支持 Range（老服务器）、或者探测失败 → 回退 aria2，别让任务加不进来 */
+          boot('seg-fallback', netdisk, f.name, (e && e.message) || String(e))
+          gid = ''
+        }
+      }
+      if (!gid) {
+        gid = await aria2.addUri([f.url], options)
+        engine = 'aria2'
+      }
+      tasks.remember(gid, {
+        name: f.name,
+        netdisk,
+        source,
+        dir: subdir,
+        engine,
+        /* 重新解析直链所需的一切：网盘直链（夸克/UC/百度/迅雷）会过期，
+         * 或者节点太慢时，可以「换直链」重新取一条。 */
+        origin: {
+          source,
+          netdisk,
+          title: shareTitle,
+          name: f.name,
+          dir: f.dir || '',
+          engine,
+          opts: { ...options },
+        },
+      })
+      /* 夸克/UC 是「转存→取直链」，用户网盘里会多一份拷贝；登记下来，
+       * 等这个任务 complete 时回收（见下面的 tasks.on('update')）。 */
+      if (sessionId) downloadsCleanup.set(String(f.name), sessionId)
+      added.push(gid)
+    } catch (e) {
+      errors.push(`${f.name}: ${e && e.message ? e.message : e}`)
+    }
+  }
+  await tasks._tick().catch(() => {})
+  return { added, errors }
+}
+
+/* ------------------------------------------------------------------ */
+/* 浏览器插件接收通道                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 插件投递进来的一条下载。
+ * - 普通 http(s) 文件地址：直接交给下载引擎（带上插件抓到的 Referer / Cookie / UA，
+ *   很多站点的直链离开这几个请求头就会 403 —— 这正是浏览器自带下载器给不出来的东西）。
+ * - 网盘分享链接：**不在这里擅自决定下哪些文件**，只把窗口叫到最前面并预填链接，
+ *   让用户自己勾选。网盘要转存、要凭证，交给通道自动做既不透明也容易出事。
+ */
+async function bridgeAdd(p) {
+  const url = String((p && p.url) || '')
+  if (!/^https?:\/\//i.test(url)) return { ok: false, message: '只接受 http(s) 地址' }
+
+  const nd = detectNetdisk(url)
+  if (nd && nd !== 'direct' && nd !== 'unknown') {
+    if (win && !win.isDestroyed()) {
+      if (win.isMinimized()) win.restore()
+      win.show()
+      win.focus()
+      win.webContents.send('bridge:prefill', { url, netdisk: nd })
+    }
+    return { ok: true, kind: 'share', name: '', message: '这是网盘分享链接，已在 PanBox 里打开，请勾选要下载的文件' }
+  }
+
+  const cfg = settings.load()
+  const headers = { ...((p && p.headers) || {}) }
+  if (p && p.referer && !headers.Referer) headers.Referer = p.referer
+  if (p && p.userAgent) headers['User-Agent'] = p.userAgent
+  if (p && p.cookie) headers.Cookie = p.cookie
+
+  let name = sanitizeName((p && p.name) || '')
+  if (!name) {
+    try {
+      const seg2 = new URL(url).pathname.split('/').filter(Boolean).pop() || ''
+      name = sanitizeName(decodeURIComponent(seg2))
+    } catch {
+      name = ''
+    }
+  }
+  if (!name) name = 'download.bin'
+
+  const session = [{ id: '0', name, size: Number((p && p.size) || 0), isDir: false, dir: '', url, headers }]
+  const r = await addResolved(cfg, {
+    session,
+    netdisk: 'direct',
+    source: (p && p.referer) || '',
+    title: (p && p.pageTitle) || name,
+  })
+  if (!r.added.length) return { ok: false, message: r.errors[0] || '加入下载队列失败' }
+  return { ok: true, kind: 'direct', name, gid: r.added[0], message: `已加入下载队列：${name}` }
+}
+
+/** 拿（必要时生成）桥的配置。令牌只存在本机 settings.json 里。 */
+function bridgeCfg() {
+  const cfg = settings.load()
+  if (!cfg.bridgeToken) cfg.bridgeToken = settings.save({ bridgeToken: bridge.ensureToken('') }).bridgeToken
+  return cfg
+}
+
+async function startBridge() {
+  const cfg = bridgeCfg()
+  if (!cfg.bridgeEnabled) {
+    await bridge.stop().catch(() => {})
+    return bridge.status()
+  }
+  const st = await bridge.start({ port: cfg.bridgePort, token: cfg.bridgeToken }, bridgeAdd)
+  boot('bridge', 'running=' + st.running, 'port=' + st.port, st.error || '')
+  return st
+}
+
+function bridgeInfo() {
+  const cfg = bridgeCfg()
+  const dir = extensionDir()
+  return {
+    ...bridge.status(),
+    enabled: !!cfg.bridgeEnabled,
+    token: cfg.bridgeToken,
+    extDir: dir,
+    extExists: fs.existsSync(path.join(dir, 'manifest.json')),
+  }
+}
+
 function registerIpc() {
   ipcMain.handle('settings:get', () => settings.load())
 
@@ -222,7 +414,34 @@ function registerIpc() {
         })
         .catch(() => {})
     }
+    /* 插件通道的开关/端口/令牌变了就重开监听（端口占用等问题会反映在 bridge.status().error 里） */
+    if (
+      after.bridgeEnabled !== before.bridgeEnabled ||
+      String(after.bridgePort) !== String(before.bridgePort) ||
+      String(after.bridgeToken) !== String(before.bridgeToken)
+    ) {
+      await startBridge().catch(() => {})
+    }
     return after
+  })
+
+  ipcMain.handle('bridge:status', () => bridgeInfo())
+
+  ipcMain.handle('bridge:start', async () => {
+    await startBridge()
+    return bridgeInfo()
+  })
+
+  ipcMain.handle('bridge:openFolder', async () => {
+    const dir = extensionDir()
+    const err = await shell.openPath(dir)
+    return { ok: !err, dir, message: err || '' }
+  })
+
+  ipcMain.handle('bridge:newToken', async () => {
+    settings.save({ bridgeToken: bridge.ensureToken('') })
+    await startBridge()
+    return bridgeInfo()
   })
 
   ipcMain.handle('dialog:pickDir', async () => {
@@ -335,8 +554,6 @@ function registerIpc() {
 
   ipcMain.handle('downloads:add', async (_e, payload) => {
     const cfg = settings.load()
-    const added = []
-    const errors = []
     const netdisk = (payload && payload.netdisk) || 'unknown'
     const source = (payload && payload.source) || ''
     let session = null
@@ -353,94 +570,14 @@ function registerIpc() {
       return { ok: false, added: [], errors: ['没有可下载的文件'] }
     }
 
-    const shareTitle = sanitizeName((payload && payload.title) || 'PanBox')
-    /* 只有一个文件、且它没有目录归属时，直接落在下载根目录。
-     * 否则会出现「下载目录/文件名/文件名」这种多此一举的嵌套——
-     * 蓝奏优享这类「分享标题就等于文件名」的网盘必然踩到。 */
-    const nest = session.length > 1 || session.some((f) => f.dir)
-
-    for (const f of session) {
-      const subdir = nest
-        ? path.join(cfg.downloadDir, shareTitle, ...(f.dir ? String(f.dir).split(/[\\/]/).filter(Boolean).map(sanitizeName) : []))
-        : cfg.downloadDir
-      try {
-        fs.mkdirSync(subdir, { recursive: true })
-      } catch {
-        /* ignore */
-      }
-      /* 百度按「账号」维度限速：并发调大只会招致几小时~几天的惩罚性降速。
-       * 但如果这条直链是用户自己的「解析接口」给的（别人的会员账号出的链），
-       * 那限速档位就不是用户的账号了，再限成单线程等于白配——所以跳过这个限制。 */
-      const perEndpoint = session.some((x) => x.viaEndpoint)
-      const isBaidu = netdisk === 'baidu' && !perEndpoint
-      /* 不用分段引擎的那几家，aria2 的并发也要按网盘调（默认 16 会招来 503/403） */
-      const split = isBaidu ? 1 : perEndpoint ? cfg.split : ARIA2_SPLIT_OVERRIDE[netdisk] || cfg.split
-      const options = {
-        dir: subdir,
-        out: sanitizeName(f.name),
-        continue: 'true',
-        split: String(split),
-        'max-connection-per-server': String(split),
-        'min-split-size': cfg.minSplitSize,
-        'user-agent': cfg.userAgent,
-        'check-certificate': 'false',
-      }
-      const header = buildHeaders(f.headers)
-      if (header.length) options.header = header
-      const segConns = perEndpoint ? 0 : segConnectionsFor(cfg, netdisk)
-      try {
-        let gid = ''
-        let engine = 'aria2'
-        if (segConns && f.url) {
-          try {
-            gid = await seg.add({
-              url: f.url,
-              headers: f.headers || {},
-              dir: subdir,
-              out: sanitizeName(f.name),
-              connections: segConns,
-              netdisk,
-              source,
-            })
-            engine = 'seg'
-          } catch (e) {
-            /* 不支持 Range（老服务器）、或者探测失败 → 回退 aria2，别让任务加不进来 */
-            boot('seg-fallback', netdisk, f.name, (e && e.message) || String(e))
-            gid = ''
-          }
-        }
-        if (!gid) {
-          gid = await aria2.addUri([f.url], options)
-          engine = 'aria2'
-        }
-        tasks.remember(gid, {
-          name: f.name,
-          netdisk,
-          source,
-          dir: subdir,
-          engine,
-          /* 重新解析直链所需的一切：网盘直链（夸克/UC/百度/迅雷）会过期，
-           * 或者节点太慢时，可以「换直链」重新取一条。 */
-          origin: {
-            source,
-            netdisk,
-            title: shareTitle,
-            name: f.name,
-            dir: f.dir || '',
-            engine,
-            opts: { ...options },
-          },
-        })
-        /* 夸克/UC 是「转存→取直链」，用户网盘里会多一份拷贝；登记下来，
-         * 等这个任务 complete 时回收（见下面的 tasks.on('update')）。 */
-        if (payload && payload.sessionId) downloadsCleanup.set(String(f.name), payload.sessionId)
-        added.push(gid)
-      } catch (e) {
-        errors.push(`${f.name}: ${e && e.message ? e.message : e}`)
-      }
-    }
-    await tasks._tick().catch(() => {})
-    return { ok: added.length > 0, added, errors }
+    const r = await addResolved(cfg, {
+      session,
+      netdisk,
+      source,
+      title: (payload && payload.title) || 'PanBox',
+      sessionId: payload && payload.sessionId ? String(payload.sessionId) : '',
+    })
+    return { ok: r.added.length > 0, added: r.added, errors: r.errors }
   })
 
   ipcMain.handle('downloads:list', () => tasks.list())
@@ -657,6 +794,8 @@ if (!gotLock) {
     boot('aria2 ready=' + aria2Ready + ' err=' + aria2Error)
     if (win && !win.isDestroyed()) win.webContents.send('aria2:update', { running: aria2Ready, error: aria2Error })
 
+    await startBridge().catch((e) => boot('bridge-err', String((e && e.message) || e)))
+
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
     })
@@ -693,6 +832,7 @@ if (!gotLock) {
     tasks.stop()
     /* 分段引擎要把断点信息落盘、关掉文件句柄，下次启动才能接着下 */
     await seg.flush().catch(() => {})
+    await bridge.stop().catch(() => {})
     await aria2.stop()
   })
 }
