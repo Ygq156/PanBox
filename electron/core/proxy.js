@@ -3,14 +3,14 @@
 /**
  * 代理探测与归一化。
  *
- * 为什么需要这个文件：实测发现 NDM 之所以下 GitHub 能到 5 MB/s，而 PanBox 只有 1 MB/s
- * （甚至经常直接 0 B/s、报 SSL/TLS handshake failure），差别不在连接数，而在**代理**：
- * NDM 会跟随 Windows 的系统代理（WinINET 设置 → 本机 Clash 127.0.0.1:7897），
- * PanBox 的 aria2 与自研分段引擎都是裸连，而被墙的线路裸连基本不可用。
+ * 为什么需要这个文件：实测发现同样下 GitHub，差别不在连接数，而在**出口**。
+ * 本机直连 github.com 会被 SNI 层间歇性重置（ETIMEDOUT / ECONNRESET），
+ * 而走系统代理时同一条链接能到 9 MB/s 且字节精确 —— 所以必须让 PanBox 认这个设置。
  *
- * 实测对照（同一个 GitHub 66 MB 资源，aria2 -x16 -s16）：
- *   直连           → SSL/TLS handshake failure，0 B/s
- *   --all-proxy=…  → 7.9 → 9.9 MiB/s，63 MiB 约 7 秒下完
+ * 实测对照（同一个 GitHub 66 MB 资源）：
+ *   直连           → 0 B/s，connect ETIMEDOUT / ECONNRESET（间歇性）
+ *   走系统代理     → 9.5 MB/s，约 7 秒下完
+ *   v0.6.4 的直连  → 2 MB/s（停顿重连 + 重定向只解一次之后）
  *
  * 所以这里读的是**系统代理**，而不是自己维护一份代理配置。
  */
@@ -41,7 +41,7 @@ function readReg(name) {
 
 /**
  * 把注册表里的写法统一成 `http://host:port`。
- * 可能是 `127.0.0.1:7897`，也可能是 `http=1.2.3.4:8080;https=1.2.3.4:9090`。
+ * 可能是 `127.0.0.1:7890`，也可能是 `http=1.2.3.4:8080;https=1.2.3.4:9090`。
  */
 function normalize(raw) {
   const s = String(raw || '').trim()

@@ -47,6 +47,13 @@ const MIN_CHUNK = 128 * 1024
 const MAX_CHUNK = 4 * 1024 * 1024
 /** 单个分片的失败重试次数 */
 const CHUNK_TRIES = 5
+
+/* 「空档看门狗」。直连跨境线路的典型症状是「先冲一阵、然后几十秒一个字节都不来」，
+ * 死等到 45 秒的连接超时只会把整条任务拖垮（实测直连 CDN 峰值能到 11 MB/s，平均却只有 0.9 MB/s）。
+ * 这里只要超过 STALL_MS 没有新数据就掐掉这一片，worker 会换一条全新连接重下。
+ * 注意计时器每收到一个数据块就重置，所以「只是慢、但在持续动」的连接不会被误杀。
+ * 要复现实验：PANBOX_SEG_STALL_MS=0 可关掉。 */
+const STALL_MS = Math.max(0, Number(process.env.PANBOX_SEG_STALL_MS ?? 3000))
 /** 并发被拒时最低降到几条 */
 const MIN_CONN = 4
 /** 探测真实大小时请求的字节数（`Range: bytes=0-0`） */
@@ -94,7 +101,7 @@ function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5,
         const next = new URL(res.headers.location, url).toString()
         return openStream(next, { headers, signal, timeout, redirects: redirects - 1, proxy }).then(resolve, reject)
       }
-      resolve({ status: code, headers: res.headers, stream: res })
+      resolve({ status: code, headers: res.headers, stream: res, url })
     }
     /* 每个请求都要能被 timeout / abort 掐掉，三种走法共用同一套收尾 */
     const armReq = (req) => {
@@ -504,7 +511,7 @@ class SegmentDownloader extends EventEmitter {
     const status = res.status
     await readAll(res.stream, 2048)
     if (status >= 400) throw new Error(httpError(status))
-    return { total, acceptRanges, status }
+    return { total, acceptRanges, status, finalUrl: res.url }
   }
 
   /** 探测大小、决定分片、打开（或恢复）分片文件 */
@@ -553,6 +560,18 @@ class SegmentDownloader extends EventEmitter {
         }
       }
       if (best && best.pr.acceptRanges) break
+    }
+    /* 重定向只解一次，之后所有分片直接打终点 CDN。
+     * 这是「同一条 GitHub 链接，NDM 有 5 MB/s 而 PanBox 只有 1 MB/s」的另一半原因：
+     * github.com 那一跳在本机是间歇性被重置的，如果每个分片都从它开始跟 302，
+     * 那么「换一条新连接重下」就永远要重新过一次鬼门关 —— 实测直连原始链接平均只有 0.68 MB/s，
+     * 换成终点 CDN 直连能到 3.02 MB/s（128 连接，见 test/probe-direct-conn.js）。 */
+    if (best && best.pr.finalUrl && best.pr.finalUrl !== t.url) {
+      const from = new URL(t.url).host
+      const to = new URL(best.pr.finalUrl).host
+      t.originUrl = t.originUrl || t.url
+      t.url = best.pr.finalUrl
+      if (from !== to) console.log(`[seg] 重定向 ${from} → ${to}，后续分片直连终点`)
     }
     if (!best) {
       const err = new Error('探测文件大小失败：' + ((lastErr && lastErr.message) || lastErr))
@@ -698,6 +717,13 @@ class SegmentDownloader extends EventEmitter {
       const ac = new AbortController()
       t.running.add(ac)
       let written = 0
+      let stallTimer = null
+      const armStall = (stream) => {
+        if (!STALL_MS) return
+        if (stallTimer) clearTimeout(stallTimer)
+        stallTimer = setTimeout(() => stream.destroy(new Error('长时间没有数据（停顿）')), STALL_MS)
+        if (stallTimer.unref) stallTimer.unref()
+      }
       try {
         const res = await openStream(t.url, {
           headers: { ...t.headers, Range: `bytes=${start}-${end}` },
@@ -713,6 +739,7 @@ class SegmentDownloader extends EventEmitter {
         if (res.status === 200 && t.chunkCount > 1) {
           throw new Error('服务端不支持 Range（返回了 200 整文件）')
         }
+        armStall(res.stream)
         for await (const buf of res.stream) {
           if (t.status !== 'active') throw new Error('已取消')
           if (!buf.length) continue
@@ -721,6 +748,7 @@ class SegmentDownloader extends EventEmitter {
           await t.fh.write(chunk, 0, chunk.length, start + written)
           written += chunk.length
           t.liveBytes += chunk.length
+          armStall(res.stream)
           if (written >= need) break
         }
         res.stream.destroy()
@@ -732,6 +760,7 @@ class SegmentDownloader extends EventEmitter {
         t.liveBytes = Math.max(0, t.liveBytes - written)
         await sleep(300 * (attempt + 1))
       } finally {
+        if (stallTimer) clearTimeout(stallTimer)
         t.running.delete(ac)
       }
     }
