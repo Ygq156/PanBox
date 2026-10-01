@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { api, formatEta, formatSize, formatSpeed } from './api'
-import type { BridgeStatus, ProxyStatus } from './api'
+import type { AppInfo, BridgeStatus, ProxyStatus, UpdateInfo } from './api'
 import type { Aria2Status, DownloadTask, ParseEndpoint, ParseResult, Settings } from './types'
 
 /* ------------------------------------------------------------------ */
@@ -409,28 +409,224 @@ function BridgeSection() {
 }
 
 /* ------------------------------------------------------------------ */
-/* 设置弹窗                                                            */
+/* 设置弹窗：左侧分类导航 + 右侧一屏一组                                */
 /* ------------------------------------------------------------------ */
+
+/** 分类。组数与每屏条目数是照调研（lx-music / shadcn-admin / Motrix）定的：一屏放得下一组。 */
+const SET_TABS = [
+  { id: 'general', name: '通用' },
+  { id: 'download', name: '下载' },
+  { id: 'net', name: '网络' },
+  { id: 'account', name: '网盘账号' },
+  { id: 'ext', name: '浏览器插件' },
+  { id: 'update', name: '更新' },
+  { id: 'endpoint', name: '解析接口' },
+  { id: 'adv', name: '高级' },
+] as const
+
+type TabId = (typeof SET_TABS)[number]['id']
+
+/** 开关本体。文案一律是「状态陈述」（登录时启动），不要写成「开启 XX」。 */
+function Switch({
+  checked,
+  onChange,
+  disabled,
+}: {
+  checked: boolean
+  onChange: (v: boolean) => void
+  disabled?: boolean
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      className={`switch${checked ? ' on' : ''}`}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+    >
+      <i />
+    </button>
+  )
+}
+
+/** 设置页的一行：左边标题 + 说明，右边控件。说明必须写清「这个开关到底干了什么」。 */
+function Row({
+  title,
+  desc,
+  children,
+  err,
+  indent,
+  stack,
+}: {
+  title: ReactNode
+  desc?: ReactNode
+  children?: ReactNode
+  err?: string
+  indent?: boolean
+  stack?: boolean
+}) {
+  return (
+    <div className={`srow${indent ? ' indent' : ''}${stack ? ' stackrow' : ''}`}>
+      <div className="srow-text">
+        <div className="srow-title">{title}</div>
+        {desc ? <div className="srow-desc">{desc}</div> : null}
+        {err ? <div className="srow-desc err">{err}</div> : null}
+      </div>
+      {children ? <div className="srow-ctl">{children}</div> : null}
+    </div>
+  )
+}
+
+/**
+ * 数字输入。刻意**不在 onChange 里写盘**：边打字边保存会把「192」拆成 1、12、192 存三次，
+ * 中途那两次是给正在跑的任务换连接数。失焦或回车才提交。
+ */
+function NumBox({
+  value,
+  min,
+  max,
+  onCommit,
+}: {
+  value: number
+  min: number
+  max: number
+  onCommit: (n: number) => void
+}) {
+  const [draft, setDraft] = useState(String(value))
+  useEffect(() => setDraft(String(value)), [value])
+  const commit = () => {
+    const n = Number(draft.trim())
+    if (!draft.trim() || !Number.isFinite(n)) {
+      setDraft(String(value))
+      return
+    }
+    const next = Math.max(min, Math.min(max, Math.round(n)))
+    setDraft(String(next))
+    if (next !== value) onCommit(next)
+  }
+  return (
+    <input
+      type="number"
+      min={min}
+      max={max}
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+    />
+  )
+}
+
+function NumberRow({
+  title,
+  desc,
+  value,
+  min,
+  max,
+  onCommit,
+  err,
+}: {
+  title: ReactNode
+  desc?: ReactNode
+  value: number
+  min: number
+  max: number
+  onCommit: (n: number) => void
+  err?: string
+}) {
+  return (
+    <Row title={title} desc={desc} err={err}>
+      <NumBox value={value} min={min} max={max} onCommit={onCommit} />
+    </Row>
+  )
+}
 
 function SettingsModal({
   initial,
+  updateNotice,
   onClose,
   onSaved,
 }: {
   initial: Settings
+  /** 启动时自动检查发现的新版本（主进程推过来的，进来就显示在「更新」里） */
+  updateNotice?: { latest: string; current: string; url: string; name?: string } | null
   onClose: () => void
   onSaved: (s: Settings) => void
 }) {
   const [s, setS] = useState<Settings>(initial)
+  /* saved = 最后一次落盘的那份。开关/数字是即时保存的，所以两者只会在「文本框」上有差别 */
+  const [saved, setSaved] = useState<Settings>(initial)
+  const [tab, setTab] = useState<TabId>('general')
   const [busy, setBusy] = useState(false)
   const [saveErr, setSaveErr] = useState('')
+  const [rowErr, setRowErr] = useState<Record<string, string>>({})
   const [cookieKey, setCookieKey] = useState(LOGIN_TARGETS[0])
   const [loginBusy, setLoginBusy] = useState(false)
   const [loginMsg, setLoginMsg] = useState('')
+  const [info, setInfo] = useState<AppInfo | null>(null)
+  const [upd, setUpd] = useState<{ state: 'idle' | 'checking' | 'latest' | 'new' | 'error'; data?: UpdateInfo }>(
+    updateNotice
+      ? {
+          state: 'new',
+          data: {
+            ok: true,
+            current: updateNotice.current,
+            latest: updateNotice.latest,
+            hasUpdate: true,
+            url: updateNotice.url,
+            name: updateNotice.name,
+          },
+        }
+      : { state: 'idle' },
+  )
+  const [confirmReset, setConfirmReset] = useState(false)
+
+  useEffect(() => {
+    api.appInfo().then(setInfo).catch(() => {})
+  }, [])
 
   const patch = (p: Partial<Settings>) => setS((v) => ({ ...v, ...p }))
+  const dirty = JSON.stringify(s) !== JSON.stringify(saved)
+  const setErr = (key: string, msg: string) => setRowErr((m) => ({ ...m, [key]: msg }))
 
-  // 有「启用中且填了地址」的解析接口时，必须先勾选用户承诺才能保存
+  /**
+   * 开关 / 下拉这类「不用校验也不会写坏」的改动：立刻落盘。
+   * 失败（主进程会校验范围）就把这一项退回改前的值，并在那一行说明原因 —— 不能悄悄吞掉。
+   */
+  const instant = async (p: Partial<Settings>, key: string) => {
+    const before: Partial<Settings> = {}
+    for (const k of Object.keys(p) as (keyof Settings)[]) before[k] = s[k] as never
+    setS((v) => ({ ...v, ...p }))
+    if (rowErr[key]) setErr(key, '')
+    try {
+      const next = await api.setSettings(p)
+      setSaved(next)
+      /* 同步给上层：下次打开设置时 initial 就是最新的，不然关掉再打开会看到旧值，
+         更糟的是上层那份旧值会在下一次改动时被原样回写（把刚改好的数字顶回去）。 */
+      onSaved(next)
+    } catch (e) {
+      setS((v) => ({ ...v, ...before }))
+      setErr(key, e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /** 开机自启动要真写系统登录项，走专门的通道（主进程写完再回来报结果） */
+  const toggleAutoStart = async (on: boolean) => {
+    setS((v) => ({ ...v, autoStart: on }))
+    setErr('autoStart', '')
+    try {
+      await api.setAutoStart(on)
+      const nv = { ...saved, autoStart: on }
+      setSaved(nv)
+      onSaved(nv)
+      setInfo(await api.appInfo())
+    } catch (e) {
+      setS((v) => ({ ...v, autoStart: !on }))
+      setErr('autoStart', e instanceof Error ? e.message : String(e))
+    }
+  }
+
   const needAck =
     (s.parseEndpoints || []).some((e) => e.enabled !== false && (e.url || '').trim() !== '') && !s.endpointAck
 
@@ -439,7 +635,8 @@ function SettingsModal({
     setBusy(true)
     setSaveErr('')
     try {
-      onSaved(await api.setSettings(s))
+      const got = await api.setSettings(s)
+      onSaved(got)
       onClose()
     } catch (e: unknown) {
       /* 主进程会校验设置（范围、路径、令牌长度…），把它的原话显示出来，
@@ -471,195 +668,416 @@ function SettingsModal({
     }
   }
 
+  const checkUpd = async () => {
+    setUpd({ state: 'checking' })
+    try {
+      const r = await api.checkUpdate({ manual: true })
+      if (!r.ok) setUpd({ state: 'error', data: r })
+      else if (r.hasUpdate) setUpd({ state: 'new', data: r })
+      else setUpd({ state: 'latest', data: r })
+    } catch (e) {
+      setUpd({ state: 'error', data: { ok: false, current: '', message: e instanceof Error ? e.message : String(e) } })
+    }
+  }
+
+  const doReset = async () => {
+    setConfirmReset(false)
+    try {
+      const got = await api.resetSettings()
+      setS(got)
+      setSaved(got)
+      onSaved(got)
+      setSaveErr('')
+    } catch (e) {
+      setSaveErr(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const autoStartDesc = !info
+    ? '登录 Windows 后自动启动 PanBox。'
+    : !info.packaged
+      ? '登录 Windows 后自动启动 PanBox。开发模式下不写系统登录项，安装版才生效。'
+      : info.portable
+        ? '登录 Windows 后自动启动 PanBox。便携版记下的启动路径换个位置或换台机器就失效，建议用安装版。'
+        : '登录 Windows 后自动启动 PanBox，默认收在托盘里把没下完的任务接着跑。'
+
   return (
     <div className="mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal">
-        <h2>设置</h2>
-        <div className="content">
-          <Section title="基础">
-            <Field label="下载目录">
-              <div className="row">
-                <input type="text" value={s.downloadDir} onChange={(e) => patch({ downloadDir: e.target.value })} />
-                <button
-                  onClick={async () => {
-                    const dir = await api.pickDir()
-                    if (dir) patch({ downloadDir: dir })
-                  }}
-                >
-                  选择…
-                </button>
-              </div>
-            </Field>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={!!s.openFolderWhenDone}
-                onChange={(e) => patch({ openFolderWhenDone: e.target.checked })}
-              />
-              下载完成后自动打开下载目录
-            </label>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={s.closeToTray !== false}
-                onChange={(e) => patch({ closeToTray: e.target.checked })}
-              />
-              点 × 关闭窗口后留在后台继续下载（托盘图标可再打开）
-            </label>
-          </Section>
+      <div className="modal settings">
+        <h2>
+          设置
+          <button className="x" onClick={onClose} title="关闭">
+            ✕
+          </button>
+        </h2>
+        <div className="set-shell">
+          <nav className="set-nav">
+            {SET_TABS.map((t) => (
+              <button key={t.id} className={tab === t.id ? 'on' : ''} onClick={() => setTab(t.id)}>
+                {t.name}
+                {t.id === 'update' && upd.state === 'new' ? <span className="navdot" /> : null}
+              </button>
+            ))}
+          </nav>
 
-          <Section title="下载引擎">
-            <div className="grid2">
-              <Field label="同时下载任务数">
-                <input
-                  type="number"
-                  min={1}
-                  max={20}
-                  value={s.maxConcurrent}
-                  onChange={(e) => patch({ maxConcurrent: Number(e.target.value) || 1 })}
-                />
-              </Field>
-              <Field label="单任务分片数（split）">
-                <input
-                  type="number"
-                  min={1}
-                  max={64}
-                  value={s.split}
-                  onChange={(e) => patch({ split: Number(e.target.value) || 1 })}
-                />
-              </Field>
-              <Field label="每服务器最大连接数">
-                <input
-                  type="number"
-                  min={1}
-                  max={64}
-                  value={s.maxConnectionPerServer}
-                  onChange={(e) => patch({ maxConnectionPerServer: Number(e.target.value) || 1 })}
-                />
-              </Field>
-              <Field label="最小分片大小">
-                <input type="text" value={s.minSplitSize} onChange={(e) => patch({ minSplitSize: e.target.value })} />
-              </Field>
-            </div>
-
-            <Field
-              label="分段引擎连接数（绕开 aria2 的 16 连接上限）"
-              hint={
-                <>
-                  夸克 / UC 的 CDN 是<b>按每条 TCP 连接</b>发额度的（夸克 ≈50KB/s、UC ≈64KB/s 一条），
-                  而 aria2 的连接数上限只有 16 —— 所以这两家和普通直链交给自带的分段引擎，连接数在这里调。
-                  填 0 = 退回 aria2。<b>直链默认 128</b>：境外线路经常「先冲一阵再长时间不动」，连接少了就一直在等。
-                </>
-              }
-            >
-              <div className="ep-netdisks">
-                {SEG_TARGETS.map((k) => (
-                  <span key={k} className="seg-conn">
-                    <span className="ep-hint">{label(k)}</span>
-                    <input
-                      type="number"
-                      min={0}
-                      max={256}
-                      value={s.segConnections?.[k] ?? 0}
-                      onChange={(e) =>
-                        patch({ segConnections: { ...(s.segConnections || {}), [k]: Number(e.target.value) || 0 } })
-                      }
-                    />
-                  </span>
-                ))}
-              </div>
-            </Field>
-
-            <Field
-              label="百度网盘并发（默认 1）"
-              hint={
-                <>
-                  百度是<b>账号级总量限速</b>，普通账号调大并发只会招来几小时到几天的惩罚性降速。
-                  如果你是超级会员，可以调到 4~8 试试；<b>调高后速度反而变 0 就说明被限了，调回 1</b>。
-                </>
-              }
-            >
-              <input
-                type="number"
-                min={1}
-                max={32}
-                value={s.baiduConnections ?? 1}
-                onChange={(e) => patch({ baiduConnections: Math.max(1, Number(e.target.value) || 1) })}
-              />
-            </Field>
-          </Section>
-
-          <Section title="网络">
-            <ProxySection s={s} patch={patch} />
-            <Field label="自定义 User-Agent" hint="留默认即可。只有个别站点要求特定 UA 时才改。">
-              <input type="text" value={s.userAgent} onChange={(e) => patch({ userAgent: e.target.value })} />
-            </Field>
-            <Field label="aria2 RPC 端口" hint="端口被占用时改这里，重启应用生效。">
-              <input
-                type="number"
-                value={s.aria2Port}
-                onChange={(e) => patch({ aria2Port: Number(e.target.value) || 6800 })}
-              />
-            </Field>
-          </Section>
-
-          <Section title="网盘账号">
-            <Field
-              label="用你自己的账号（可选，但夸克 / UC / 迅雷 / 百度必须登录）"
-              hint={
-                <>
-                  凭证只在你自己机器上用，程序只拿「你账号本来应有的速度」，不做任何身份伪造。
-                  夸克与 UC 的游客直链会被 CDN 拒绝（412 / 403），迅雷和百度的转存取链也必须登录。
-                </>
-              }
-            >
-              <div className="row">
-                <select className="select" value={cookieKey} onChange={(e) => setCookieKey(e.target.value)}>
-                  {COOKIE_TARGETS.map((k) => (
-                    <option key={k} value={k}>
-                      {label(k)}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  type="text"
-                  placeholder="粘贴该网盘的凭证字符串，或点下面「登录」自动获取"
-                  value={s.cookies[cookieKey] ?? ''}
-                  onChange={(e) => patch({ cookies: { ...s.cookies, [cookieKey]: e.target.value } })}
-                />
-              </div>
-              {LOGIN_TARGETS.includes(cookieKey) && (
-                <div className="row" style={{ marginTop: 8 }}>
-                  <button disabled={loginBusy} onClick={doLogin}>
-                    {loginBusy ? '请在弹出的窗口里登录…' : `登录${label(cookieKey)}`}
-                  </button>
-                  <button
-                    onClick={async () => {
-                      await api.clearLogin(cookieKey)
-                      patch({ cookies: { ...s.cookies, [cookieKey]: '' } })
-                      setLoginMsg(`已清除 ${label(cookieKey)} 的登录状态`)
-                    }}
+          <div className="set-pane">
+            {tab === 'general' && (
+              <>
+                <Section title="启动">
+                  <Row title="开机自启动" desc={autoStartDesc} err={rowErr.autoStart}>
+                    <Switch checked={!!s.autoStart} onChange={toggleAutoStart} />
+                  </Row>
+                  {!!s.autoStart && (
+                    <Row
+                      indent
+                      title="启动时显示主窗口"
+                      desc="不勾选就静静待在托盘里 —— 该续传的任务照常跑，不打扰你。"
+                    >
+                      <Switch
+                        checked={!!s.startupShowWindow}
+                        onChange={(v) => instant({ startupShowWindow: v }, 'startupShowWindow')}
+                      />
+                    </Row>
+                  )}
+                </Section>
+                <Section title="关闭">
+                  <Row
+                    title="关闭窗口后留在后台下载"
+                    desc="点右上角 × 只是把窗口收进托盘，下载与浏览器插件通道都不中断；真要退出走托盘菜单的「退出」。"
+                    err={rowErr.closeToTray}
                   >
-                    退出登录
-                  </button>
+                    <Switch
+                      checked={s.closeToTray !== false}
+                      onChange={(v) => instant({ closeToTray: v }, 'closeToTray')}
+                    />
+                  </Row>
+                  <Row title="下载完成后打开下载目录" desc="每个任务下完都弹一次资源管理器；下的东西多时可以关掉。">
+                    <Switch
+                      checked={!!s.openFolderWhenDone}
+                      onChange={(v) => instant({ openFolderWhenDone: v }, 'openFolderWhenDone')}
+                    />
+                  </Row>
+                </Section>
+                <Section title="下载位置">
+                  <Row stack title="下载目录" desc="任务默认存到这里；改完记得点右下角「保存」。">
+                    <div className="row">
+                      <input
+                        type="text"
+                        value={s.downloadDir}
+                        onChange={(e) => patch({ downloadDir: e.target.value })}
+                      />
+                      <button
+                        onClick={async () => {
+                          const dir = await api.pickDir()
+                          if (dir) patch({ downloadDir: dir })
+                        }}
+                      >
+                        选择…
+                      </button>
+                    </div>
+                  </Row>
+                </Section>
+              </>
+            )}
+
+            {tab === 'download' && (
+              <>
+                <Section title="aria2（百度 / 迅雷 / 蓝奏云走这条）">
+                  <NumberRow
+                    title="同时下载任务数"
+                    desc="同时跑几个任务。太多会互相抢带宽，反而每个都慢。"
+                    value={s.maxConcurrent}
+                    min={1}
+                    max={20}
+                    onCommit={(n) => instant({ maxConcurrent: n }, 'maxConcurrent')}
+                    err={rowErr.maxConcurrent}
+                  />
+                  <NumberRow
+                    title="单任务分片数（split）"
+                    desc="把一个文件切成几段同时下。"
+                    value={s.split}
+                    min={1}
+                    max={64}
+                    onCommit={(n) => instant({ split: n }, 'split')}
+                    err={rowErr.split}
+                  />
+                  <NumberRow
+                    title="每服务器最大连接数"
+                    desc="aria2 对同一台服务器的连接上限（它自己的硬上限是 16）。"
+                    value={s.maxConnectionPerServer}
+                    min={1}
+                    max={64}
+                    onCommit={(n) => instant({ maxConnectionPerServer: n }, 'maxConnectionPerServer')}
+                    err={rowErr.maxConnectionPerServer}
+                  />
+                  <Row
+                    stack
+                    title="最小分片大小"
+                    desc="写成 1M / 512K 这样。太小会让请求数暴增，反而慢。"
+                  >
+                    <input
+                      type="text"
+                      value={s.minSplitSize}
+                      onChange={(e) => patch({ minSplitSize: e.target.value })}
+                    />
+                  </Row>
+                </Section>
+
+                <Section title="分段引擎（夸克 / UC / 直链走这条）">
+                  <Row
+                    stack
+                    title="每个网盘的连接数"
+                    desc={
+                      <>
+                        夸克与 UC 的 CDN 是<b>按每条 TCP 连接</b>发额度的（夸克实测 ≈50KB/s 一条），
+                        而 aria2 的连接上限只有 16 —— 所以这两家交给自带的分段引擎，连接数在这里调。
+                        填 0 = 退回 aria2。<b>夸克默认 192</b>（实测比 96 快 1.85×）；
+                        <b>UC 默认 96</b>（实测 96 条已经跑满线路，加到 192 没有提升）；
+                        <b>直链默认 128</b>（境外线路常常「先冲一阵再长时间不动」，连接少了就一直在等）。
+                      </>
+                    }
+                    err={rowErr.segConnections}
+                  >
+                    <div className="ep-netdisks">
+                      {SEG_TARGETS.map((k) => (
+                        <span key={k} className="seg-conn">
+                          <span className="ep-hint">{label(k)}</span>
+                          <NumBox
+                            value={s.segConnections?.[k] ?? 0}
+                            min={0}
+                            max={256}
+                            onCommit={(n) =>
+                              instant(
+                                { segConnections: { ...(s.segConnections || {}), [k]: n } },
+                                'segConnections',
+                              )
+                            }
+                          />
+                        </span>
+                      ))}
+                    </div>
+                  </Row>
+                  <NumberRow
+                    title="百度网盘并发（默认 1）"
+                    desc={
+                      <>
+                        百度是<b>账号级总量限速</b>，普通账号调大并发只会招来几小时到几天的惩罚性降速。
+                        如果你是超级会员，可以调到 4~8 试试；<b>调高后速度反而变 0 就说明被限了，调回 1</b>。
+                      </>
+                    }
+                    value={s.baiduConnections ?? 1}
+                    min={1}
+                    max={16}
+                    onCommit={(n) => instant({ baiduConnections: n }, 'baiduConnections')}
+                    err={rowErr.baiduConnections}
+                  />
+                </Section>
+              </>
+            )}
+
+            {tab === 'net' && (
+              <>
+                <Section title="代理">
+                  <ProxySection s={s} patch={patch} />
+                </Section>
+                <Section title="证书">
+                  <Row
+                    title="忽略证书错误"
+                    desc={
+                      <>
+                        默认关闭：两个下载引擎与解析请求都按正常流程校验证书。打开后，公共 WiFi 或代理里的中间人
+                        能静默替换你下载的内容（含 .exe / .msi），只有确实遇到自签或过期的网盘 CDN 时才打开。
+                      </>
+                    }
+                    err={rowErr.ignoreCert}
+                  >
+                    <Switch checked={!!s.ignoreCert} onChange={(v) => instant({ ignoreCert: v }, 'ignoreCert')} />
+                  </Row>
+                </Section>
+                <Section title="其它">
+                  <Row stack title="自定义 User-Agent" desc="留默认即可。只有个别站点要求特定 UA 时才改。">
+                    <input type="text" value={s.userAgent} onChange={(e) => patch({ userAgent: e.target.value })} />
+                  </Row>
+                  <NumberRow
+                    title="aria2 RPC 端口"
+                    desc="端口被占用时改这里（改完会重启下载引擎）。"
+                    value={s.aria2Port}
+                    min={1024}
+                    max={65535}
+                    onCommit={(n) => instant({ aria2Port: n }, 'aria2Port')}
+                    err={rowErr.aria2Port}
+                  />
+                </Section>
+              </>
+            )}
+
+            {tab === 'account' && (
+              <Section title="网盘账号">
+                <Row
+                  stack
+                  title="用你自己的账号（夸克 / UC / 迅雷 / 百度必须登录）"
+                  desc={
+                    <>
+                      凭证只在你自己机器上用，程序只拿「你账号本来应有的速度」，不做任何身份伪造。
+                      夸克与 UC 的游客直链会被 CDN 拒绝（412 / 403），迅雷和百度的转存取链也必须登录。
+                    </>
+                  }
+                >
+                  <div className="row">
+                    <select className="select" value={cookieKey} onChange={(e) => setCookieKey(e.target.value)}>
+                      {COOKIE_TARGETS.map((k) => (
+                        <option key={k} value={k}>
+                          {label(k)}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="text"
+                      placeholder="粘贴该网盘的凭证字符串，或点下面「登录」自动获取"
+                      value={s.cookies[cookieKey] ?? ''}
+                      onChange={(e) => patch({ cookies: { ...s.cookies, [cookieKey]: e.target.value } })}
+                    />
+                  </div>
+                  {LOGIN_TARGETS.includes(cookieKey) && (
+                    <div className="row" style={{ marginTop: 8 }}>
+                      <button disabled={loginBusy} onClick={doLogin}>
+                        {loginBusy ? '请在弹出的窗口里登录…' : `登录${label(cookieKey)}`}
+                      </button>
+                      <button
+                        onClick={async () => {
+                          await api.clearLogin(cookieKey)
+                          patch({ cookies: { ...s.cookies, [cookieKey]: '' } })
+                          setLoginMsg(`已清除 ${label(cookieKey)} 的登录状态`)
+                        }}
+                      >
+                        退出登录
+                      </button>
+                    </div>
+                  )}
+                  {loginMsg && <div className="desc">{loginMsg}</div>}
+                </Row>
+              </Section>
+            )}
+
+            {tab === 'ext' && (
+              <Section title="浏览器插件接收通道">
+                <BridgeSection />
+              </Section>
+            )}
+
+            {tab === 'update' && (
+              <>
+                <Section title="版本">
+                  <Row
+                    title={`PanBox ${info ? info.version : '…'}`}
+                    desc={info ? (info.packaged ? '安装版' : '开发模式（npm start）') : '读取中…'}
+                  >
+                    <button disabled={upd.state === 'checking'} onClick={checkUpd}>
+                      {upd.state === 'checking' ? '正在检查…' : '检查更新'}
+                    </button>
+                  </Row>
+                  <div className="updbox" aria-live="polite">
+                    {upd.state === 'idle' && <div className="desc">还没检查过。点上面的「检查更新」查一次。</div>}
+                    {upd.state === 'checking' && <div className="desc">正在查询 GitHub Releases…</div>}
+                    {upd.state === 'latest' && (
+                      <div className="desc">
+                        已是最新版本（{upd.data?.latest ?? upd.data?.current}）。
+                      </div>
+                    )}
+                    {upd.state === 'new' && (
+                      <>
+                        <div className="upd-title">发现新版本 {upd.data?.latest}</div>
+                        <div className="desc">
+                          当前是 {upd.data?.current}
+                          {upd.data?.publishedAt ? `，新版发布于 ${String(upd.data.publishedAt).slice(0, 10)}` : ''}。
+                          下载页会打开浏览器，安装包自己挑。
+                        </div>
+                        <div className="row">
+                          <button className="primary" onClick={() => api.openRelease(upd.data?.url || '')}>
+                            打开下载页
+                          </button>
+                        </div>
+                      </>
+                    )}
+                    {upd.state === 'error' && (
+                      <>
+                        <div className="upd-title err">更新信息获取失败</div>
+                        <div className="desc">
+                          可能是无法访问 GitHub 导致的（{upd.data?.message || '网络不通'}）。
+                          不影响下载功能，随时可以再试。
+                        </div>
+                        <div className="row">
+                          <button onClick={checkUpd}>重试</button>
+                          <button onClick={() => api.openRelease('https://github.com/Ygq156/PanBox/releases')}>
+                            直接打开发布页
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                  <Row
+                    title="自动检查更新"
+                    desc="启动后查一次 GitHub 的公开 release 接口（不带任何本机信息）。只提示，不做静默安装。"
+                    err={rowErr.autoCheckUpdate}
+                  >
+                    <Switch
+                      checked={s.autoCheckUpdate !== false}
+                      onChange={(v) => instant({ autoCheckUpdate: v }, 'autoCheckUpdate')}
+                    />
+                  </Row>
+                </Section>
+                <Section title="链接">
+                  <Row title="项目主页 / 源码" desc="程序不内置也不推荐任何解析站；网盘凭证只在你自己机器上使用。">
+                    <div className="row">
+                      <button onClick={() => api.openRelease('https://github.com/Ygq156/PanBox')}>打开 GitHub</button>
+                      <button onClick={() => api.bridgeOpenFolder()}>插件文件夹</button>
+                    </div>
+                  </Row>
+                </Section>
+              </>
+            )}
+
+            {tab === 'endpoint' && (
+              <Section title="用户自备的解析接口">
+                <EndpointSection
+                  list={s.parseEndpoints || []}
+                  onChange={(next) => patch({ parseEndpoints: next })}
+                  ack={!!s.endpointAck}
+                  onAck={(v) => patch({ endpointAck: v })}
+                />
+              </Section>
+            )}
+
+            {tab === 'adv' && (
+              <Section title="重置">
+                <div className="danger">
+                  <div className="danger-title">恢复默认设置</div>
+                  <div className="danger-desc">
+                    把下载、网络、端口、外观这些设置全部改回出厂值。
+                    <b>登录凭证和你自己填的解析接口会保留</b> —— 不必重新登录四个网盘。
+                  </div>
+                  {confirmReset ? (
+                    <div className="row">
+                      <button className="danger-btn" onClick={doReset}>
+                        确认恢复
+                      </button>
+                      <button onClick={() => setConfirmReset(false)}>取消</button>
+                    </div>
+                  ) : (
+                    <div className="row">
+                      <button onClick={() => setConfirmReset(true)}>恢复默认设置…</button>
+                    </div>
+                  )}
                 </div>
-              )}
-              {loginMsg && <div className="desc">{loginMsg}</div>}
-            </Field>
-          </Section>
-
-          <Section title="浏览器插件">
-            <BridgeSection />
-          </Section>
-
-          <Section title="高级：解析接口">
-            <EndpointSection
-              list={s.parseEndpoints || []}
-              onChange={(next) => patch({ parseEndpoints: next })}
-              ack={!!s.endpointAck}
-              onAck={(v) => patch({ endpointAck: v })}
-            />
-          </Section>
+                <Row
+                  title="浏览器插件版本"
+                  desc="插件是随程序更新的本地目录版本。更新后请在 chrome://extensions 里点一次「重新加载」，否则拖拽悬浮按钮那类改动不会生效。"
+                >
+                  <button onClick={() => api.bridgeOpenFolder()}>打开插件文件夹</button>
+                </Row>
+              </Section>
+            )}
+          </div>
         </div>
 
         <div className="footer">
@@ -670,12 +1088,15 @@ function SettingsModal({
           )}
           {needAck && (
             <span className="hint err" style={{ marginRight: 'auto' }}>
-              请先勾选上面的「用户承诺」
+              请先勾选「用户承诺」
             </span>
           )}
-          <button onClick={onClose}>取消</button>
-          <button className="primary" disabled={busy || needAck} onClick={save}>
-            保存
+          <span className="hint" style={{ marginRight: 'auto' }}>
+            {dirty ? '开关与数字改动即时生效；文本框改完请点保存' : '开关与数字改动会立即保存'}
+          </span>
+          <button onClick={onClose}>关闭</button>
+          <button className="primary" disabled={busy || needAck || !dirty} onClick={save}>
+            {busy ? '保存中…' : '保存'}
           </button>
         </div>
       </div>
@@ -821,6 +1242,8 @@ export default function App() {
   const [tasks, setTasks] = useState<DownloadTask[]>([])
   const [refreshing, setRefreshing] = useState<string | null>(null)
   const [aria2, setAria2] = useState<Aria2Status>({ running: false })
+  /** 启动时自动检查发现的新版本（只提示 + 打开下载页，不静默安装） */
+  const [newVer, setNewVer] = useState<{ latest: string; current: string; url: string; name?: string } | null>(null)
 
   useEffect(() => {
     api.getSettings().then(setSettings).catch(() => {})
@@ -833,9 +1256,12 @@ export default function App() {
       setText(d.url)
       setHint({ kind: 'ok', msg: `浏览器插件送来一个${label(d.netdisk)}分享链接，点「解析」看看里面有什么` })
     })
+    /* 主进程启动 4 秒后自己查一次更新，有新版本就推过来（设置里可以关掉自动检查） */
+    const offUpd = api.onUpdateAvailable?.((d) => setNewVer(d))
     return () => {
       off()
       if (offPre) offPre()
+      if (offUpd) offUpd()
     }
   }, [])
 
@@ -984,6 +1410,7 @@ export default function App() {
         <div className="grow" />
         <button className="ghost" onClick={() => setShowSettings(true)}>
           ⚙ 设置
+          {newVer ? <span className="navdot" /> : null}
         </button>
       </div>
 
@@ -1156,7 +1583,12 @@ export default function App() {
       </div>
 
       {showSettings && (
-        <SettingsModal initial={settings} onClose={() => setShowSettings(false)} onSaved={setSettings} />
+        <SettingsModal
+        initial={settings}
+        updateNotice={newVer}
+        onClose={() => setShowSettings(false)}
+        onSaved={setSettings}
+      />
       )}
     </div>
   )

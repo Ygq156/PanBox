@@ -655,6 +655,231 @@ input[type='checkbox'] {
   background: var(--bg-elev);
 }
 
+/* ---------- 设置页：左侧分类导航 + 右侧一屏一组（见 src/App.tsx SET_TABS） ---------- */
+.modal.settings {
+  width: 820px;
+  height: 620px;
+  max-height: 88vh;
+}
+
+.modal.settings h2 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.modal.settings h2 .x {
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.set-shell {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.set-nav {
+  width: 168px;
+  flex: 0 0 auto;
+  padding: 10px 8px;
+  border-right: 1px solid var(--border);
+  background: var(--bg-elev2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+}
+
+.set-nav button {
+  position: relative;
+  text-align: left;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.set-nav button:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+
+.set-nav button.on {
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* 有新版本时在「更新」上点一个圆点；标题栏的「设置」按钮也用同一个 */
+.navdot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+  vertical-align: middle;
+}
+
+.set-pane {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 20px 18px;
+  overflow-y: auto;
+}
+
+/* 一行：左标题+说明，右控件。说明写清「这个开关到底干了什么」 */
+.srow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 0;
+  border-bottom: 0.5px solid rgba(255, 255, 255, 0.06);
+}
+
+.srow:last-child {
+  border-bottom: 0;
+}
+
+.srow.indent {
+  padding-left: 18px;
+  border-left: 2px solid var(--accent-dim);
+}
+
+.srow.stackrow {
+  align-items: stretch;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.srow-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.srow-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.srow-desc {
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+.srow-desc.err {
+  color: var(--err);
+}
+
+.srow-desc b {
+  color: var(--text);
+}
+
+.srow-ctl {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.srow-ctl input[type='text'] {
+  width: 300px;
+}
+
+/* 开关：文案是状态陈述，所以本体就是个滑块 */
+.switch {
+  width: 32px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.15);
+  cursor: pointer;
+  position: relative;
+  transition: background 0.12s;
+}
+
+.switch i {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #9aa3b5;
+  transition: transform 0.12s, background 0.12s;
+}
+
+.switch.on {
+  background: var(--accent);
+}
+
+.switch.on i {
+  transform: translateX(14px);
+  background: #fff;
+}
+
+.switch:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* 更新状态块（aria-live，同一位置随状态换文案） */
+.updbox {
+  margin: 4px 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #12151c;
+}
+
+.upd-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.upd-title.err {
+  color: var(--err);
+}
+
+.updbox .row {
+  margin-top: 8px;
+}
+
+/* 危险操作：红框 + 二次确认（见设置页「高级」） */
+.danger {
+  margin: 6px 0 16px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 91, 91, 0.45);
+  border-radius: 8px;
+  background: rgba(255, 91, 91, 0.06);
+}
+
+.danger-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--err);
+}
+
+.danger-desc {
+  margin: 5px 0 10px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+.danger-desc b {
+  color: var(--text);
+}
+
 /* ---------- 解析接口 ---------- */
 .endpoint-add {
   display: flex;

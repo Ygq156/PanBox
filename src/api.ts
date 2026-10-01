@@ -48,6 +48,30 @@ export interface ProxyStatus {
   effective: string
 }
 
+export interface AppInfo {
+  version: string
+  /** false = 开发模式（npm start） */
+  packaged: boolean
+  autoStart: boolean
+  /** 开发模式不写登录项，界面要据此提示「安装版才生效」 */
+  autoStartApplied: boolean
+  /** 便携版：登录项里记的路径换个位置就失效，界面要据此提醒 */
+  portable: boolean
+  platform: string
+}
+
+export interface UpdateInfo {
+  ok: boolean
+  current: string
+  latest?: string
+  hasUpdate?: boolean
+  url?: string
+  name?: string
+  publishedAt?: string
+  /** ok=false 时的原因（超时 / 被墙 / 限流…） */
+  message?: string
+}
+
 export interface PanboxAPI {
   parseShare(p: ParsePayload): Promise<ParseResponse>
   /** 界面丢掉一条解析结果时通知主进程释放对应会话缓存 */
@@ -62,6 +86,8 @@ export interface PanboxAPI {
   resumeAll(): Promise<boolean>
   getSettings(): Promise<Settings>
   setSettings(s: Partial<Settings>): Promise<Settings>
+  /** 恢复默认设置（登录凭证与自备解析接口保留），返回恢复后的设置 */
+  resetSettings(): Promise<Settings>
   pickDir(): Promise<string | null>
   openPath(p: string): Promise<string>
   aria2Status(): Promise<Aria2Status>
@@ -73,8 +99,13 @@ export interface PanboxAPI {
   bridgeOpenFolder(): Promise<{ ok: boolean; dir: string; message: string }>
   bridgeNewToken(): Promise<BridgeStatus>
   proxyStatus(): Promise<ProxyStatus>
+  appInfo(): Promise<AppInfo>
+  setAutoStart(on: boolean): Promise<{ ok: boolean; autoStart: boolean; applied: boolean }>
+  checkUpdate(opts?: { manual?: boolean }): Promise<UpdateInfo>
+  openRelease(url: string): Promise<{ ok: boolean; message?: string }>
   onDownloadsUpdate(cb: (tasks: DownloadTask[]) => void): () => void
   onBridgePrefill(cb: (data: { url: string; netdisk: string }) => void): () => void
+  onUpdateAvailable(cb: (data: { latest: string; current: string; url: string; name?: string; publishedAt?: string }) => void): () => void
 }
 
 declare global {

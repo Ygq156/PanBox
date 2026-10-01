@@ -3,6 +3,7 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, session, Tray, Menu, nativeImage } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
+const https = require('node:https')
 
 const settings = require('./core/settings')
 const aria2 = require('./core/aria2')
@@ -200,8 +201,9 @@ let win = null
 let tray = null
 /* 真正要退出了（托盘退出 / 系统关机 / app.quit()）。窗口的 close 处理靠它放行。 */
 let isQuitting = false
-/* 只在本次运行里弹一次「还在后台跑」的气泡，别每次关窗口都弹 */
-let trayHinted = false
+/* 开机自启动拉起来的这次运行：直接待命在托盘里，别在用户刚开机时弹一个窗口出来。
+ * 只有「点 × 收进托盘」开着时才这么干 —— 否则用户既没窗口也没托盘，等于没启动。 */
+const STARTUP_HIDDEN = process.argv.includes('--startup')
 let aria2Ready = false
 let aria2Error = ''
 
@@ -342,30 +344,31 @@ function createWindow() {
       webviewTag: false,
     },
   })
-  win.once('ready-to-show', () => win.show())
+  win.once('ready-to-show', () => {
+    const boot0 = settings.load()
+    /* 开机自启动默认「收在托盘」：登录时自己把窗口弹出来很打扰。
+     * 只有在设置里明确勾了「启动时显示主窗口」才显示，或用户关掉了「关闭到后台」。 */
+    if (STARTUP_HIDDEN && boot0.closeToTray && !boot0.startupShowWindow) {
+      boot('startup-hidden', '开机自启动，收在托盘里')
+      ensureTray()
+      return
+    }
+    win.show()
+  })
   win.on('closed', () => {
     win = null
   })
   /* 点 × 不退出，收进托盘继续下载（设置里可以关掉这个行为）。
    * 注意判 isQuitting：托盘菜单的「退出」、系统关机都走 app.quit()，
-   * 那时候必须真的关掉窗口，否则程序退不出去。 */
+   * 那时候必须真的关掉窗口，否则程序退不出去。
+   * 这里刻意**不弹任何提示**：用户点 × 的本意就是「收起来别烦我」，
+   * 托盘图标本身已经说明它还在跑（气泡还会被 Windows 记成一条通知）。 */
   win.on('close', (e) => {
     if (isQuitting) return
     if (!settings.load().closeToTray) return
     e.preventDefault()
     win.hide()
     ensureTray()
-    if (!trayHinted) {
-      trayHinted = true
-      try {
-        tray.displayBalloon({
-          title: 'PanBox 仍在后台运行',
-          content: '下载不会中断，点托盘图标可以再打开窗口；要彻底退出请用托盘菜单的「退出」。',
-        })
-      } catch {
-        /* 某些系统不支持气泡，忽略 */
-      }
-    }
   })
 
   /* 导航管控：界面是单页应用，任何「整页跳转」都不是正常行为
@@ -607,32 +610,58 @@ function registerIpc() {
     }
     /* 代理是 aria2 的**命令行参数**，改不了运行时（changeGlobalOption 不支持 all-proxy），
      * 所以只要代理设置变了就得重启 aria2 子进程。 */
-    const proxyChanged =
-      String(after.proxyMode) !== String(before.proxyMode) || String(after.proxy) !== String(before.proxy)
-    if (String(after.aria2Port) !== String(before.aria2Port) || proxyChanged) {
-      if (proxyChanged) proxy.clearCache()
-      await startAria2()
-    } else {
-      await aria2
-        .changeGlobalOption({
-          'max-concurrent-downloads': String(after.maxConcurrent),
-          split: String(after.split),
-          'max-connection-per-server': String(after.maxConnectionPerServer),
-          'min-split-size': after.minSplitSize,
-          dir: after.downloadDir,
-          'user-agent': after.userAgent,
-        })
-        .catch(() => {})
-    }
-    /* 插件通道的开关/端口/令牌变了就重开监听（端口占用等问题会反映在 bridge.status().error 里） */
-    if (
-      after.bridgeEnabled !== before.bridgeEnabled ||
-      String(after.bridgePort) !== String(before.bridgePort) ||
-      String(after.bridgeToken) !== String(before.bridgeToken)
-    ) {
-      await startBridge().catch(() => {})
-    }
-    return after
+    await applyRuntimeSettings(before, after)
+    /* 回给渲染层的一律是脱敏副本：settings:get 早就这么做了，这里漏掉的话
+     * 「保存」之后界面手里就攥着一份凭证原文，等于白脱敏。 */
+    return settings.forRenderer(after)
+  })
+
+  /* 开机自启动：设置改了立刻写登录项（打包版才真写，开发模式只记日志） */
+  ipcMain.handle('app:setAutoStart', async (_e, on) => {
+    const checked = settings.sanitizePatch({ autoStart: !!on })
+    if (!checked.ok) throw new Error(checked.message)
+    settings.save(checked.value)
+    applyAutoStart(settings.load())
+    return { ok: true, autoStart: !!settings.load().autoStart, applied: app.isPackaged }
+  })
+
+  ipcMain.handle('app:info', () => ({
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    autoStart: !!settings.load().autoStart,
+    /* 开发模式没写注册表，界面要据此说明「安装版才生效」 */
+    autoStartApplied: app.isPackaged,
+    /* 便携版：登录项里记的是解包后的临时路径，换个位置/换台机器就失效，
+     * 界面要据此给一句提醒（见设置页「开机自启动」那行） */
+    portable: !!process.env.PORTABLE_EXECUTABLE_FILE,
+    platform: process.platform,
+  }))
+
+  /* 恢复默认设置：默认值这份知识只在主进程里（见 settings.resetDefaults）。
+   * 登录凭证与用户自备的解析接口会被保留，其余回默认值。 */
+  ipcMain.handle('settings:reset', async () => {
+    const before = settings.load()
+    const after = settings.resetDefaults()
+    boot('settings-reset', 'restore defaults')
+    await applyRuntimeSettings(before, after)
+    return settings.forRenderer(after)
+  })
+
+  /* 检查更新：只查 GitHub 的公开 release 接口 + 打开下载页，不做静默自动更新 */
+  ipcMain.handle('update:check', async (_e, opts) => {
+    const manual = !!(opts && opts.manual)
+    const r = await checkUpdate(manual)
+    if (r && r.ok) autoChecked = true
+    boot('update-check', 'manual=' + manual, JSON.stringify({ ok: r.ok, current: r.current, latest: r.latest, hasUpdate: r.hasUpdate, message: r.message }))
+    return r
+  })
+
+  ipcMain.handle('update:open', async (_e, url) => {
+    /* 只允许打开这个仓库下的地址 —— 不能让渲染层拿它当任意 URL 的跳板 */
+    const u = String(url || '')
+    if (!/^https:\/\/github\.com\/Ygq156\/PanBox(\/|$)/i.test(u)) return { ok: false, message: '只允许打开本项目的下载页' }
+    await shell.openExternal(u).catch(() => {})
+    return { ok: true }
   })
 
   ipcMain.handle('bridge:status', () => bridgeInfo())
@@ -1006,6 +1035,152 @@ function quitApp() {
   app.quit()
 }
 
+/* ------------------------------------------------------------------ */
+/* 开机自启动 / 检查更新                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 把配置里的值真正推到运行中的部件上：aria2 全局参数（代理只能靠重启子进程换）、
+ * 插件通道监听、开机自启动登录项。
+ * settings:set 与 settings:reset 都走这一条路 —— 两处各写一遍，日后必然改一处漏一处。
+ */
+async function applyRuntimeSettings(before, after) {
+  const proxyChanged =
+    String(after.proxyMode) !== String(before.proxyMode) || String(after.proxy) !== String(before.proxy)
+  if (String(after.aria2Port) !== String(before.aria2Port) || proxyChanged) {
+    if (proxyChanged) proxy.clearCache()
+    await startAria2()
+  } else {
+    await aria2
+      .changeGlobalOption({
+        'max-concurrent-downloads': String(after.maxConcurrent),
+        split: String(after.split),
+        'max-connection-per-server': String(after.maxConnectionPerServer),
+        'min-split-size': after.minSplitSize,
+        dir: after.downloadDir,
+        'user-agent': after.userAgent,
+      })
+      .catch(() => {})
+  }
+  /* 插件通道的开关/端口/令牌变了就重开监听（端口占用等问题会反映在 bridge.status().error 里） */
+  if (
+    after.bridgeEnabled !== before.bridgeEnabled ||
+    String(after.bridgePort) !== String(before.bridgePort) ||
+    String(after.bridgeToken) !== String(before.bridgeToken)
+  ) {
+    await startBridge().catch(() => {})
+  }
+  applyAutoStart(after)
+}
+
+/**
+ * 把设置里的「开机自启动」写进 Windows 的登录项（macOS/Linux 上 Electron 也认这套 API）。
+ *
+ * - 打包版注册安装后的真实 exe；**portable 版**必须用 `PORTABLE_EXECUTABLE_FILE`
+ *   （portable 运行时会被解包到 %TEMP%，注册那个临时路径重启就失效了）。
+ * - 参数固定带 `--startup`：启动时看到它就直接收进托盘，不弹主窗口。
+ * - 开发模式不写注册表（注册 electron.exe 没有任何意义），只记日志。
+ */
+function applyAutoStart(cfg) {
+  const on = !!(cfg && cfg.autoStart)
+  if (!app.isPackaged) {
+    boot('autostart', 'dev-skip', 'want=' + on)
+    return
+  }
+  const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath
+  try {
+    const args = ['--startup']
+    const cur = app.getLoginItemSettings({ path: exe, args })
+    if (!!cur.openAtLogin === on) {
+      boot('autostart', 'unchanged', 'on=' + on)
+      return
+    }
+    app.setLoginItemSettings({ openAtLogin: on, path: exe, args, name: 'PanBox' })
+    boot('autostart', 'set', 'on=' + on, exe)
+  } catch (e) {
+    boot('autostart-err', (e && e.message) || String(e))
+  }
+}
+
+const UPDATE_REPO = 'Ygq156/PanBox'
+const RELEASE_PAGE = `https://github.com/${UPDATE_REPO}/releases`
+/** 自动检查在本次运行里最多只做一次（手动点「检查更新」不受限制） */
+let autoChecked = false
+
+function verParts(v) {
+  return String(v || '')
+    .replace(/^v/i, '')
+    .split('.')
+    .map((n) => parseInt(n, 10) || 0)
+}
+function isNewer(a, b) {
+  const A = verParts(a)
+  const B = verParts(b)
+  for (let i = 0; i < 3; i++) {
+    if ((A[i] || 0) !== (B[i] || 0)) return (A[i] || 0) > (B[i] || 0)
+  }
+  return false
+}
+
+/**
+ * 查 GitHub Releases 的公开接口（匿名、不带任何本机信息，只发一个 UA）。
+ * 刻意**不**做静默自动下载更新：装不装、什么时候装交给用户，这里只负责告诉他「有新版了」。
+ *
+ * @param {boolean} manual 用户手点的（失败要把原因说出来；自动检查失败就静默）
+ */
+function checkUpdate(manual) {
+  return new Promise((resolve) => {
+    const current = app.getVersion()
+    const req = https.request(
+      {
+        hostname: 'api.github.com',
+        path: `/repos/${UPDATE_REPO}/releases/latest`,
+        method: 'GET',
+        headers: { 'User-Agent': `PanBox/${current} (+https://github.com/${UPDATE_REPO})`, Accept: 'application/vnd.github+json' },
+        timeout: manual ? 10000 : 6000,
+      },
+      (res) => {
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', (c) => {
+          body += c
+          if (body.length > 512 * 1024) req.destroy()
+        })
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            resolve({ ok: false, current, message: `GitHub 返回 HTTP ${res.statusCode}` })
+            return
+          }
+          let j = null
+          try {
+            j = JSON.parse(body)
+          } catch (e) {
+            resolve({ ok: false, current, message: '返回内容不是合法 JSON' })
+            return
+          }
+          const latest = String(j.tag_name || j.name || '').replace(/^v/i, '')
+          resolve({
+            ok: true,
+            current,
+            latest,
+            hasUpdate: !!latest && isNewer(latest, current),
+            url: j.html_url || RELEASE_PAGE,
+            name: j.name || '',
+            publishedAt: j.published_at || '',
+          })
+        })
+      },
+    )
+    req.on('timeout', () => {
+      req.destroy(new Error('请求超时'))
+    })
+    req.on('error', (e) => {
+      resolve({ ok: false, current, message: (e && e.message) || String(e) })
+    })
+    req.end()
+  })
+}
+
 function ensureTray() {
   if (tray && !tray.isDestroyed()) return tray
   const p = trayIconPath()
@@ -1055,6 +1230,21 @@ if (!gotLock) {
     registerIpc()
     createWindow()
     boot('window created')
+
+    /* 开机自启动：每次启动都把登录项跟设置对齐一次（用户在别处删了登录项也能补回来） */
+    applyAutoStart(settings.load())
+
+    /* 启动后顺带查一次有没有新版本：延迟 4 秒，别跟启动抢网络；
+     * 只在「自动检查更新」开着、而且这次运行还没查过时做一次，失败静默。 */
+    setTimeout(async () => {
+      if (autoChecked) return
+      if (settings.load().autoCheckUpdate === false) return
+      autoChecked = true
+      const r = await checkUpdate(false)
+      if (r && r.ok && r.hasUpdate && win && !win.isDestroyed()) {
+        win.webContents.send('update:available', { latest: r.latest, current: r.current, url: r.url, name: r.name, publishedAt: r.publishedAt })
+      }
+    }, 4000)
 
     tasks.on('update', (list) => {
       if (win && !win.isDestroyed()) win.webContents.send('downloads:update', list)
