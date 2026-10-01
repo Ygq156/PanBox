@@ -267,33 +267,61 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
 /* 页面悬浮面板要用的素材：这一页浏览器真的请求过哪些媒体               */
 /* ------------------------------------------------------------------ */
 
-/* blob: 播放器（B 站、YouTube 这类 MSE）在 DOM 里只有一个 blob: 地址，
+/* blob: 播放器（B 站 / YouTube / 抖音这类 MSE）在 DOM 里只有一个 blob: 地址，
  * 真的能下的地址藏在网络请求里 —— 只能在 webRequest 里记下来。
- * 只留最近 10 分钟、每个标签页最多 200 条。 */
+ *
+ * ⚠️ 只按 URL 后缀找是不够的（v1.1.0 就栽在这里）：
+ *   抖音的视频长这样 ——
+ *     https://v3-web.douyinvod.com/xxxx/video/tos/cn/tos-cn-ve-15/yyyy/?a=6383&mime_type=video_mp4
+ *   路径里根本没有 .mp4，靠后缀永远匹配不到，于是面板只捞到页面里那个
+ *   「下载抖音 App」的链接。正确做法是**看响应头里的 Content-Type**：
+ *   video/mp4、audio/mp4、application/vnd.apple.mpegurl…
+ *   所以这里挂了两个监听：onBeforeRequest 按后缀兜底，
+ *   onHeadersReceived 按响应类型收网（这才是能抓到抖音视频的那一个）。 */
+
 const MEDIA_RE =
   /\.(m3u8|mpd|mp4|m4v|m4s|mkv|webm|flv|ts|mov|avi|wmv|mp3|m4a|flac|aac|ogg|opus|wav|wma)(?:$|[?#])/i
 
-const mediaByTab = new Map() /* tabId -> Map<url, {t, kind}> */
+/* 响应类型命中这些 = 一定是媒体 */
+const MEDIA_CT_RE = /^(video\/|audio\/|application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml|vnd\.ms-sstr))/i
+/* 有些 CDN 拿 octet-stream 发 mp4 —— 只在请求类型确实是媒体时才认，
+ * 免得把 .exe / .zip 这种也收进来。 */
+const OCTET_RE = /^application\/octet-stream/i
+
+const MEDIA_TTL = 3 * 60 * 1000 /* 换视频后旧地址会失效；3 分钟足够，也顺便自动淘汰上一个视频 */
+const MEDIA_MAX = 240
+
+const mediaByTab = new Map() /* tabId -> Map<url, {t, kind, ct, size}> */
 const frameItems = new Map() /* tabId -> Map<frameId, items[]> */
 
-function kindOfUrl(url) {
+function kindOfUrl(url, ct) {
+  const c = String(ct || '')
   if (/\.(m3u8|mpd)(?:$|[?#])/i.test(url)) return 'stream'
+  if (/^application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)/i.test(c)) return 'stream'
   if (/\.(ts|m4s)(?:$|[?#])/i.test(url)) return 'segment'
+  if (/^(video|audio)\//i.test(c)) return 'media'
   if (MEDIA_RE.test(url)) return 'media'
   return 'file'
 }
 
-function rememberMedia(tabId, url) {
+function rememberMedia(tabId, url, ct, size) {
   let m = mediaByTab.get(tabId)
   if (!m) {
     m = new Map()
     mediaByTab.set(tabId, m)
   }
-  m.set(url, { t: Date.now(), kind: kindOfUrl(url) })
-  if (m.size > 200) {
+  const old = m.get(url)
+  const c = ct || (old && old.ct) || ''
+  m.set(url, {
+    t: Date.now(),
+    kind: kindOfUrl(url, c),
+    ct: c,
+    size: Math.max(Number(size) || 0, (old && old.size) || 0),
+  })
+  if (m.size > MEDIA_MAX) {
     const now = Date.now()
-    for (const [k, v] of m) if (now - v.t > 10 * 60 * 1000) m.delete(k)
-    while (m.size > 200) m.delete(m.keys().next().value)
+    for (const [k, v] of m) if (now - v.t > MEDIA_TTL) m.delete(k)
+    while (m.size > MEDIA_MAX) m.delete(m.keys().next().value)
   }
 }
 
@@ -313,11 +341,62 @@ chrome.webRequest.onBeforeRequest.addListener(
       return
     }
     if (!/^https?:/i.test(d.url)) return
-    if (!MEDIA_RE.test(d.url)) return
-    rememberMedia(d.tabId, d.url)
+    if (!(MEDIA_RE.test(d.url) || d.type === 'media')) return
+    rememberMedia(d.tabId, d.url, '', 0)
   },
   { urls: ['http://*/*', 'https://*/*'] },
 )
+
+/* 收网的那一个：按响应 Content-Type 认媒体（抖音视频只有这一步能抓到） */
+chrome.webRequest.onHeadersReceived.addListener(
+  (d) => {
+    if (d.tabId == null || d.tabId < 0) return
+    if (!/^https?:/i.test(d.url)) return
+    let ct = ''
+    let len = 0
+    for (const h of d.responseHeaders || []) {
+      const n = String(h.name || '').toLowerCase()
+      if (n === 'content-type') ct = String(h.value || '')
+      else if (n === 'content-length') len = Math.max(len, Number(h.value) || 0)
+      else if (n === 'content-range') {
+        const m = /\/(\d+)\s*$/.exec(String(h.value || ''))
+        if (m) len = Math.max(len, Number(m[1]) || 0)
+      }
+    }
+    const media =
+      MEDIA_CT_RE.test(ct) ||
+      (OCTET_RE.test(ct) && (d.type === 'media' || d.type === 'xmlhttprequest' || d.type === 'other'))
+    if (!media) return
+    rememberMedia(d.tabId, d.url, ct, len)
+  },
+  { urls: ['http://*/*', 'https://*/*'] },
+  ['responseHeaders', 'extraHeaders'],
+)
+
+/* SPA（抖音、B 站、微博…）换内容是 pushState，文档并没有重新加载，
+ * 内容脚本自己不会知道。这里把导航事件转告给页面，让它立刻重扫；
+ * 并且顺手清掉上一个视频的记录，否则面板会一直列着已经失效的地址。 */
+function notifyNavigated(tabId, clear) {
+  if (tabId == null || tabId < 0) return
+  if (clear) {
+    mediaByTab.delete(tabId)
+    frameItems.delete(tabId)
+  }
+  try {
+    chrome.tabs.sendMessage(tabId, { type: 'panbox:navigated', clear: !!clear }).catch(() => {})
+  } catch {
+    /* 没有内容脚本（设置页、空白页）就算了 */
+  }
+}
+
+if (chrome.webNavigation) {
+  chrome.webNavigation.onCommitted.addListener((d) => {
+    if (d.frameId === 0) notifyNavigated(d.tabId, true)
+  })
+  chrome.webNavigation.onHistoryStateUpdated.addListener((d) => {
+    if (d.frameId === 0) notifyNavigated(d.tabId, true)
+  })
+}
 
 /* ------------------------------------------------------------------ */
 /* 接管浏览器下载                                                      */
@@ -421,12 +500,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       const tabId = _sender && _sender.tab ? _sender.tab.id : -1
       const out = []
       const have = new Set()
+      const now = Date.now()
       const m = tabId >= 0 ? mediaByTab.get(tabId) : null
       if (m) {
         for (const [url, v] of m) {
+          if (now - v.t > MEDIA_TTL) continue
           if (have.has(url)) continue
           have.add(url)
-          out.push({ url, kind: v.kind })
+          out.push({ url, kind: v.kind, ct: v.ct || '', size: v.size || 0 })
         }
       }
       const f = tabId >= 0 ? frameItems.get(tabId) : null
@@ -435,11 +516,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
           for (const it of list) {
             if (!it || !it.url || have.has(it.url)) continue
             have.add(it.url)
-            out.push({ url: it.url, kind: it.kind || 'file' })
+            out.push({ url: it.url, kind: it.kind || 'file', ct: '', size: 0 })
           }
         }
       }
-      return reply({ ok: true, items: out.slice(0, 150) })
+      /* 能直接下的整段视频排最前，其次播放列表，再是分片，最后才是页面文件链接。
+       * 同类型按体积从大到小 —— 抖音一页能抓到几十个 3KB 的 MSE 分片，
+       * 真正要下的是那个几百 KB 起步的 video/mp4。 */
+      const rank = { media: 0, stream: 1, segment: 2, file: 3 }
+      out.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || (b.size || 0) - (a.size || 0))
+      return reply({ ok: true, items: out.slice(0, 200) })
     }
     if (msg.type === 'sendUrls') {
       const items = (Array.isArray(msg.items) ? msg.items : [])
