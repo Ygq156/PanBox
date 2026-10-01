@@ -111,6 +111,13 @@ const MATCHERS = [
   { netdisk: 'quark', re: /(pan\.quark\.cn|drive-pc\.quark\.cn|quark\.cn)/i },
   { netdisk: 'uc', re: /((fast|drive|pc-api)\.uc\.cn|\buc\.cn\/s\/)/i },
   { netdisk: 'aliyun', re: /(aliyundrive\.com|alipan\.com)/i },
+  /* 下面是「认得出域名、但没有实现解析器」的网盘。它们出现在 MATCHERS 里**只为**让
+   * pickParser 命中 index.js 的 KNOWN_UNSUPPORTED 分支，回一句「暂不支持××」；
+   * 不列的话会掉进「兜底当直链」分支，拿分享页 URL 去 HEAD，给用户一个莫名其妙的结果。 */
+  { netdisk: 'tianyi', re: /(cloud\.189\.cn|189\.cn\/t\/)/i },
+  { netdisk: 'yidong', re: /(caiyun\.139\.com|139\.com\/m\/i)/i },
+  { netdisk: 'pan115', re: /(115\.com|115cdn\.com|anxia\.com)/i },
+  { netdisk: 'weiyun', re: /(share\.weiyun\.com|weiyun\.com)/i },
   { netdisk: '123pan', re: /(123pan\.com|123pan\.cn|123panpay\.com|123684\.com|123865\.com|123912\.com|123592\.com)/i },
 ]
 
