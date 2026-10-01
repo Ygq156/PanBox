@@ -121,7 +121,7 @@ const { cleanupDownloaded } = parsers
  *   迅雷 8 条最好，16 条以上回 503；
  *   直链/网盘直链在 16 条时已经接近服务端上限（npmmirror 16→3.99、64→4.86 MB/s）。
  */
-const SEG_CONNECTIONS = { quark: 96, uc: 96, direct: 128 }
+const SEG_CONNECTIONS = { quark: 192, uc: 96, direct: 128 }
 
 /**
  * 某个网盘该用自研分段引擎开多少连接（0 = 不用这个引擎，继续走 aria2）。
