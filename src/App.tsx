@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, formatEta, formatSize, formatSpeed } from './api'
+import type { BridgeStatus } from './api'
 import type { DownloadTask, ParseEndpoint, ParseResult, Settings, Aria2Status } from './types'
 
 /* ------------------------------------------------------------------ */
@@ -397,6 +398,8 @@ function SettingsModal({
             onAck={(v) => patch({ endpointAck: v })}
           />
 
+          <BridgeSection />
+
           <div className="field">
             <label>aria2 RPC 端口</label>
             <input
@@ -418,6 +421,105 @@ function SettingsModal({
             保存
           </button>
         </div>
+      </div>
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/* 浏览器插件（设置页里的一段）                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 浏览器插件把下载任务投给本机的 PanBox。
+ * 这一段的职责只有三件事：告诉用户「通没通」、告诉他插件目录在哪、以及给他配对令牌。
+ */
+function BridgeSection() {
+  const [st, setSt] = useState<BridgeStatus | null>(null)
+  const [msg, setMsg] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const refresh = async () => {
+    try {
+      setSt(await api.bridgeStatus())
+    } catch {
+      /* 主进程没起这条通道时忽略 */
+    }
+  }
+
+  useEffect(() => {
+    refresh()
+  }, [])
+
+  const run = async (fn: () => Promise<string>) => {
+    setBusy(true)
+    try {
+      setMsg(await fn())
+      await refresh()
+    } catch (e) {
+      setMsg(`出错了：${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const openFolder = () =>
+    run(async () => {
+      const r = await api.bridgeOpenFolder()
+      return r.ok ? `已打开插件文件夹：${r.dir}` : `打不开：${r.message || '未知原因'}`
+    })
+
+  const restart = () => run(async () => ((await api.bridgeStart()) ? '已重新开始监听' : '没起来'))
+
+  const newToken = () => run(async () => ((await api.bridgeNewToken()) ? '已换新令牌，请到插件的「高级」里重新填一次' : '没换成'))
+
+  const state = !st ? 'gray' : !st.enabled ? 'gray' : st.running ? 'ok' : 'err'
+  const stateText = !st
+    ? '读取中…'
+    : !st.enabled
+      ? '已关闭'
+      : st.running
+        ? `运行中 · ${st.host}:${st.port}`
+        : `没有起来${st.error ? `：${st.error}` : ''}`
+
+  return (
+    <div className="field">
+      <label>浏览器插件（用浏览器直接下网站资源）</label>
+      <div className="ep-netdisks" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
+        <div className="seg-conn" style={{ justifyContent: 'space-between' }}>
+          <span className={`badge ${state === 'ok' ? 'ok' : state === 'err' ? 'err' : 'gray'}`}>{stateText}</span>
+          <span className="meta">
+            {st ? (st.added > 0 ? `已接收 ${st.added} 个任务` : '还没有收到过任务') : ''}
+          </span>
+        </div>
+
+        <div className="row">
+          <button onClick={openFolder} disabled={busy}>
+            打开插件文件夹
+          </button>
+          <button onClick={restart} disabled={busy}>
+            重新检测
+          </button>
+          <button onClick={newToken} disabled={busy}>
+            重新配对
+          </button>
+        </div>
+
+        {st && (
+          <div className="seg-conn" style={{ alignItems: 'center' }}>
+            <span className="meta">配对令牌</span>
+            <input type="text" readOnly value={st.token} onFocus={(e) => e.currentTarget.select()} style={{ width: 260 }} />
+          </div>
+        )}
+
+        <div className="desc">
+          装上插件后，在网页里右键链接就能「用 PanBox 下载」——任务会带着当前页面的 Referer / Cookie / User-Agent
+          一起送过来，很多站点的直链少了这几个头就是 403。安装方法：浏览器打开{' '}
+          <code>chrome://extensions</code>（Edge 是 <code>edge://extensions</code>）→ 打开「开发者模式」→
+          「加载已解压的扩展程序」→ 选上面打开的插件文件夹。只支持 Chrome / Edge 这类 Chromium 内核浏览器。
+        </div>
+        {!st?.extExists && <div className="hint err">插件文件夹里没找到 manifest.json，可能是安装不完整。</div>}
+        {msg && <div className="hint ok">{msg}</div>}
       </div>
     </div>
   )
@@ -584,7 +686,16 @@ export default function App() {
     api.aria2Status().then(setAria2).catch(() => {})
     api.listDownloads().then(setTasks).catch(() => {})
     const off = api.onDownloadsUpdate(setTasks)
-    return off
+    /* 浏览器插件投进来一个「网盘分享链接」时，主进程不会擅自决定下哪些文件，
+     * 而是把链接送到这里填进输入框，让用户自己勾选。 */
+    const offPre = api.onBridgePrefill?.((d) => {
+      setText(d.url)
+      setHint({ kind: 'ok', msg: `浏览器插件送来一个${NETDISK_LABEL[d.netdisk] ?? d.netdisk}分享链接，点「解析」看看里面有什么` })
+    })
+    return () => {
+      off()
+      if (offPre) offPre()
+    }
   }, [])
 
   useEffect(() => {
@@ -727,7 +838,7 @@ export default function App() {
           <div className="link-row">
             <input
               type="text"
-              placeholder="粘贴网盘分享链接，支持一行一个批量解析（蓝奏云 / 夸克 / UC / 百度 …）"
+              placeholder="粘贴网盘分享链接，或任意 http(s) 直链（一行一个，批量解析）—— 蓝奏云 / 夸克 / UC / 百度 / 迅雷 / 123 …"
               value={text}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && !parsing && doParse()}

@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "PanBox 下载助手",
+  "version": "1.0.0",
+  "description": "把浏览器里的下载链接交给本机 PanBox 多线程下载，自动带上 Referer / Cookie / User-Agent。",
+  "minimum_chrome_version": "102",
+  "permissions": [
+    "contextMenus",
+    "storage",
+    "cookies",
+    "downloads",
+    "webRequest",
+    "scripting",
+    "activeTab",
+    "tabs"
+  ],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*", "<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "PanBox 下载助手",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

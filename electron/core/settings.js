@@ -39,6 +39,11 @@ const DEFAULTS = () => ({
    * 于是被钉死在 16 × 0.05 ≈ 0.8 MB/s。这个引擎自己开连接，不受那个上限约束。
    * 百度不在此表 —— 它是**账号级总量**限速，加连接只会招致 403（实测 16/24 连接直接 403）。 */
   segConnections: { quark: 96, uc: 96 },
+  /* 浏览器插件接收通道（见 electron/core/bridge.js）。
+   * 默认开：它只监听 127.0.0.1，公网与局域网都连不上，而且投递任务要带令牌。 */
+  bridgeEnabled: true,
+  bridgePort: 7799,
+  bridgeToken: '',
 })
 
 let cache = null

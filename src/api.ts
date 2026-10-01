@@ -17,6 +17,27 @@ export interface AddPayload {
   title?: string
 }
 
+export interface BridgeStatus {
+  running: boolean
+  port: number
+  host: string
+  url: string
+  error?: string
+  added: number
+  lastAddedName?: string
+  lastAddedAt?: number
+  lastError?: string
+  paired: boolean
+  pairedAt?: number
+  /** 设置里有没有开这条通道 */
+  enabled: boolean
+  /** 配对令牌，插件高级选项里要填的就是它 */
+  token: string
+  /** 未打包的浏览器插件目录（「打开插件文件夹」按钮用） */
+  extDir: string
+  extExists: boolean
+}
+
 export interface PanboxAPI {
   parseShare(p: ParsePayload): Promise<ParseResponse>
   listDownloads(): Promise<DownloadTask[]>
@@ -35,7 +56,12 @@ export interface PanboxAPI {
   restartAria2(): Promise<Aria2Status>
   openLogin(netdisk: string): Promise<{ ok: boolean; cookie?: string; count?: number; loggedIn?: boolean; message?: string }>
   clearLogin(netdisk: string): Promise<boolean>
+  bridgeStatus(): Promise<BridgeStatus>
+  bridgeStart(): Promise<BridgeStatus>
+  bridgeOpenFolder(): Promise<{ ok: boolean; dir: string; message: string }>
+  bridgeNewToken(): Promise<BridgeStatus>
   onDownloadsUpdate(cb: (tasks: DownloadTask[]) => void): () => void
+  onBridgePrefill(cb: (data: { url: string; netdisk: string }) => void): () => void
 }
 
 declare global {
