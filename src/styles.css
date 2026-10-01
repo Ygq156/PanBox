@@ -479,7 +479,7 @@ input[type='checkbox'] {
 
 .task {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 190px 110px 100px;
+  grid-template-columns: minmax(0, 1fr) 190px 110px 138px;
   gap: 10px;
   align-items: center;
   padding: 9px 16px;
@@ -674,6 +674,93 @@ input[type='checkbox'] {
   border-top: 1px solid var(--border);
   flex: 0 0 auto;
   background: var(--bg-elev);
+}
+
+/* ---------- 回收站 ---------- */
+.modal.trash {
+  width: 620px;
+  height: 520px;
+  max-height: 86vh;
+}
+
+.modal.trash h2 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.modal.trash h2 .x {
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.trash-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.trash-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 18px;
+  border-bottom: 1px solid #1c2029;
+}
+
+.trash-row:hover {
+  background: #13161d;
+}
+
+.trash-row .tcell {
+  min-width: 0;
+  flex: 1;
+}
+
+.trash-row .tname {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trash-row .tsub {
+  color: var(--text-dim);
+  font-size: 11px;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trash-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-elev);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.trash-foot .trash-count {
+  font-variant-numeric: tabular-nums;
+}
+
+.trash-foot .trash-warn {
+  color: var(--err);
+}
+
+/* 回收站里的「彻底删除」/「清空」——红字小按钮（.danger 是设置页那个红框，不能复用） */
+button.tiny.del {
+  color: var(--err);
+  border-color: rgba(255, 91, 91, 0.4);
+}
+
+button.tiny.del:hover:not(:disabled) {
+  background: rgba(255, 91, 91, 0.12);
+  border-color: rgba(255, 91, 91, 0.6);
 }
 
 /* ---------- 设置页：左侧分类导航 + 右侧一屏一组（见 src/App.tsx SET_TABS） ---------- */
@@ -950,7 +1037,32 @@ input[type='checkbox'] {
   background: var(--ok);
 }
 
-/* 账号状态那一行说明：留空 = 已保存，不是游客模式 */
+/* 账号表单：下拉 + 输入框一行，说明与按钮一律排在下面（挤在右边时输入框放不下长凭证） */
+.acct-form {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  width: 100%;
+}
+
+.acct-form .row {
+  gap: 8px;
+}
+
+.acct-form input[type='text'] {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+  height: 32px;
+  font-size: 12.5px;
+}
+
+.acct-form .chint {
+  margin-top: 0;
+}
+
+/* 账号状态那一行说明：留空 = 沿用本机已保存的那份 */
 .chint {
   display: flex;
   align-items: flex-start;
