@@ -15,8 +15,17 @@ contextBridge.exposeInMainWorld('panbox', {
   resumeTask: (gid) => invoke('downloads:resume', gid),
   refreshTask: (gid) => invoke('downloads:refresh', gid),
   removeTask: (gid) => invoke('downloads:remove', gid),
+  /* 删掉已下完的文件：文件进回收站，任务同时从队列移除 */
+  deleteTaskFile: (gid) => invoke('downloads:deleteFile', gid),
   pauseAll: () => invoke('downloads:pauseAll'),
   resumeAll: () => invoke('downloads:resumeAll'),
+
+  /* 回收站 */
+  trashList: () => invoke('trash:list'),
+  trashRestore: (id) => invoke('trash:restore', id),
+  trashDelete: (id) => invoke('trash:delete', id),
+  trashEmpty: () => invoke('trash:empty'),
+  trashOpenDir: () => invoke('trash:openDir'),
 
   getSettings: () => invoke('settings:get'),
   setSettings: (s) => invoke('settings:set', s),
@@ -41,6 +50,11 @@ contextBridge.exposeInMainWorld('panbox', {
   setAutoStart: (on) => invoke('app:setAutoStart', on),
   checkUpdate: (opts) => invoke('update:check', opts),
   openRelease: (url) => invoke('update:open', url),
+  /* 安装版就地更新（见 electron/main.js 的 update:* 通道） */
+  updateState: () => invoke('update:state'),
+  updateAppCheck: () => invoke('update:appCheck'),
+  updateDownload: () => invoke('update:download'),
+  updateInstall: () => invoke('update:install'),
 
   onDownloadsUpdate: (cb) => {
     const h = (_e, data) => cb(data)
@@ -53,6 +67,13 @@ contextBridge.exposeInMainWorld('panbox', {
     const h = (_e, data) => cb(data)
     ipcRenderer.on('update:available', h)
     return () => ipcRenderer.removeListener('update:available', h)
+  },
+
+  /* 自更新的进度/结果（下载中、已下载、出错） */
+  onUpdateState: (cb) => {
+    const h = (_e, data) => cb(data)
+    ipcRenderer.on('update:state', h)
+    return () => ipcRenderer.removeListener('update:state', h)
   },
 
   /* 浏览器插件投递进来一个「网盘分享链接」时，主进程把它送到这里，

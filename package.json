@@ -1,7 +1,7 @@
 {
   "name": "panbox",
   "productName": "PanBox",
-  "version": "0.6.9",
+  "version": "0.6.10",
   "private": true,
   "description": "PanBox 网盘快取 —— 多网盘分享链接解析 + aria2 多线程下载桌面客户端",
   "main": "electron/main.js",
@@ -64,8 +64,16 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "PanBox"
+      "shortcutName": "PanBox",
+      "artifactName": "PanBox-Setup-${version}.${ext}"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Ygq156",
+        "repo": "PanBox"
+      }
+    ],
     "portable": {
       "artifactName": "PanBox-${version}-portable.exe"
     }
@@ -83,5 +91,8 @@
   },
   "optionalDependencies": {
     "@rolldown/binding-win32-x64-msvc": "^1.2.11"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
   }
 }

@@ -60,6 +60,18 @@ export interface AppInfo {
   platform: string
 }
 
+/** 回收站里的一条记录（删掉的下载文件） */
+export interface TrashItem {
+  id: string
+  name: string
+  /** 原来的完整路径，还原就挪回这里 */
+  from: string
+  size: number
+  dir: boolean
+  netdisk: string
+  at: number
+}
+
 export interface UpdateInfo {
   ok: boolean
   current: string
@@ -69,6 +81,19 @@ export interface UpdateInfo {
   name?: string
   publishedAt?: string
   /** ok=false 时的原因（超时 / 被墙 / 限流…） */
+  message?: string
+}
+
+/** 安装版自更新的状态（主进程 update:state / update:download / update:install） */
+export interface UpdateState {
+  state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'latest' | 'error'
+  /** 这次检查能不能就地更新（打包过的安装版才有） */
+  canUpdate?: boolean
+  version?: string
+  percent?: number
+  transferred?: number
+  total?: number
+  bytesPerSecond?: number
   message?: string
 }
 
@@ -82,8 +107,15 @@ export interface PanboxAPI {
   resumeTask(gid: string): Promise<boolean>
   refreshTask(gid: string): Promise<{ ok: boolean; gid?: string; message?: string }>
   removeTask(gid: string, deleteFile?: boolean): Promise<boolean>
+  /** 删掉已下载完成的文件：文件进回收站，任务同时从队列移除 */
+  deleteTaskFile(gid: string): Promise<{ ok: boolean; name?: string; size?: number; message?: string }>
   pauseAll(): Promise<boolean>
   resumeAll(): Promise<boolean>
+  trashList(): Promise<TrashItem[]>
+  trashRestore(id: string): Promise<{ ok: boolean; name?: string; path?: string; message?: string }>
+  trashDelete(id: string): Promise<boolean>
+  trashEmpty(): Promise<number>
+  trashOpenDir(): Promise<string>
   getSettings(): Promise<Settings>
   setSettings(s: Partial<Settings>): Promise<Settings>
   /** 恢复默认设置（登录凭证与自备解析接口保留），返回恢复后的设置 */
@@ -103,9 +135,14 @@ export interface PanboxAPI {
   setAutoStart(on: boolean): Promise<{ ok: boolean; autoStart: boolean; applied: boolean }>
   checkUpdate(opts?: { manual?: boolean }): Promise<UpdateInfo>
   openRelease(url: string): Promise<{ ok: boolean; message?: string }>
+  updateState(): Promise<UpdateState>
+  updateAppCheck(): Promise<{ ok: boolean; message?: string }>
+  updateDownload(): Promise<{ ok: boolean; message?: string }>
+  updateInstall(): Promise<{ ok: boolean; message?: string }>
   onDownloadsUpdate(cb: (tasks: DownloadTask[]) => void): () => void
   onBridgePrefill(cb: (data: { url: string; netdisk: string }) => void): () => void
   onUpdateAvailable(cb: (data: { latest: string; current: string; url: string; name?: string; publishedAt?: string }) => void): () => void
+  onUpdateState(cb: (data: UpdateState) => void): () => void
 }
 
 declare global {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { api, formatEta, formatSize, formatSpeed } from './api'
-import type { AppInfo, BridgeStatus, ProxyStatus, UpdateInfo } from './api'
+import type { AppInfo, BridgeStatus, ProxyStatus, TrashItem, UpdateInfo, UpdateState } from './api'
 import type { Aria2Status, DownloadTask, ParseEndpoint, ParseResult, Settings } from './types'
 
 /* ------------------------------------------------------------------ */
@@ -53,22 +53,22 @@ const EP_NETDISKS = ['lanzou', 'ilanzou', 'quark', 'uc', 'baidu', 'xunlei', '123
 /** 解析成功后，结果面板底下的一句话提示（原来每个网盘一段 if，现在一张表） */
 const NETDISK_TIP: Record<string, { warn?: boolean; text: string }> = {
   quark: {
-    text: '夸克按「每条连接」发额度（单条约 50KB/s），已交给自带的分段引擎多连接下载，连接越多越快。',
+    text: '已交给分段引擎多连接下载。',
   },
-  uc: { text: 'UC 按每条连接发额度，已交给自带的分段引擎多连接下载。' },
-  xunlei: { text: '走「转存到你的迅雷云盘 → 取直链」，下载完成后会自动删掉转存副本。' },
+  uc: { text: '已交给分段引擎多连接下载。' },
+  xunlei: { text: '已转存到你的迅雷云盘取直链，任务结束后自动删掉转存副本。' },
   baidu: {
     warn: true,
-    text: '百度按「账号」维度限速，本任务强制单线程。想更快：在官方客户端开「设置 → 传输 → 下载提速」（免费），或者开 SVIP。',
+    text: '百度按账号限速，本任务单线程。想更快：官方客户端开「设置 → 传输 → 下载提速」，或者开 SVIP。',
   },
 }
 
 /** 没登录时各网盘的一句话说明 */
 const NEED_LOGIN_TIP: Record<string, string> = {
-  quark: '夸克网盘的游客直链会被 CDN 拒绝（412），需要登录你自己的账号。',
-  uc: 'UC 网盘的游客直链会被 CDN 拒绝（403），需要登录你自己的账号。',
-  xunlei: '迅雷分享可以匿名浏览文件列表，但转存和取直链必须登录。',
-  baidu: '百度网盘需要登录你自己的账号，才能转存并取直链。',
+  quark: '需要登录你自己的夸克账号。',
+  uc: '需要登录你自己的 UC 账号。',
+  xunlei: '需要登录你自己的迅雷账号。',
+  baidu: '需要登录你自己的百度账号。',
 }
 
 /* ------------------------------------------------------------------ */
@@ -153,8 +153,8 @@ function EndpointSection({
       label="解析接口（可选，优先于内置解析）"
       hint={
         <>
-          接口地址完全由你提供。填了提取码时，<b>提取码会随分享链接一起发给接口</b>（否则它取不到链）；
-          你的网盘凭证只在你自己机器上用，<b>不会</b>发往接口。
+          接口地址由你自己提供。填了提取码时，<b>提取码会随分享链接一起发给接口</b>；
+          你的网盘凭证<b>不会</b>发往接口。
         </>
       }
     >
@@ -291,14 +291,11 @@ function ProxySection({ s, patch }: { s: Settings; patch: (p: Partial<Settings>)
 
   return (
     <Field
-      label="网络代理（下 GitHub / 境外资源时差别很大）"
+      label="网络代理（下 GitHub / 境外资源时用）"
       hint={
         <>
-          实测同一条 66 MB 的 GitHub 直链：<b>直连 CDN 单连接只有 0.03–0.04 MB/s</b>，
-          走系统代理能到 <b>8–11 MB/s</b>。哪个更快跟连接数是 16 还是 32 关系不大。
-          <br />
           当前实际使用：{st?.effective ? <code>{st.effective}</code> : '直连（不走代理）'}。
-          改完会自动重启下载引擎，本机地址永远绕过代理。一条路不通时程序会自动换另一条。
+          改完自动重启下载引擎，本机地址不走代理。
         </>
       }
     >
@@ -372,10 +369,9 @@ function BridgeSection() {
       label="浏览器插件（在网页里直接下资源）"
       hint={
         <>
-          装上后，网页里右键链接就能「用 PanBox 下载」，任务会带上当前页面的 Referer / Cookie / User-Agent
-          —— 很多站点的直链少了这几个头就是 403。安装：打开 <code>chrome://extensions</code>（Edge 是{' '}
-          <code>edge://extensions</code>）→ 开发者模式 → 加载已解压的扩展程序 → 选「打开插件文件夹」里的目录。
-          装好或更新后要在扩展页点一次「重新加载」。
+          装上后，网页里右键链接就能「用 PanBox 下载」，任务会带上当前页面的 Referer / Cookie / User-Agent。
+          安装：打开 <code>chrome://extensions</code>（Edge 是 <code>edge://extensions</code>）→ 开发者模式 →
+          加载已解压的扩展程序 → 选「打开插件文件夹」里的目录；装好或更新后点一次「重新加载」。
         </>
       }
     >
@@ -597,9 +593,13 @@ function SettingsModal({
       : { state: 'idle' },
   )
   const [confirmReset, setConfirmReset] = useState(false)
+  /* 安装版就地更新：主进程推状态，界面只负责显示和两个按钮 */
+  const [auto, setAuto] = useState<UpdateState>({ state: 'idle' })
 
   useEffect(() => {
     api.appInfo().then(setInfo).catch(() => {})
+    api.updateState?.().then(setAuto).catch(() => {})
+    return api.onUpdateState?.((d) => setAuto(d))
   }, [])
 
   const patch = (p: Partial<Settings>) => setS((v) => ({ ...v, ...p }))
@@ -607,6 +607,10 @@ function SettingsModal({
    * 主进程回的那份是按它自己的顺序拼的），看起来一样的内容也会被判成「有改动」——
    * 结果就是点过任意一个开关之后，底部一直提示「文本框改完请点保存」、「保存」也一直是可点的。 */
   const dirty = stableJson(s) !== stableJson(saved)
+  /* 只有打包过的安装版能就地更新（便携版解包到临时目录运行，没法替换自己） */
+  const canAutoUpdate = !!(info?.packaged && !info?.portable)
+  /* 「检查更新」按钮的忙碌态：安装版看自更新的状态，便携版看 GitHub 接口的状态 */
+  const checking = canAutoUpdate ? auto.state === 'checking' : upd.state === 'checking'
   /* 网盘账号那页用：主进程只发打码串过来，打码串 = 本机存着一份真凭证（不是游客模式）。
    * maskedCookie 看的是「当前编辑框里是不是打码串」，storedMasked 看的是「磁盘上那份还在不在」——
    * 后者才是「清空输入框也不能把凭证弄丢」的依据（改完又清空时，编辑框里已经不是打码串了）。 */
@@ -694,6 +698,13 @@ function SettingsModal({
   }
 
   const checkUpd = async () => {
+    /* 安装版让 electron-updater 自己去比版本；便携版读不了自己的安装信息，只能用 GitHub 接口 */
+    if (canAutoUpdate) {
+      setAuto({ state: 'checking' })
+      const r = await api.updateAppCheck()
+      if (!r.ok) setAuto({ state: 'error', message: r.message || '检查失败' })
+      return
+    }
     setUpd({ state: 'checking' })
     try {
       const r = await api.checkUpdate({ manual: true })
@@ -756,7 +767,7 @@ function SettingsModal({
                     <Row
                       indent
                       title="启动时显示主窗口"
-                      desc="不勾选就静静待在托盘里 —— 该续传的任务照常跑，不打扰你。"
+                      desc="不勾选就只留在托盘里。"
                     >
                       <Switch
                         checked={!!s.startupShowWindow}
@@ -768,7 +779,7 @@ function SettingsModal({
                 <Section title="关闭">
                   <Row
                     title="关闭窗口后留在后台下载"
-                    desc="点右上角 × 只是把窗口收进托盘，下载与浏览器插件通道都不中断；真要退出走托盘菜单的「退出」。"
+                    desc="关闭窗口后留在托盘，下载不中断；要完全退出走托盘菜单的「退出」。"
                     err={rowErr.closeToTray}
                   >
                     <Switch
@@ -776,7 +787,7 @@ function SettingsModal({
                       onChange={(v) => instant({ closeToTray: v }, 'closeToTray')}
                     />
                   </Row>
-                  <Row title="下载完成后打开下载目录" desc="每个任务下完都弹一次资源管理器；下的东西多时可以关掉。">
+                  <Row title="下载完成后打开下载目录" desc="每个任务下载完成时打开一次所在目录。">
                     <Switch
                       checked={!!s.openFolderWhenDone}
                       onChange={(v) => instant({ openFolderWhenDone: v }, 'openFolderWhenDone')}
@@ -810,7 +821,7 @@ function SettingsModal({
                 <Section title="aria2（百度 / 迅雷 / 蓝奏云走这条）">
                   <NumberRow
                     title="同时下载任务数"
-                    desc="同时跑几个任务。太多会互相抢带宽，反而每个都慢。"
+                    desc="同时下载的任务数。"
                     value={s.maxConcurrent}
                     min={1}
                     max={20}
@@ -828,7 +839,7 @@ function SettingsModal({
                   />
                   <NumberRow
                     title="每服务器最大连接数"
-                    desc="aria2 对同一台服务器的连接上限（它自己的硬上限是 16）。"
+                    desc="aria2 对同一台服务器的连接上限，最大 16。"
                     value={s.maxConnectionPerServer}
                     min={1}
                     max={64}
@@ -838,7 +849,7 @@ function SettingsModal({
                   <Row
                     stack
                     title="最小分片大小"
-                    desc="写成 1M / 512K 这样。太小会让请求数暴增，反而慢。"
+                    desc="写成 1M / 512K 这样的格式。"
                   >
                     <input
                       type="text"
@@ -852,15 +863,7 @@ function SettingsModal({
                   <Row
                     stack
                     title="每个网盘的连接数"
-                    desc={
-                      <>
-                        夸克与 UC 的 CDN 是<b>按每条 TCP 连接</b>发额度的（夸克实测 ≈50KB/s 一条），
-                        而 aria2 的连接上限只有 16 —— 所以这两家交给自带的分段引擎，连接数在这里调。
-                        填 0 = 退回 aria2。<b>夸克默认 192</b>（实测比 96 快 1.85×）；
-                        <b>UC 默认 96</b>（实测 96 条已经跑满线路，加到 192 没有提升）；
-                        <b>直链默认 128</b>（境外线路常常「先冲一阵再长时间不动」，连接少了就一直在等）。
-                      </>
-                    }
+                    desc="夸克 / UC / 直链 各自用多少条连接下载。填 0 就改用 aria2。默认：夸克 192、UC 96、直链 128。"
                     err={rowErr.segConnections}
                   >
                     <div className="ep-netdisks">
@@ -884,12 +887,7 @@ function SettingsModal({
                   </Row>
                   <NumberRow
                     title="百度网盘并发（默认 1）"
-                    desc={
-                      <>
-                        百度是<b>账号级总量限速</b>，普通账号调大并发只会招来几小时到几天的惩罚性降速。
-                        如果你是超级会员，可以调到 4~8 试试；<b>调高后速度反而变 0 就说明被限了，调回 1</b>。
-                      </>
-                    }
+                    desc="百度按账号限速。超级会员可以调到 4~8；调高后速度变成 0 说明被限了，调回 1。"
                     value={s.baiduConnections ?? 1}
                     min={1}
                     max={16}
@@ -908,12 +906,7 @@ function SettingsModal({
                 <Section title="证书">
                   <Row
                     title="忽略证书错误"
-                    desc={
-                      <>
-                        默认关闭：两个下载引擎与解析请求都按正常流程校验证书。打开后，公共 WiFi 或代理里的中间人
-                        能静默替换你下载的内容（含 .exe / .msi），只有确实遇到自签或过期的网盘 CDN 时才打开。
-                      </>
-                    }
+                    desc="打开后不再校验证书，公共 WiFi 或代理可能替换你下载的内容，仅在必要时打开。"
                     err={rowErr.ignoreCert}
                   >
                     <Switch checked={!!s.ignoreCert} onChange={(v) => instant({ ignoreCert: v }, 'ignoreCert')} />
@@ -960,67 +953,60 @@ function SettingsModal({
                 <Row
                   stack
                   title="用你自己的账号（夸克 / UC / 迅雷 / 百度必须登录）"
-                  desc={
-                    <>
-                      凭证只在你自己机器上用，程序只拿「你账号本来应有的速度」，不做任何身份伪造。
-                      夸克与 UC 的游客直链会被 CDN 拒绝（412 / 403），迅雷和百度的转存取链也必须登录。
-                    </>
-                  }
+                  desc="凭证只存在这台电脑上，程序只用你账号本来应有的速度，不做身份伪造。"
                 >
-                  <div className="row">
-                    <select className="select" value={cookieKey} onChange={(e) => setCookieKey(e.target.value)}>
-                      {COOKIE_TARGETS.map((k) => (
-                        <option key={k} value={k}>
-                          {label(k)}
-                        </option>
-                      ))}
-                    </select>
-                    <input
-                      type="text"
-                      placeholder={
-                        maskedCookie
-                          ? '已保存；要换账号就粘贴新凭证，或点下面「登录」重新登一次'
-                          : '粘贴该网盘的凭证字符串，或点下面「登录」自动获取'
-                      }
-                      value={maskedCookie ? '' : s.cookies[cookieKey] ?? ''}
-                      onChange={(e) => {
-                        const v = e.target.value
-                        /* 清空输入框永远不等于「删凭证」：磁盘上本来有一份就退回那份（打码串），
-                         * 只有本来就什么都没有（或点「退出登录」）才会真的变成空。
-                         * 不然用户打一半反悔、或者手滑全选删掉，就得重新登录一遍。 */
-                        const val = v === '' ? (storedMasked ? COOKIE_MASK : '') : v
-                        patch({ cookies: { ...s.cookies, [cookieKey]: val } })
-                      }}
-                    />
-                  </div>
-                  <div className={`chint${cookiesOk ? ' ok' : ''}`}>
-                    <i className={cookiesOk ? 'dot ok' : 'dot'} />
-                    {cookiesOk
-                      ? `${label(cookieKey)} 的凭证已保存在本机配置里，界面上不回显原文（打字框留空就是这个意思，不是游客模式）。解析和下载直接用这份凭证。`
-                      : `${label(cookieKey)} 还没有凭证：这种情况下解析只能拿到游客直链，夸克 / UC 会被 CDN 拒（412 / 403）。`}
-                  </div>
-                  {LOGIN_TARGETS.includes(cookieKey) && (
-                    <div className="row" style={{ marginTop: 8 }}>
-                      <button disabled={loginBusy} onClick={doLogin}>
-                        {loginBusy ? '请在弹出的窗口里登录…' : `登录${label(cookieKey)}`}
-                      </button>
-                      <button
-                        onClick={async () => {
-                          await api.clearLogin(cookieKey)
-                          /* 退出登录要立刻落盘：这里清了浏览器分区，配置里那份也一起清掉，
-                           * 免得留下一个「分区已登出、配置里还攥着旧凭证」的中间状态。 */
-                          const next = await api.setSettings({ cookies: { ...s.cookies, [cookieKey]: '' } })
-                          setS((v) => ({ ...v, cookies: { ...next.cookies } }))
-                          setSaved(next)
-                          onSaved(next)
-                          setLoginMsg(`已清除 ${label(cookieKey)} 的登录状态`)
+                  <div className="acct-form">
+                    <div className="row">
+                      <select className="select" value={cookieKey} onChange={(e) => setCookieKey(e.target.value)}>
+                        {COOKIE_TARGETS.map((k) => (
+                          <option key={k} value={k}>
+                            {label(k)}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        type="text"
+                        placeholder={maskedCookie ? '已保存；粘贴新凭证可换账号' : '粘贴凭证，或点下面「登录」自动获取'}
+                        value={maskedCookie ? '' : s.cookies[cookieKey] ?? ''}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          /* 清空输入框永远不等于「删凭证」：磁盘上本来有一份就退回那份（打码串），
+                           * 只有本来就什么都没有（或点「退出登录」）才会真的变成空。
+                           * 不然用户打一半反悔、或者手滑全选删掉，就得重新登录一遍。 */
+                          const val = v === '' ? (storedMasked ? COOKIE_MASK : '') : v
+                          patch({ cookies: { ...s.cookies, [cookieKey]: val } })
                         }}
-                      >
-                        退出登录
-                      </button>
+                      />
                     </div>
-                  )}
-                  {loginMsg && <div className="desc">{loginMsg}</div>}
+                    <div className={`chint${cookiesOk ? ' ok' : ''}`}>
+                      <i className={cookiesOk ? 'dot ok' : 'dot'} />
+                      {cookiesOk
+                        ? `${label(cookieKey)} 的凭证已保存在本机，输入框留空即沿用。`
+                        : `${label(cookieKey)} 还没有凭证，解析只能拿到游客直链。`}
+                    </div>
+                    {LOGIN_TARGETS.includes(cookieKey) && (
+                      <div className="row">
+                        <button disabled={loginBusy} onClick={doLogin}>
+                          {loginBusy ? '请在弹出的窗口里登录…' : `登录${label(cookieKey)}`}
+                        </button>
+                        <button
+                          onClick={async () => {
+                            await api.clearLogin(cookieKey)
+                            /* 退出登录要立刻落盘：这里清了浏览器分区，配置里那份也一起清掉，
+                             * 免得留下一个「分区已登出、配置里还攥着旧凭证」的中间状态。 */
+                            const next = await api.setSettings({ cookies: { ...s.cookies, [cookieKey]: '' } })
+                            setS((v) => ({ ...v, cookies: { ...next.cookies } }))
+                            setSaved(next)
+                            onSaved(next)
+                            setLoginMsg(`已清除 ${label(cookieKey)} 的登录状态`)
+                          }}
+                        >
+                          退出登录
+                        </button>
+                      </div>
+                    )}
+                    {loginMsg && <div className="desc">{loginMsg}</div>}
+                  </div>
                 </Row>
               </Section>
             )}
@@ -1036,54 +1022,91 @@ function SettingsModal({
                 <Section title="版本">
                   <Row
                     title={`PanBox ${info ? info.version : '…'}`}
-                    desc={info ? (info.packaged ? '安装版' : '开发模式（npm start）') : '读取中…'}
+                    desc={info ? (info.packaged ? (info.portable ? '便携版' : '安装版') : '开发模式（npm start）') : '读取中…'}
                   >
-                    <button disabled={upd.state === 'checking'} onClick={checkUpd}>
-                      {upd.state === 'checking' ? '正在检查…' : '检查更新'}
+                    <button disabled={checking} onClick={checkUpd}>
+                      {checking ? '正在检查…' : '检查更新'}
                     </button>
                   </Row>
                   <div className="updbox" aria-live="polite">
-                    {upd.state === 'idle' && <div className="desc">还没检查过。点上面的「检查更新」查一次。</div>}
-                    {upd.state === 'checking' && <div className="desc">正在查询 GitHub Releases…</div>}
-                    {upd.state === 'latest' && (
-                      <div className="desc">
-                        已是最新版本（{upd.data?.latest ?? upd.data?.current}）。
-                      </div>
-                    )}
-                    {upd.state === 'new' && (
+                    {canAutoUpdate ? (
                       <>
-                        <div className="upd-title">发现新版本 {upd.data?.latest}</div>
-                        <div className="desc">
-                          当前是 {upd.data?.current}
-                          {upd.data?.publishedAt ? `，新版发布于 ${String(upd.data.publishedAt).slice(0, 10)}` : ''}。
-                          下载页会打开浏览器，安装包自己挑。
-                        </div>
+                        {auto.state === 'idle' && <div className="desc">点上面的「检查更新」查一次。</div>}
+                        {auto.state === 'checking' && <div className="desc">正在检查…</div>}
+                        {auto.state === 'latest' && <div className="desc">已是最新版本（{auto.version || (info ? info.version : '')}）。</div>}
+                        {auto.state === 'available' && (
+                          <>
+                            <div className="upd-title">发现新版本 {auto.version}</div>
+                            <div className="desc">装好后程序文件就地替换，设置、任务和登录状态都保留。</div>
+                          </>
+                        )}
+                        {auto.state === 'downloading' && (
+                          <>
+                            <div className="desc">正在下载 {auto.percent ? auto.percent.toFixed(0) : 0}%</div>
+                            <div className="bar">
+                              <i style={{ width: `${auto.percent || 0}%` }} />
+                            </div>
+                          </>
+                        )}
+                        {auto.state === 'downloaded' && <div className="desc">下载完成，点「重启并安装」。</div>}
+                        {auto.state === 'error' && <div className="desc">更新失败：{auto.message || '未知原因'}</div>}
                         <div className="row">
-                          <button className="primary" onClick={() => api.openRelease(upd.data?.url || '')}>
-                            打开下载页
-                          </button>
+                          {(auto.state === 'available' || auto.state === 'downloading' || auto.state === 'error') && (
+                            <button
+                              className="primary"
+                              disabled={auto.state === 'downloading'}
+                              onClick={async () => {
+                                const r = await api.updateDownload()
+                                if (!r.ok) setAuto({ state: 'error', message: r.message || '下载失败' })
+                              }}
+                            >
+                              {auto.state === 'downloading' ? '正在下载' : '下载更新'}
+                            </button>
+                          )}
+                          {auto.state === 'downloaded' && (
+                            <button className="primary" onClick={() => api.updateInstall()}>
+                              重启并安装
+                            </button>
+                          )}
+                          <button onClick={() => api.openRelease('https://github.com/Ygq156/PanBox/releases/latest')}>打开发布页</button>
                         </div>
                       </>
-                    )}
-                    {upd.state === 'error' && (
+                    ) : (
                       <>
-                        <div className="upd-title err">更新信息获取失败</div>
-                        <div className="desc">
-                          可能是无法访问 GitHub 导致的（{upd.data?.message || '网络不通'}）。
-                          不影响下载功能，随时可以再试。
-                        </div>
-                        <div className="row">
-                          <button onClick={checkUpd}>重试</button>
-                          <button onClick={() => api.openRelease('https://github.com/Ygq156/PanBox/releases')}>
-                            直接打开发布页
-                          </button>
-                        </div>
+                        {upd.state === 'idle' && <div className="desc">点上面的「检查更新」查一次。</div>}
+                        {upd.state === 'checking' && <div className="desc">正在检查…</div>}
+                        {upd.state === 'latest' && (
+                          <div className="desc">已是最新版本（{upd.data?.latest ?? upd.data?.current}）。</div>
+                        )}
+                        {upd.state === 'new' && (
+                          <>
+                            <div className="upd-title">发现新版本 {upd.data?.latest}</div>
+                            <div className="desc">便携版请下载新包替换。</div>
+                            <div className="row">
+                              <button className="primary" onClick={() => api.openRelease(upd.data?.url || '')}>
+                                打开发布页
+                              </button>
+                            </div>
+                          </>
+                        )}
+                        {upd.state === 'error' && (
+                          <>
+                            <div className="upd-title err">检查失败</div>
+                            <div className="desc">可能是访问不到 GitHub（{upd.data?.message || '网络不通'}）。</div>
+                            <div className="row">
+                              <button onClick={checkUpd}>重试</button>
+                              <button onClick={() => api.openRelease('https://github.com/Ygq156/PanBox/releases/latest')}>
+                                打开发布页
+                              </button>
+                            </div>
+                          </>
+                        )}
                       </>
                     )}
                   </div>
                   <Row
                     title="自动检查更新"
-                    desc="启动后查一次 GitHub 的公开 release 接口（不带任何本机信息）。只提示，不做静默安装。"
+                    desc="启动后自动查一次新版本。"
                     err={rowErr.autoCheckUpdate}
                   >
                     <Switch
@@ -1093,7 +1116,7 @@ function SettingsModal({
                   </Row>
                 </Section>
                 <Section title="链接">
-                  <Row title="项目主页 / 源码" desc="程序不内置也不推荐任何解析站；网盘凭证只在你自己机器上使用。">
+                  <Row title="项目主页 / 源码" desc="GitHub 仓库与浏览器插件目录。">
                     <div className="row">
                       <button onClick={() => api.openRelease('https://github.com/Ygq156/PanBox')}>打开 GitHub</button>
                       <button onClick={() => api.bridgeOpenFolder()}>插件文件夹</button>
@@ -1137,7 +1160,7 @@ function SettingsModal({
                 </div>
                 <Row
                   title="浏览器插件版本"
-                  desc="插件是随程序更新的本地目录版本。更新后请在 chrome://extensions 里点一次「重新加载」，否则拖拽悬浮按钮那类改动不会生效。"
+                  desc="更新程序后，请在 chrome://extensions 里点一次「重新加载」。"
                 >
                   <button onClick={() => api.bridgeOpenFolder()}>打开插件文件夹</button>
                 </Row>
@@ -1206,14 +1229,14 @@ function ResultPanel({
         <span className="badge gray">{result.files.length} 个文件</span>
         {result.elapsed != null && <span className="badge gray">{(result.elapsed / 1000).toFixed(1)}s</span>}
         {result.viaEndpoint && (
-          <span className="badge ok" title="直链来自你配置的解析接口，不受你自己账号的限速档位约束">
+          <span className="badge ok" title="直链来自你配置的解析接口">
             解析接口 · {result.endpointName || '自定义'}
           </span>
         )}
         {onRemoveFiles && (
           <button
             className="ghost tiny"
-            title="把这个链接的解析结果整个从列表里删掉（网盘上的文件不会动）"
+            title="从列表移除这个链接的解析结果"
             onClick={() => onRemoveFiles(result.files.map((f) => f.id))}
           >
             ✕
@@ -1243,7 +1266,7 @@ function ResultPanel({
             {onRemoveFiles && (
               <button
                 className="fdel"
-                title="从列表里删掉这一项（只是不在界面上列出来，网盘上的文件不会动）"
+                title="从列表移除这一项"
                 onClick={() => onRemoveFiles([f.id])}
               >
                 ✕
@@ -1316,9 +1339,128 @@ const STATUS_TEXT: Record<string, string> = {
   removed: '已移除',
 }
 
+/* ------------------------------------------------------------------ */
+/* 回收站：删掉的下载文件先挪进这里，可以还原                                 */
+/* ------------------------------------------------------------------ */
+
+function TrashModal({ onClose }: { onClose: () => void }) {
+  const [items, setItems] = useState<TrashItem[] | null>(null)
+  const [msg, setMsg] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(async () => {
+    try {
+      setItems(await api.trashList())
+    } catch (e) {
+      setMsg(`读取失败：${e instanceof Error ? e.message : String(e)}`)
+    }
+  }, [])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  const run = async (fn: () => Promise<string>) => {
+    setBusy(true)
+    try {
+      setMsg(await fn())
+      await load()
+    } catch (e) {
+      setMsg(`出错了：${e instanceof Error ? e.message : String(e)}`)
+    }
+    setBusy(false)
+  }
+
+  const total = (items || []).reduce((n, it) => n + (it.size || 0), 0)
+
+  return (
+    <div className="mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal trash">
+        <h2>
+          回收站
+          <button className="x" onClick={onClose} title="关闭">
+            ✕
+          </button>
+        </h2>
+
+        <div className="trash-body">
+          {items === null ? (
+            <div className="empty">读取中…</div>
+          ) : items.length === 0 ? (
+            <div className="empty">
+              回收站是空的。
+              <br />
+              在下载队列里删掉的文件会先放到这里。
+            </div>
+          ) : (
+            items.map((it) => (
+              <div className="trash-row" key={it.id}>
+                <div className="tcell">
+                  <div className="tname" title={it.from}>
+                    {it.name}
+                  </div>
+                  <div className="tsub">
+                    {formatSize(it.size)} · {new Date(it.at).toLocaleString()}
+                  </div>
+                </div>
+                <button
+                  className="tiny"
+                  disabled={busy}
+                  onClick={() =>
+                    run(async () => {
+                      const r = await api.trashRestore(it.id)
+                      return r.ok ? `已还原到 ${r.path || '原位置'}` : `还原失败：${r.message || '未知原因'}`
+                    })
+                  }
+                >
+                  还原
+                </button>
+                <button
+                  className="tiny del"
+                  disabled={busy}
+                  onClick={() =>
+                    run(async () => {
+                      await api.trashDelete(it.id)
+                      return `已彻底删除「${it.name}」`
+                    })
+                  }
+                >
+                  彻底删除
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className="trash-foot">
+          <span className="trash-count">{items ? `${items.length} 个文件 · ${formatSize(total)}` : ''}</span>
+          {msg && <span className="trash-warn">{msg}</span>}
+          <span className="grow" />
+          <button className="tiny" disabled={busy} onClick={() => run(async () => `已打开 ${await api.trashOpenDir()}`)}>
+            打开目录
+          </button>
+          <button
+            className="tiny del"
+            disabled={busy || !items || items.length === 0}
+            onClick={() =>
+              run(async () => {
+                const n = await api.trashEmpty()
+                return `已彻底删除 ${n} 个文件`
+              })
+            }
+          >
+            清空
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [showSettings, setShowSettings] = useState(false)
+  const [showTrash, setShowTrash] = useState(false)
   const [text, setText] = useState('')
   const [pwd, setPwd] = useState('')
   const [parsing, setParsing] = useState(false)
@@ -1394,7 +1536,7 @@ export default function App() {
       if (!gone) return
       setResults(next)
       dropSessionsOf(next)
-      setHint({ kind: 'ok', msg: `已从列表移除 ${gone} 项（网盘上的文件没有动）` })
+      setHint({ kind: 'ok', msg: `已从列表移除 ${gone} 项` })
     },
     [results, dropSessionsOf],
   )
@@ -1592,6 +1734,9 @@ export default function App() {
             <button className="tiny" onClick={() => api.openPath(settings.downloadDir)}>
               打开目录
             </button>
+            <button className="tiny" onClick={() => setShowTrash(true)}>
+              回收站
+            </button>
           </div>
 
           <div className="scroll">
@@ -1651,7 +1796,7 @@ export default function App() {
                       {(t.status === 'active' || t.status === 'paused' || t.status === 'error') && t.source && (
                         <button
                           className="ghost tiny"
-                          title="换直链：重新解析这条分享，用新的下载地址替换当前的。直链过期或这次分到的节点太慢时用得上。"
+                          title="重新解析这条分享，用新的下载地址替换当前的。"
                           disabled={refreshing === t.gid}
                           onClick={async () => {
                             setRefreshing(t.gid)
@@ -1669,6 +1814,27 @@ export default function App() {
                           }}
                         >
                           {refreshing === t.gid ? '…' : '⟳'}
+                        </button>
+                      )}
+                      {t.status === 'complete' && (
+                        <button
+                          className="ghost tiny"
+                          title="删除文件（放进回收站，之后可以还原）"
+                          onClick={async () => {
+                            try {
+                              const r = await api.deleteTaskFile(t.gid)
+                              setHint(
+                                r.ok
+                                  ? { kind: 'ok', msg: `已删除「${r.name || t.name}」，可在回收站还原` }
+                                  : { kind: 'err', msg: r.message || '删除失败' },
+                              )
+                              setTasks((await api.listDownloads()) || [])
+                            } catch (e) {
+                              setHint({ kind: 'err', msg: `删除失败：${String((e as Error)?.message || e)}` })
+                            }
+                          }}
+                        >
+                          🗑
                         </button>
                       )}
                       <button
@@ -1704,6 +1870,8 @@ export default function App() {
         onSaved={setSettings}
       />
       )}
+
+      {showTrash && <TrashModal onClose={() => setShowTrash(false)} />}
     </div>
   )
 }

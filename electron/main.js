@@ -9,11 +9,21 @@ const settings = require('./core/settings')
 const aria2 = require('./core/aria2')
 const seg = require('./core/segmentDownloader')
 const tasks = require('./core/taskManager')
+const trash = require('./core/trash')
 const parsers = require('./parsers')
 const login = require('./core/login')
 const bridge = require('./core/bridge')
 const proxy = require('./core/proxy')
 const { detectNetdisk } = require('./parsers/util')
+
+/* 安装版可以就地更新：electron-updater 走 NSIS，安装器会静默跑旧卸载器
+ * （`/S /KEEP_APP_DATA --updated`，见 app-builder-lib 的 installUtil.nsh），
+ * 只换程序目录里的文件，`%APPDATA%\PanBox`（设置、任务、网盘登录分区）原样保留。
+ * 便携版做不到自更新（解包到临时目录再运行），继续走「打开发布页」。 */
+const { autoUpdater } = require('electron-updater')
+const isPortable = !!process.env.PORTABLE_EXECUTABLE_FILE
+/** 自更新只在「打包过的安装版」里启用 */
+const canAutoUpdate = () => app.isPackaged && !isPortable
 
 /* ------------------------------------------------------------------ */
 /* 进程 / 内存精简（必须在 app ready 之前设置才生效）                     */
@@ -206,6 +216,10 @@ let isQuitting = false
 const STARTUP_HIDDEN = process.argv.includes('--startup')
 let aria2Ready = false
 let aria2Error = ''
+
+/* 自更新状态机：idle → checking → available → downloading → downloaded / error / latest。
+ * 界面按这个渲染「下载并安装」那一条。 */
+let updState = { state: 'idle' }
 
 /* ------------------------------------------------------------------ */
 /* 路径                                                                */
@@ -588,6 +602,45 @@ function bridgeInfo() {
   }
 }
 
+/** 一个任务在磁盘上的真实文件路径（aria2 与分段引擎的 tellStatus 都带 files[0].path） */
+async function taskFile(gid) {
+  let st = null
+  try {
+    st = await aria2.tellStatus(gid)
+  } catch {
+    /* 可能不在 aria2 上（分段引擎的任务），也可能已经没了 */
+  }
+  if (!st) {
+    try {
+      st = seg.tellStatus(gid)
+    } catch {
+      /* 两边都没有 */
+    }
+  }
+  if (!st) return null
+  const f = (st.files && st.files[0]) || {}
+  return { status: String(st.status || ''), path: f.path || '', dir: st.dir || '' }
+}
+
+/** 把任务从队列与引擎里彻底清掉（与 downloads:remove 同一套动作，删文件后复用） */
+async function purgeTask(gid) {
+  if (isSegTask(gid)) {
+    await seg.remove(gid).catch(() => {})
+  } else {
+    await aria2.remove(gid).catch(() => {})
+    for (let i = 0; i < 4; i++) {
+      try {
+        await aria2.removeDownloadResult(gid)
+        break
+      } catch {
+        await new Promise((r) => setTimeout(r, 250))
+      }
+    }
+  }
+  tasks.forget(gid)
+  await tasks._tick().catch(() => {})
+}
+
 function registerIpc() {
   /* 渲染层拿到的是脱敏副本：cookies 逐键打码（回传时打码串 = 保持原值，见 settings.js）。
    * 这样即便渲染层被注入脚本，也读不到百度 BDUSS / 夸克 __puus / 迅雷 access_token 原文。 */
@@ -647,7 +700,7 @@ function registerIpc() {
     return settings.forRenderer(after)
   })
 
-  /* 检查更新：只查 GitHub 的公开 release 接口 + 打开下载页，不做静默自动更新 */
+  /* 便携版/开发模式：查 GitHub 的公开 release 接口，拿到发布页自己去下 */
   ipcMain.handle('update:check', async (_e, opts) => {
     const manual = !!(opts && opts.manual)
     const r = await checkUpdate(manual)
@@ -661,6 +714,53 @@ function registerIpc() {
     const u = String(url || '')
     if (!/^https:\/\/github\.com\/Ygq156\/PanBox(\/|$)/i.test(u)) return { ok: false, message: '只允许打开本项目的下载页' }
     await shell.openExternal(u).catch(() => {})
+    return { ok: true }
+  })
+
+  /* ---- 自更新（只有安装版有）---- */
+  ipcMain.handle('update:state', () => ({ ...updState, canUpdate: canAutoUpdate() }))
+
+  /* 安装版查新版：走 electron-updater 的 feed（下载自己在 GitHub 上比版本），
+   * 不再依赖匿名 GitHub 接口的 60 次/小时限流 */
+  ipcMain.handle('update:appCheck', async () => {
+    if (!canAutoUpdate()) return { ok: false, message: '这个版本只能手动下载新版' }
+    try {
+      await autoUpdater.checkForUpdates()
+      return { ok: true }
+    } catch (e) {
+      const message = readableNetError(e)
+      updTell({ state: 'error', message })
+      return { ok: false, message }
+    }
+  })
+
+  ipcMain.handle('update:download', async () => {
+    if (!canAutoUpdate()) return { ok: false, message: '这个版本只能手动下载新版' }
+    /* 已经下好过一次（缓存在本机）就别重复下，直接等用户点「重启并安装」 */
+    if (updState.state === 'downloaded') return { ok: true }
+    try {
+      /* 还没查过就现查一次；查完仍没有新版就不必下 */
+      if (updState.state !== 'available') {
+        await autoUpdater.checkForUpdates()
+        if (updState.state !== 'available') return { ok: false, message: '已是最新版本' }
+      }
+      autoUpdater.downloadUpdate().catch((e) => updTell({ state: 'error', message: readableNetError(e) }))
+      return { ok: true }
+    } catch (e) {
+      const message = readableNetError(e)
+      updTell({ state: 'error', message })
+      return { ok: false, message }
+    }
+  })
+
+  ipcMain.handle('update:install', async () => {
+    if (!canAutoUpdate()) return { ok: false, message: '这个版本只能手动下载新版' }
+    if (updState.state !== 'downloaded') return { ok: false, message: '还没下载完' }
+    /* 先立 isQuitting：托盘那套「点 × 只收进托盘」的逻辑看到它才肯真的退出 */
+    isQuitting = true
+    /* 必须 quitAndInstall(true, true)：PanBox 是 assisted 安装器，
+     * 静默（/S）跑完得靠 --force-run 才会把程序重新拉起来。 */
+    setTimeout(() => autoUpdater.quitAndInstall(true, true), 800)
     return { ok: true }
   })
 
@@ -996,6 +1096,48 @@ function registerIpc() {
     /* 只要 aria2 的结果清掉了就算成功；停不掉也没关系（本来就已停止） */
     return purged || stopped
   })
+  /* ---- 回收站 ------------------------------------------------------ */
+  /* 删「已完成的下载文件」：不抹盘，先把文件挪进回收站，再把任务从队列里移除。
+   * 没下完的任务不给删（它还要靠分片文件续传）。 */
+  ipcMain.handle('downloads:deleteFile', async (_e, gid) => {
+    const meta = tasks.info(gid)
+    const st = await taskFile(gid)
+    if (!st || !st.path) return { ok: false, message: '找不到这个任务对应的文件' }
+    if (st.status !== 'complete') return { ok: false, message: '只有已下载完成的任务才能删除文件' }
+    let moved = null
+    try {
+      moved = await trash.add(st.path, { netdisk: (meta && meta.netdisk) || '', gid })
+    } catch (e) {
+      return { ok: false, message: (e && e.message) || String(e) }
+    }
+    if (!moved) return { ok: false, message: '文件已经不在磁盘上了' }
+    await purgeTask(gid)
+    if (meta && meta.name) await recycleTransferCopy(meta.name, 'remove').catch(() => {})
+    boot('delete-file', gid, `${moved.name} size=${moved.size}`)
+    return { ok: true, name: moved.name, size: moved.size, id: moved.id }
+  })
+
+  ipcMain.handle('trash:list', () => trash.list())
+
+  ipcMain.handle('trash:restore', async (_e, id) => {
+    const r = await trash.restore(id)
+    boot('trash-restore', String(id), JSON.stringify({ ok: r.ok, name: r.name }))
+    return r
+  })
+
+  ipcMain.handle('trash:delete', (_e, id) => trash.drop(id))
+  ipcMain.handle('trash:empty', () => trash.empty())
+  ipcMain.handle('trash:openDir', async () => {
+    const dir = trash._trashDir()
+    try {
+      fs.mkdirSync(dir, { recursive: true })
+    } catch {
+      /* ignore */
+    }
+    await shell.openPath(dir).catch(() => {})
+    return dir
+  })
+
   ipcMain.handle('downloads:pauseAll', () =>
     Promise.all([aria2.pauseAll().catch(() => {}), seg.pauseAll().catch(() => {})]).then(() => true),
   )
@@ -1071,6 +1213,10 @@ async function applyRuntimeSettings(before, after) {
     await startBridge().catch(() => {})
   }
   applyAutoStart(after)
+  /* 下载目录换了，回收站跟着搬到新目录下 */
+  if (String(after.downloadDir) !== String(before.downloadDir)) {
+    trash.configure({ downloadDir: after.downloadDir })
+  }
 }
 
 /**
@@ -1124,7 +1270,7 @@ function isNewer(a, b) {
 
 /**
  * 查 GitHub Releases 的公开接口（匿名、不带任何本机信息，只发一个 UA）。
- * 刻意**不**做静默自动下载更新：装不装、什么时候装交给用户，这里只负责告诉他「有新版了」。
+ * 这里只负责「有没有新版」；装不装、什么时候装都交给用户点。
  *
  * @param {boolean} manual 用户手点的（失败要把原因说出来；自动检查失败就静默）
  */
@@ -1181,6 +1327,47 @@ function checkUpdate(manual) {
   })
 }
 
+/* ---- 自更新：状态推给界面，实际动作由用户点了才做 ---- */
+
+function updTell(patch) {
+  updState = { ...updState, ...patch }
+  boot('updater', JSON.stringify(updState))
+  if (win && !win.isDestroyed()) win.webContents.send('update:state', { ...updState, canUpdate: canAutoUpdate() })
+}
+
+/* 网络错误的原文又长又带内部路径，挑一句用户看得懂的 */
+function readableNetError(e) {
+  const raw = String((e && e.message) || e || '')
+  boot('updater-error', raw.slice(0, 300))
+  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(raw)) return '连不上更新服务器，检查网络或代理。'
+  if (/ETIMEDOUT|timeout/i.test(raw)) return '连接更新服务器超时，稍后再试。'
+  if (/404/.test(raw)) return '更新服务器上还没有可用的新版文件。'
+  if (/sha512|checksum|integrity/i.test(raw)) return '下载的文件校验没过，请重试。'
+  if (/net::ERR|ECONNRESET|socket hang up/i.test(raw)) return '下载中断，请重试。'
+  return raw.replace(/^Error:\s*/, '').slice(0, 120) || '未知原因'
+}
+
+function initAutoUpdater() {
+  if (!canAutoUpdate()) return
+  /* 用户点「下载」才下；装完的重启也由 update:install 显式触发 */
+  autoUpdater.autoDownload = false
+  autoUpdater.autoInstallOnAppQuit = false
+  autoUpdater.on('checking-for-update', () => updTell({ state: 'checking', message: '' }))
+  autoUpdater.on('update-available', (i) => updTell({ state: 'available', version: (i && i.version) || '', message: '' }))
+  autoUpdater.on('update-not-available', (i) => updTell({ state: 'latest', percent: 0, version: (i && i.version) || app.getVersion(), message: '' }))
+  autoUpdater.on('download-progress', (p) =>
+    updTell({
+      state: 'downloading',
+      percent: (p && p.percent) || 0,
+      transferred: (p && p.transferred) || 0,
+      total: (p && p.total) || 0,
+      bytesPerSecond: (p && p.bytesPerSecond) || 0,
+    }),
+  )
+  autoUpdater.on('update-downloaded', (i) => updTell({ state: 'downloaded', percent: 100, version: (i && i.version) || updState.version || '', message: '' }))
+  autoUpdater.on('error', (e) => updTell({ state: 'error', message: readableNetError(e) }))
+}
+
 function ensureTray() {
   if (tray && !tray.isDestroyed()) return tray
   const p = trayIconPath()
@@ -1228,6 +1415,12 @@ if (!gotLock) {
   app.whenReady().then(async () => {
     boot('whenReady, resourcesPath=' + process.resourcesPath, 'indexHtml=' + indexHtml(), 'exists=' + fs.existsSync(indexHtml()), 'aria2=' + aria2ExePath(), 'aria2Exists=' + fs.existsSync(aria2ExePath()))
     registerIpc()
+    initAutoUpdater()
+    /* 回收站索引跟着用户数据走，回收目录放在下载目录里（用户能在资源管理器里直接看到） */
+    trash.configure({
+      indexPath: path.join(app.getPath('userData'), 'trash.json'),
+      downloadDir: settings.load().downloadDir,
+    })
     createWindow()
     boot('window created')
 
@@ -1240,6 +1433,12 @@ if (!gotLock) {
       if (autoChecked) return
       if (settings.load().autoCheckUpdate === false) return
       autoChecked = true
+      /* 安装版：交给更新器自己比版本，结果通过 update:state 推到「设置 → 更新」；
+       * 便携版没有就地更新，只能读 GitHub 接口后提示用户自己去下 */
+      if (canAutoUpdate()) {
+        autoUpdater.checkForUpdates().catch((e) => boot('updater-auto-err', String((e && e.message) || e)))
+        return
+      }
       const r = await checkUpdate(false)
       if (r && r.ok && r.hasUpdate && win && !win.isDestroyed()) {
         win.webContents.send('update:available', { latest: r.latest, current: r.current, url: r.url, name: r.name, publishedAt: r.publishedAt })
