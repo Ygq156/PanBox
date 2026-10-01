@@ -59,7 +59,14 @@
         <input type="checkbox" id="intercept" />
         <span>接管浏览器下载（自动转给 PanBox）</span>
       </label>
-      <div class="tip">关掉时浏览器照常下载，你仍然可以用右键菜单把链接交给 PanBox。</div>
+      <label class="sw" style="margin-top: 6px">
+        <input type="checkbox" id="panel" />
+        <span>在页面角落显示「N 个文件」悬浮面板</span>
+      </label>
+      <div class="tip">
+        接管关掉时浏览器照常下载（PanBox 没运行时会自动放回浏览器下载）；
+        面板会把这一页的视频、媒体分片和文件链接列出来，点一下就能交给 PanBox。
+      </div>
       <button id="sendPage" class="ghost">把本页文件链接交给 PanBox</button>
       <div id="msg"></div>
     </div>
