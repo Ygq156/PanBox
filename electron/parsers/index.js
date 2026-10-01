@@ -41,7 +41,13 @@ function gc() {
 /* 已经认得出域名、但**没有实现**解析器的网盘。
  * 必须在这里显式拦掉，否则会被下面的「兜底当直链」分支接手，
  * 拿分享页 URL 去 HEAD 一番，给用户一个莫名其妙的结果。 */
-const KNOWN_UNSUPPORTED = { aliyun: '阿里云盘' }
+const KNOWN_UNSUPPORTED = {
+  aliyun: '阿里云盘',
+  tianyi: '天翼云盘',
+  yidong: '移动云盘',
+  pan115: '115 网盘',
+  weiyun: '腾讯微云',
+}
 
 function pickParser(url) {
   const nd = detectNetdisk(url)
