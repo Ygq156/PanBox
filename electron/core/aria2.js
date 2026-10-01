@@ -4,6 +4,7 @@ const { spawn } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
+const { NO_PROXY: PROXY_BYPASS } = require('./proxy')
 
 /**
  * aria2 JSON-RPC 客户端 + aria2c 子进程生命周期管理。
@@ -93,6 +94,11 @@ class Aria2 {
       '--log-level=warn',
       '--quiet=false',
     ]
+    /* `--no-proxy` 一直给：本机/局域网的地址永远不该被送去代理。
+     * 注意这里**不**用全局 `--all-proxy` —— 那样会把夸克/UC/百度/迅雷的 CDN 也推到代理出口，
+     * 而这些直链可能是按 IP 授权的（解析走的是本机直连），换出口 IP 有被拒的风险。
+     * 代理改成**按任务**给（见 main.js 的 addResolved，只给 netdisk === 'direct' 的任务）。 */
+    args.push('--no-proxy=' + PROXY_BYPASS)
     return args
   }
 

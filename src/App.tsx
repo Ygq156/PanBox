@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, formatEta, formatSize, formatSpeed } from './api'
-import type { BridgeStatus } from './api'
+import type { BridgeStatus, ProxyStatus } from './api'
 import type { DownloadTask, ParseEndpoint, ParseResult, Settings, Aria2Status } from './types'
 
 /* ------------------------------------------------------------------ */
@@ -23,7 +23,7 @@ const NETDISK_LABEL: Record<string, string> = {
 const LOGIN_TARGETS = ['baidu', 'quark', 'uc', 'xunlei']
 
 /** 走自研分段引擎的网盘（按连接数发额度的那些）。百度不在此列：它是账号级总量限速。 */
-const SEG_TARGETS = ['quark', 'uc']
+const SEG_TARGETS = ['quark', 'uc', 'direct']
 
 /** 「解析接口」可以勾选的网盘（顶层域名会被自动识别成这些代号） */
 const EP_NETDISKS = ['lanzou', 'ilanzou', 'quark', 'uc', 'baidu', 'xunlei', '123pan', 'direct']
@@ -320,6 +320,8 @@ function SettingsModal({
             </div>
           </div>
 
+          <ProxySection s={s} patch={patch} />
+
           <div className="field">
             <label>自定义 User-Agent</label>
             <input type="text" value={s.userAgent} onChange={(e) => patch({ userAgent: e.target.value })} />
@@ -434,6 +436,63 @@ function SettingsModal({
  * 浏览器插件把下载任务投给本机的 PanBox。
  * 这一段的职责只有三件事：告诉用户「通没通」、告诉他插件目录在哪、以及给他配对令牌。
  */
+/**
+ * 代理设置。
+ * 存在的理由（实测）：同一条 GitHub 66 MB 直链，PanBox 裸连是 0 B/s
+ * （SSL/TLS handshake failure），跟着 Windows 系统代理走是 10 MB/s。
+ * NDM 之所以快，就是因为它跟随系统代理 —— 所以这里默认也是 auto。
+ */
+function ProxySection({ s, patch }: { s: Settings; patch: (p: Partial<Settings>) => void }) {
+  const [st, setSt] = useState<ProxyStatus | null>(null)
+  const mode = s.proxyMode || 'auto'
+
+  const refresh = async () => {
+    try {
+      setSt(await api.proxyStatus())
+    } catch {
+      /* 主进程没起来时忽略 */
+    }
+  }
+  useEffect(() => {
+    refresh()
+  }, [mode, s.proxy])
+
+  const badge = !st ? '读取中…' : st.system ? `系统代理：${st.system}` : '系统里没有开代理'
+
+  return (
+    <div className="field">
+      <label>网络代理（下 GitHub / 境外资源必看）</label>
+      <div className="ep-netdisks" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
+        <div className="seg-conn" style={{ justifyContent: 'space-between' }}>
+          <select value={mode} onChange={(e) => patch({ proxyMode: e.target.value as Settings['proxyMode'] })}>
+            <option value="auto">跟随 Windows 系统代理（推荐）</option>
+            <option value="custom">手动指定</option>
+            <option value="off">不使用代理</option>
+          </select>
+          {mode === 'auto' && <span className={`badge ${st?.system ? 'ok' : 'gray'}`}>{badge}</span>}
+        </div>
+        {mode === 'custom' && (
+          <input
+            type="text"
+            placeholder="http://127.0.0.1:7890"
+            value={s.proxy || ''}
+            onChange={(e) => patch({ proxy: e.target.value })}
+          />
+        )}
+        <div className="hint">
+          实测同一条 GitHub 直链：<strong>不走代理 0 B/s</strong>（TLS 握手就被掐断），
+          <strong>走系统代理（Clash / v2ray 之类）10 MB/s</strong>。NDM 之所以快就是因为它跟随系统代理，
+          PanBox 之前完全不用代理 —— 这就是「同样下 GitHub，它 5 MB/s 而 PanBox 1 MB/s」的真正原因，
+          跟 16 还是 32 条连接关系不大（挂上代理后 16 条就已经跑满 10 MB/s）。
+          <br />
+          当前实际使用：{st?.effective ? <code>{st.effective}</code> : '直连（不走代理）'}。
+          修改后会自动重启下载引擎。本机地址（127.0.0.1 / localhost）永远绕过代理。
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function BridgeSection() {
   const [st, setSt] = useState<BridgeStatus | null>(null)
   const [msg, setMsg] = useState('')
@@ -921,6 +980,7 @@ export default function App() {
                       <div className="tsub">
                         {NETDISK_LABEL[t.netdisk] ?? t.netdisk}
                         {t.engine === 'seg' ? ' · 分段引擎' : ''}
+                        {t.route === 'proxy' ? ' · 走代理' : ''}
                         {t.connections ? ` · ${t.connections} 连接` : ''}
                         {t.errorMessage ? ` · ${t.errorMessage}` : ''}
                       </div>

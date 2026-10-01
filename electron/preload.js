@@ -31,6 +31,7 @@ contextBridge.exposeInMainWorld('panbox', {
   bridgeStart: () => invoke('bridge:start'),
   bridgeOpenFolder: () => invoke('bridge:openFolder'),
   bridgeNewToken: () => invoke('bridge:newToken'),
+  proxyStatus: () => invoke('proxy:status'),
 
   onDownloadsUpdate: (cb) => {
     const h = (_e, data) => cb(data)

@@ -38,7 +38,12 @@ const DEFAULTS = () => ({
    * UC ≈64KB/s/连接），而 aria2 的 `--max-connection-per-server` 上限只有 16，
    * 于是被钉死在 16 × 0.05 ≈ 0.8 MB/s。这个引擎自己开连接，不受那个上限约束。
    * 百度不在此表 —— 它是**账号级总量**限速，加连接只会招致 403（实测 16/24 连接直接 403）。 */
-  segConnections: { quark: 96, uc: 96 },
+  segConnections: { quark: 96, uc: 96, direct: 32 },
+  /* 代理。为什么默认跟着系统走：实测同一个 GitHub 66 MB 资源，
+   * 裸连是 0 B/s（SSL/TLS handshake failure），跟着系统代理（Clash）能到 10 MB/s。
+   * NDM 之所以快，就是因为它跟随 WinINET 系统代理。见 electron/core/proxy.js。 */
+  proxyMode: 'auto',
+  proxy: '',
   /* 浏览器插件接收通道（见 electron/core/bridge.js）。
    * 默认开：它只监听 127.0.0.1，公网与局域网都连不上，而且投递任务要带令牌。 */
   bridgeEnabled: true,

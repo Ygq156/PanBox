@@ -39,6 +39,7 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const http = require('node:http')
 const https = require('node:https')
+const { shouldBypass } = require('./proxy')
 
 const TICK_MS = 500
 const PERSIST_MS = 2000
@@ -59,8 +60,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
  * 裸的 HTTP(S) GET，只暴露「状态码 + 响应头 + 响应流」。
  * `agent:false` 让每个请求都新开一条 socket —— 这正是我们要的「N 请求 = N 连接」。
  * 自己跟重定向（最多 5 跳），因为 node:https 不会跟。
+ *
+ * `proxy`（`http://host:port`，可选）走 HTTP 代理：
+ *   - http 目标 → 直接把绝对 URI 交给代理（`GET http://host/path`）
+ *   - https 目标 → 先 `CONNECT host:443` 建隧道，再在**这条 socket 上**跑 TLS
+ * 为什么必须有：GitHub 这类被墙的资源裸连是 0 B/s（SSL/TLS handshake failure），
+ * 走系统代理能到 10 MB/s（实测，见 electron/core/proxy.js 顶部注释）。
+ * 本机地址（localhost/127.0.0.1/::1）永远绕过代理，否则本地测试服务器会被代理掉。
  */
-function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5 } = {}) {
+function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5, proxy = '' } = {}) {
   return new Promise((resolve, reject) => {
     let parsed
     try {
@@ -68,30 +76,105 @@ function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5 
     } catch {
       return reject(new Error('下载地址不是合法 URL'))
     }
-    const mod = parsed.protocol === 'http:' ? http : https
-    const req = mod.request(
-      parsed,
-      { method: 'GET', headers, agent: false, rejectUnauthorized: false, timeout },
-      (res) => {
-        const code = res.statusCode || 0
-        if (code >= 300 && code < 400 && res.headers.location && redirects > 0) {
-          res.resume()
-          const next = new URL(res.headers.location, url).toString()
-          return openStream(next, { headers, signal, timeout, redirects: redirects - 1 }).then(resolve, reject)
-        }
-        resolve({ status: code, headers: res.headers, stream: res })
-      },
-    )
-    req.on('timeout', () => req.destroy(new Error('连接超时')))
-    req.on('error', reject)
-    if (signal) {
-      if (signal.aborted) {
-        req.destroy(new Error('已取消'))
-        return
+
+    let px = null
+    if (proxy && !shouldBypass(parsed.hostname)) {
+      try {
+        px = new URL(proxy)
+      } catch {
+        px = null
       }
-      signal.addEventListener('abort', () => req.destroy(new Error('已取消')), { once: true })
     }
-    req.end()
+
+    const fail = (e) => reject(e)
+    const onRes = (res) => {
+      const code = res.statusCode || 0
+      if (code >= 300 && code < 400 && res.headers.location && redirects > 0) {
+        res.resume()
+        const next = new URL(res.headers.location, url).toString()
+        return openStream(next, { headers, signal, timeout, redirects: redirects - 1, proxy }).then(resolve, reject)
+      }
+      resolve({ status: code, headers: res.headers, stream: res })
+    }
+    /* 每个请求都要能被 timeout / abort 掐掉，三种走法共用同一套收尾 */
+    const armReq = (req) => {
+      req.on('timeout', () => req.destroy(new Error('连接超时')))
+      req.on('error', fail)
+      if (signal) {
+        if (signal.aborted) {
+          req.destroy(new Error('已取消'))
+          return
+        }
+        signal.addEventListener('abort', () => req.destroy(new Error('已取消')), { once: true })
+      }
+      req.end()
+    }
+
+    if (!px) {
+      const mod = parsed.protocol === 'http:' ? http : https
+      return armReq(mod.request(parsed, { method: 'GET', headers, agent: false, rejectUnauthorized: false, timeout }, onRes))
+    }
+
+    const pxPort = Number(px.port) || (px.protocol === 'https:' ? 443 : 80)
+    const auth = px.username
+      ? 'Basic ' + Buffer.from(`${decodeURIComponent(px.username)}:${decodeURIComponent(px.password)}`).toString('base64')
+      : ''
+    const pxMod = px.protocol === 'https:' ? https : http
+
+    if (parsed.protocol === 'http:') {
+      return armReq(
+        pxMod.request(
+          {
+            host: px.hostname,
+            port: pxPort,
+            method: 'GET',
+            path: parsed.toString(),
+            headers: { ...headers, Host: parsed.host, ...(auth ? { 'Proxy-Authorization': auth } : {}) },
+            agent: false,
+            rejectUnauthorized: false,
+            timeout,
+          },
+          onRes,
+        ),
+      )
+    }
+
+    const target = `${parsed.hostname}:${parsed.port || 443}`
+    const connectReq = pxMod.request({
+      host: px.hostname,
+      port: pxPort,
+      method: 'CONNECT',
+      path: target,
+      headers: { Host: target, ...(auth ? { 'Proxy-Authorization': auth } : {}) },
+      agent: false,
+      rejectUnauthorized: false,
+      timeout,
+    })
+    connectReq.on('connect', (res, socket, head) => {
+      if ((res.statusCode || 0) !== 200) {
+        socket.destroy()
+        return fail(new Error(`代理拒绝 CONNECT（HTTP ${res.statusCode}）`))
+      }
+      if (head && head.length) socket.unshift(head)
+      const req = https.request(
+        {
+          socket,
+          agent: false,
+          /* host/port 必须显式给：只挂 socket 的话 Node 不会自己补 `Host:` 头，
+           * 而 GitHub 这类站点没有正确的 Host 会直接回 404（踩过）。 */
+          host: parsed.hostname,
+          port: parsed.port || 443,
+          servername: parsed.hostname,
+          path: parsed.pathname + parsed.search,
+          method: 'GET',
+          headers: { ...headers, Host: parsed.host },
+          rejectUnauthorized: false,
+        },
+        onRes,
+      )
+      armReq(req)
+    })
+    armReq(connectReq)
   })
 }
 
@@ -153,6 +236,7 @@ class SegmentDownloader extends EventEmitter {
       netdisk = 'unknown',
       source = '',
       knownSize = 0,
+      proxy = '',
     } = opts
     if (!url) throw new Error('缺少下载地址')
     const gid = 'seg-' + (++this._seq).toString(36) + '-' + crypto.randomBytes(4).toString('hex')
@@ -162,6 +246,10 @@ class SegmentDownloader extends EventEmitter {
       gid,
       url,
       headers: { ...headers },
+      /* 走不走代理由上层按设置决定（默认跟随 Windows 系统代理） */
+      proxy: proxy || '',
+      /* 探测阶段选出来的实际出口：'direct' | 'proxy'（空串 = 还没探） */
+      route: '',
       dir,
       out,
       filePath,
@@ -299,6 +387,8 @@ class SegmentDownloader extends EventEmitter {
       completedLength: String(this._progress(t)),
       downloadSpeed: String(Math.round(t.speed || 0)),
       connections: String(t.active || 0),
+      /* 'direct' | 'proxy'，给界面显示「走代理」用 */
+      route: t.route || '',
       filesize: String(t.total || 0),
       errorCode: t.errorCode ? String(t.errorCode) : '0',
       errorMessage: t.errorMessage || '',
@@ -392,6 +482,31 @@ class SegmentDownloader extends EventEmitter {
   /* 主流程                                                               */
   /* ------------------------------------------------------------------ */
 
+  /** 用指定的出口（proxy 为空串 = 直连）探一次：只请求 PROBE_BYTES 个字节 */
+  async _probe(t, proxy, signal) {
+    const res = await openStream(t.url, {
+      headers: { ...t.headers, Range: `bytes=0-${PROBE_BYTES - 1}` },
+      signal,
+      timeout: 30000,
+      proxy,
+    })
+    const cr = String(res.headers['content-range'] || '')
+    const m = /\/(\d+)\s*$/.exec(cr)
+    let total = 0
+    let acceptRanges = false
+    if (res.status === 206 && m) {
+      total = Number(m[1])
+      acceptRanges = true
+    } else if (res.status === 200) {
+      total = Number(res.headers['content-length'] || 0)
+      acceptRanges = false
+    }
+    const status = res.status
+    await readAll(res.stream, 2048)
+    if (status >= 400) throw new Error(httpError(status))
+    return { total, acceptRanges, status }
+  }
+
   /** 探测大小、决定分片、打开（或恢复）分片文件 */
   async _prepare(t) {
     await fsp.mkdir(t.dir, { recursive: true }).catch(() => {})
@@ -412,30 +527,47 @@ class SegmentDownloader extends EventEmitter {
     const ac = new AbortController()
     let total = Number(t.total) || 0
     let acceptRanges = false
-    try {
-      const res = await openStream(t.url, {
-        headers: { ...t.headers, Range: `bytes=0-${PROBE_BYTES - 1}` },
-        signal: ac.signal,
-        timeout: 30000,
-      })
-      const cr = String(res.headers['content-range'] || '')
-      const m = /\/(\d+)\s*$/.exec(cr)
-      if (res.status === 206 && m) {
-        total = Number(m[1])
-        acceptRanges = true
-      } else if (res.status === 200) {
-        const cl = Number(res.headers['content-length'] || 0)
-        if (cl) total = cl
-        acceptRanges = false
+    /* 直连与代理互为备份：一边不通就换另一边再试。
+     * 实测（2026-10-01，本机）：直连 github.com 会被 SNI 层重置（ETIMEDOUT / ECONNRESET），
+     * 而走 Clash 系统代理能到 10 MB/s；反过来代理没开或被关掉时，直连才是唯一出路。
+     * 所以在探测阶段就把路选好，选中的那条写回 t.proxy，后续所有分片都走它。 */
+    const routes = t.proxy ? [t.proxy, ''] : ['']
+    let best = null
+    let lastErr = null
+    for (const r of routes) {
+      /* 每条路最多试 3 次：本机直连 github.com 的失败是**间歇性**的
+       * （实测同一分钟内 39.4 s / 0.69 s / 20.7 s 三种结果），一次失败不代表这条路不通。 */
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const pr = await this._probe(t, r, ac.signal)
+          if (pr.acceptRanges) {
+            best = { r, pr }
+            break
+          }
+          /* 这条路不认 Range：先记下，继续试下一条，万一另一条支持呢 */
+          if (!best) best = { r, pr }
+          break
+        } catch (e) {
+          lastErr = e
+          if (attempt < 2) await sleep(400)
+        }
       }
-      const status = res.status
-      await readAll(res.stream, 2048)
-      if (status >= 400) throw new Error(httpError(status))
-    } catch (e) {
-      const err = new Error('探测文件大小失败：' + ((e && e.message) || e))
+      if (best && best.pr.acceptRanges) break
+    }
+    if (!best) {
+      const err = new Error('探测文件大小失败：' + ((lastErr && lastErr.message) || lastErr))
       err.code = 'PROBE_FAILED'
       throw err
     }
+    if (best.r !== t.proxy) {
+      t.route = best.r ? 'proxy' : 'direct'
+      console.log('[seg] ' + (best.r ? '直连不通，改用代理 ' + best.r : '代理不通，改用直连'))
+    } else {
+      t.route = t.proxy ? 'proxy' : 'direct'
+    }
+    t.proxy = best.r
+    total = best.pr.total || total
+    acceptRanges = best.pr.acceptRanges
 
     if (!total) throw new Error('服务端没有返回文件大小，无法分段下载')
 
@@ -571,6 +703,7 @@ class SegmentDownloader extends EventEmitter {
           headers: { ...t.headers, Range: `bytes=${start}-${end}` },
           signal: ac.signal,
           timeout: 45000,
+          proxy: t.proxy,
         })
         if (res.status >= 400) {
           const body = await readAll(res.stream, 4096)
@@ -624,3 +757,5 @@ class SegmentDownloader extends EventEmitter {
 
 module.exports = new SegmentDownloader()
 module.exports.NO_RANGE = NO_RANGE
+/* 给测试用（test/verify-proxy.js 要单独验代理隧道，不想为此跑一次完整下载） */
+module.exports.__openStream = openStream
