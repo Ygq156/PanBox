@@ -17,7 +17,7 @@
 const DEFAULT_PORT = 7799
 const BADGE_MS = 2500
 
-const cfg = { port: DEFAULT_PORT, token: '', intercept: false }
+const cfg = { port: DEFAULT_PORT, token: '', intercept: true, panel: true }
 
 /* ------------------------------------------------------------------ */
 /* 与 PanBox 的通道                                                     */
@@ -27,11 +27,15 @@ async function loadCfg() {
   const got = await chrome.storage.local.get({
     port: DEFAULT_PORT,
     token: '',
-    intercept: false,
+    intercept: true,
+    panel: true,
   })
   cfg.port = Number(got.port) || DEFAULT_PORT
   cfg.token = String(got.token || '')
-  cfg.intercept = !!got.intercept
+  /* 默认「接管」是开的：装完就该像 NDM 那样，浏览器里点下载直接进 PanBox。
+   * 只有用户明确关掉（存了 false）才不接管。 */
+  cfg.intercept = got.intercept !== false
+  cfg.panel = got.panel !== false
   return cfg
 }
 
@@ -259,18 +263,81 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
   ['requestHeaders', 'extraHeaders'],
 )
 
+/* ------------------------------------------------------------------ */
+/* 页面悬浮面板要用的素材：这一页浏览器真的请求过哪些媒体               */
+/* ------------------------------------------------------------------ */
+
+/* blob: 播放器（B 站、YouTube 这类 MSE）在 DOM 里只有一个 blob: 地址，
+ * 真的能下的地址藏在网络请求里 —— 只能在 webRequest 里记下来。
+ * 只留最近 10 分钟、每个标签页最多 200 条。 */
+const MEDIA_RE =
+  /\.(m3u8|mpd|mp4|m4v|m4s|mkv|webm|flv|ts|mov|avi|wmv|mp3|m4a|flac|aac|ogg|opus|wav|wma)(?:$|[?#])/i
+
+const mediaByTab = new Map() /* tabId -> Map<url, {t, kind}> */
+const frameItems = new Map() /* tabId -> Map<frameId, items[]> */
+
+function kindOfUrl(url) {
+  if (/\.(m3u8|mpd)(?:$|[?#])/i.test(url)) return 'stream'
+  if (/\.(ts|m4s)(?:$|[?#])/i.test(url)) return 'segment'
+  if (MEDIA_RE.test(url)) return 'media'
+  return 'file'
+}
+
+function rememberMedia(tabId, url) {
+  let m = mediaByTab.get(tabId)
+  if (!m) {
+    m = new Map()
+    mediaByTab.set(tabId, m)
+  }
+  m.set(url, { t: Date.now(), kind: kindOfUrl(url) })
+  if (m.size > 200) {
+    const now = Date.now()
+    for (const [k, v] of m) if (now - v.t > 10 * 60 * 1000) m.delete(k)
+    while (m.size > 200) m.delete(m.keys().next().value)
+  }
+}
+
+function dropTab(tabId) {
+  mediaByTab.delete(tabId)
+  frameItems.delete(tabId)
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => dropTab(tabId))
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (d) => {
+    if (d.tabId == null || d.tabId < 0) return
+    /* 顶层文档开始加载 = 换页了，上一个页面的记录全部作废 */
+    if (d.type === 'main_frame') {
+      dropTab(d.tabId)
+      return
+    }
+    if (!/^https?:/i.test(d.url)) return
+    if (!MEDIA_RE.test(d.url)) return
+    rememberMedia(d.tabId, d.url)
+  },
+  { urls: ['http://*/*', 'https://*/*'] },
+)
+
+/* ------------------------------------------------------------------ */
+/* 接管浏览器下载                                                      */
+/* ------------------------------------------------------------------ */
+
 chrome.downloads.onCreated.addListener(async (item) => {
   await loadCfg()
   if (!cfg.intercept) return
   /* blob:/data: 这种是页面自己生成的，交给 PanBox 没有意义 */
   if (!/^https?:/i.test(item.url || '')) return
   const hint = seen.get(item.url) || {}
+  /* 先把浏览器这次下载按住，等 PanBox 明确收下了才真的丢掉它；
+   * 要是 PanBox 没开，再把它放回去 —— 绝不能让用户的下载凭空消失。 */
+  let cancelled = false
   try {
     await chrome.downloads.cancel(item.id)
+    cancelled = true
   } catch {
     /* 已经结束了 */
   }
-  setTimeout(() => chrome.downloads.erase({ id: item.id }).catch(() => {}), 300)
 
   const fromPath = (item.filename || '').split(/[\\/]/).pop() || ''
   const r = await send({
@@ -285,8 +352,19 @@ chrome.downloads.onCreated.addListener(async (item) => {
     headers: item.referrer || hint.referer ? { Referer: item.referrer || hint.referer } : {},
     via: 'intercept',
   })
-  if (r && r.ok) badge('✓', '#34c759')
-  else badge('!', '#ff5b5b')
+  if (r && r.ok) {
+    setTimeout(() => chrome.downloads.erase({ id: item.id }).catch(() => {}), 500)
+    badge('✓', '#34c759')
+  } else {
+    badge('!', '#ff5b5b')
+    if (cancelled) {
+      try {
+        await chrome.downloads.download({ url: item.url, filename: fromPath || undefined })
+      } catch {
+        /* 回退也失败了，只能算了 */
+      }
+    }
+  }
 })
 
 /* ------------------------------------------------------------------ */
@@ -305,6 +383,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
         alive,
         port: cfg.port,
         intercept: cfg.intercept,
+        panel: cfg.panel,
         paired: !!cfg.token,
       })
     }
@@ -312,10 +391,68 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       const patch = {}
       if (msg.port != null) patch.port = Number(msg.port) || DEFAULT_PORT
       if (msg.intercept != null) patch.intercept = !!msg.intercept
+      if (msg.panel != null) patch.panel = !!msg.panel
       if (msg.token != null) patch.token = String(msg.token)
       await chrome.storage.local.set(patch)
       await loadCfg()
-      return reply({ ok: true, port: cfg.port, intercept: cfg.intercept, paired: !!cfg.token })
+      return reply({
+        ok: true,
+        port: cfg.port,
+        intercept: cfg.intercept,
+        panel: cfg.panel,
+        paired: !!cfg.token,
+      })
+    }
+    /* ---- 页面悬浮面板 ---- */
+    if (msg.type === 'items') {
+      /* 子框架上报自己发现的媒体/文件（面板只在顶层框架画） */
+      const tabId = _sender && _sender.tab ? _sender.tab.id : -1
+      if (tabId != null && tabId >= 0) {
+        let f = frameItems.get(tabId)
+        if (!f) {
+          f = new Map()
+          frameItems.set(tabId, f)
+        }
+        f.set((_sender && _sender.frameId) || 0, Array.isArray(msg.items) ? msg.items.slice(0, 120) : [])
+      }
+      return reply({ ok: true })
+    }
+    if (msg.type === 'mediaList') {
+      const tabId = _sender && _sender.tab ? _sender.tab.id : -1
+      const out = []
+      const have = new Set()
+      const m = tabId >= 0 ? mediaByTab.get(tabId) : null
+      if (m) {
+        for (const [url, v] of m) {
+          if (have.has(url)) continue
+          have.add(url)
+          out.push({ url, kind: v.kind })
+        }
+      }
+      const f = tabId >= 0 ? frameItems.get(tabId) : null
+      if (f) {
+        for (const list of f.values()) {
+          for (const it of list) {
+            if (!it || !it.url || have.has(it.url)) continue
+            have.add(it.url)
+            out.push({ url: it.url, kind: it.kind || 'file' })
+          }
+        }
+      }
+      return reply({ ok: true, items: out.slice(0, 150) })
+    }
+    if (msg.type === 'sendUrls') {
+      const items = (Array.isArray(msg.items) ? msg.items : [])
+        .filter((x) => x && /^https?:/i.test(x.url || ''))
+        .slice(0, 80)
+      if (!items.length) return reply({ ok: false, count: 0, message: '没有可投递的地址' })
+      const r = await handOver(items, { pageUrl: msg.referer || '', pageTitle: msg.title || '' })
+      return reply({
+        ok: r.okCount > 0,
+        count: r.okCount,
+        last: r.last,
+        message: r.okCount ? '' : '投递失败：确认 PanBox 正在运行',
+      })
     }
     if (msg.type === 'pair') {
       const ok = await pair()

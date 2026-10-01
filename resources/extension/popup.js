@@ -28,6 +28,8 @@ async function refresh() {
   }
   $('port').value = s.port
   $('intercept').checked = !!(s && s.intercept)
+  $('panel').checked = !!(s && s.panel)
+  $('sendPage').textContent = s && s.panel ? '把本页媒体 / 文件链接交给 PanBox' : '把本页文件链接交给 PanBox'
   if (s && s.paired) $('token').placeholder = '已配对（令牌已保存在浏览器里）'
   return s
 }
@@ -35,6 +37,18 @@ async function refresh() {
 $('intercept').addEventListener('change', async (e) => {
   await ask({ type: 'set', intercept: e.target.checked })
   say(e.target.checked ? '已开启接管：浏览器的下载会自动转到 PanBox' : '已关闭接管', 'ok')
+  refresh()
+})
+
+$('panel').addEventListener('change', async (e) => {
+  await ask({ type: 'set', panel: e.target.checked })
+  if (e.target.checked) {
+    /* 面板之前被 ✕ 关掉过的话，这里顺手把它放回来 */
+    await chrome.storage.local.set({ panelHidden: false })
+    say('已开启悬浮面板：回到网页就能看到「N 个文件」', 'ok')
+  } else {
+    say('已关闭悬浮面板', 'ok')
+  }
   refresh()
 })
 
