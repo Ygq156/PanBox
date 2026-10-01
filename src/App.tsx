@@ -52,14 +52,10 @@ const EP_NETDISKS = ['lanzou', 'ilanzou', 'quark', 'uc', 'baidu', 'xunlei', '123
 
 /** 解析成功后，结果面板底下的一句话提示（原来每个网盘一段 if，现在一张表） */
 const NETDISK_TIP: Record<string, { warn?: boolean; text: string }> = {
-  quark: {
-    text: '已交给分段引擎多连接下载。',
-  },
-  uc: { text: '已交给分段引擎多连接下载。' },
-  xunlei: { text: '已转存到你的迅雷云盘取直链，任务结束后自动删掉转存副本。' },
+  xunlei: { text: '已在你网盘里生成转存副本，任务结束后自动删除。' },
   baidu: {
     warn: true,
-    text: '百度按账号限速，本任务单线程。想更快：官方客户端开「设置 → 传输 → 下载提速」，或者开 SVIP。',
+    text: '百度按账号限速，本任务单线程。想更快：官方客户端开「下载提速」，或者开 SVIP。',
   },
 }
 
@@ -153,8 +149,8 @@ function EndpointSection({
       label="解析接口（可选，优先于内置解析）"
       hint={
         <>
-          接口地址由你自己提供。填了提取码时，<b>提取码会随分享链接一起发给接口</b>；
-          你的网盘凭证<b>不会</b>发往接口。
+          接口地址由你自己提供，可用占位：<b>{'{url}'} {'{pwd}'} {'{shareId}'} {'{netdisk}'}</b>。
+          填了提取码时，提取码会随分享链接发给接口；你的网盘凭证<b>不会</b>发往接口。
         </>
       }
     >
@@ -165,7 +161,7 @@ function EndpointSection({
         <span className="ep-hint">{list.length}/8</span>
       </div>
 
-      {list.map((ep, i) => (
+      {list.map((ep) => (
         <div className="endpoint" key={ep.id}>
           <div className="endpoint-head">
             <label className="ep-toggle">
@@ -178,7 +174,7 @@ function EndpointSection({
             </label>
             <input
               type="text"
-              placeholder={`接口名称（如：我的解析站 ${i + 1}）`}
+              placeholder="接口名称"
               value={ep.name}
               onChange={(e) => upd(ep.id, { name: e.target.value })}
             />
@@ -197,7 +193,7 @@ function EndpointSection({
 
           <input
             type="text"
-            placeholder="接口地址，可用 {url} {pwd} {shareId} {netdisk} 占位，如 https://example.com/api?url={url}"
+            placeholder="接口地址，如 https://example.com/api?url={url}"
             value={ep.url}
             onChange={(e) => upd(ep.id, { url: e.target.value })}
           />
@@ -205,7 +201,7 @@ function EndpointSection({
           {ep.method === 'POST' && (
             <textarea
               rows={2}
-              placeholder={'请求体模板，如 url={url}&pwd={pwd}（默认 form-urlencoded）'}
+              placeholder={'请求体模板，如 url={url}&pwd={pwd}'}
               value={ep.body || ''}
               onChange={(e) => upd(ep.id, { body: e.target.value })}
             />
@@ -214,7 +210,7 @@ function EndpointSection({
           <div className="row">
             <input
               type="text"
-              placeholder="直链字段路径（留空自动识别 url / dlink / download_url …），如 data.url"
+              placeholder="直链字段路径，留空自动识别，如 data.url"
               value={ep.field || ''}
               onChange={(e) => upd(ep.id, { field: e.target.value })}
             />
@@ -229,14 +225,14 @@ function EndpointSection({
             />
             <textarea
               rows={2}
-              placeholder="下载直链要带的请求头 JSON（可选），留空只用 User-Agent"
+              placeholder="下载直链的请求头 JSON（可选）"
               value={typeof ep.dlHeaders === 'string' ? ep.dlHeaders : ep.dlHeaders ? JSON.stringify(ep.dlHeaders) : ''}
               onChange={(e) => upd(ep.id, { dlHeaders: e.target.value })}
             />
           </div>
 
           <div className="ep-netdisks">
-            <span className="ep-hint">适用网盘（不勾 = 全部；直链必须显式勾选）：</span>
+            <span className="ep-hint">适用网盘（不勾 = 全部；直链要勾）：</span>
             {EP_NETDISKS.map((k) => {
               const cur = ep.netdisks || []
               const on = cur.includes(k)
@@ -294,8 +290,7 @@ function ProxySection({ s, patch }: { s: Settings; patch: (p: Partial<Settings>)
       label="网络代理（下 GitHub / 境外资源时用）"
       hint={
         <>
-          当前实际使用：{st?.effective ? <code>{st.effective}</code> : '直连（不走代理）'}。
-          改完自动重启下载引擎，本机地址不走代理。
+          当前实际使用：{st?.effective ? <code>{st.effective}</code> : '直连（不走代理）'}。改完自动重启下载引擎。
         </>
       }
     >
@@ -369,7 +364,6 @@ function BridgeSection() {
       label="浏览器插件（在网页里直接下资源）"
       hint={
         <>
-          装上后，网页里右键链接就能「用 PanBox 下载」，任务会带上当前页面的 Referer / Cookie / User-Agent。
           安装：打开 <code>chrome://extensions</code>（Edge 是 <code>edge://extensions</code>）→ 开发者模式 →
           加载已解压的扩展程序 → 选「打开插件文件夹」里的目录；装好或更新后点一次「重新加载」。
         </>
@@ -616,7 +610,7 @@ function SettingsModal({
    * 后者才是「清空输入框也不能把凭证弄丢」的依据（改完又清空时，编辑框里已经不是打码串了）。 */
   const maskedCookie = (s.cookies[cookieKey] ?? '') === COOKIE_MASK
   const storedMasked = (saved.cookies[cookieKey] ?? '') === COOKIE_MASK
-  const cookiesOk = !!(s.cookies[cookieKey] ?? '').trim()
+  
   const setErr = (key: string, msg: string) => setRowErr((m) => ({ ...m, [key]: msg }))
 
   /**
@@ -729,13 +723,14 @@ function SettingsModal({
     }
   }
 
+  /* 只有安装版真能写系统登录项；便携版/开发模式这一行要说明白为啥不生效 */
   const autoStartDesc = !info
-    ? '登录 Windows 后自动启动 PanBox。'
+    ? undefined
     : !info.packaged
-      ? '登录 Windows 后自动启动 PanBox。开发模式下不写系统登录项，安装版才生效。'
+      ? '开发模式下不生效。'
       : info.portable
-        ? '登录 Windows 后自动启动 PanBox。便携版记下的启动路径换个位置或换台机器就失效，建议用安装版。'
-        : '登录 Windows 后自动启动 PanBox，默认收在托盘里把没下完的任务接着跑。'
+        ? '便携版换个位置或换台机器就失效。'
+        : undefined
 
   return (
     <div className="mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
@@ -767,7 +762,6 @@ function SettingsModal({
                     <Row
                       indent
                       title="启动时显示主窗口"
-                      desc="不勾选就只留在托盘里。"
                     >
                       <Switch
                         checked={!!s.startupShowWindow}
@@ -779,7 +773,7 @@ function SettingsModal({
                 <Section title="关闭">
                   <Row
                     title="关闭窗口后留在后台下载"
-                    desc="关闭窗口后留在托盘，下载不中断；要完全退出走托盘菜单的「退出」。"
+                    desc="要完全退出：托盘图标右键 →「退出」。"
                     err={rowErr.closeToTray}
                   >
                     <Switch
@@ -787,7 +781,7 @@ function SettingsModal({
                       onChange={(v) => instant({ closeToTray: v }, 'closeToTray')}
                     />
                   </Row>
-                  <Row title="下载完成后打开下载目录" desc="每个任务下载完成时打开一次所在目录。">
+                  <Row title="下载完成后打开下载目录">
                     <Switch
                       checked={!!s.openFolderWhenDone}
                       onChange={(v) => instant({ openFolderWhenDone: v }, 'openFolderWhenDone')}
@@ -795,7 +789,7 @@ function SettingsModal({
                   </Row>
                 </Section>
                 <Section title="下载位置">
-                  <Row stack title="下载目录" desc="任务默认存到这里；改完记得点右下角「保存」。">
+                  <Row stack title="下载目录">
                     <div className="row">
                       <input
                         type="text"
@@ -821,7 +815,6 @@ function SettingsModal({
                 <Section title="aria2（百度 / 迅雷 / 蓝奏云走这条）">
                   <NumberRow
                     title="同时下载任务数"
-                    desc="同时下载的任务数。"
                     value={s.maxConcurrent}
                     min={1}
                     max={20}
@@ -830,7 +823,6 @@ function SettingsModal({
                   />
                   <NumberRow
                     title="单任务分片数（split）"
-                    desc="把一个文件切成几段同时下。"
                     value={s.split}
                     min={1}
                     max={64}
@@ -839,20 +831,16 @@ function SettingsModal({
                   />
                   <NumberRow
                     title="每服务器最大连接数"
-                    desc="aria2 对同一台服务器的连接上限，最大 16。"
                     value={s.maxConnectionPerServer}
                     min={1}
                     max={64}
                     onCommit={(n) => instant({ maxConnectionPerServer: n }, 'maxConnectionPerServer')}
                     err={rowErr.maxConnectionPerServer}
                   />
-                  <Row
-                    stack
-                    title="最小分片大小"
-                    desc="写成 1M / 512K 这样的格式。"
-                  >
+                  <Row stack title="最小分片大小">
                     <input
                       type="text"
+                      placeholder="1M"
                       value={s.minSplitSize}
                       onChange={(e) => patch({ minSplitSize: e.target.value })}
                     />
@@ -863,7 +851,7 @@ function SettingsModal({
                   <Row
                     stack
                     title="每个网盘的连接数"
-                    desc="夸克 / UC / 直链 各自用多少条连接下载。填 0 就改用 aria2。默认：夸克 192、UC 96、直链 128。"
+                    desc="填 0 就改用 aria2。"
                     err={rowErr.segConnections}
                   >
                     <div className="ep-netdisks">
@@ -887,7 +875,7 @@ function SettingsModal({
                   </Row>
                   <NumberRow
                     title="百度网盘并发（默认 1）"
-                    desc="百度按账号限速。超级会员可以调到 4~8；调高后速度变成 0 说明被限了，调回 1。"
+                    desc="超级会员可调到 4~8；速度变成 0 就是被限了，调回 1。"
                     value={s.baiduConnections ?? 1}
                     min={1}
                     max={16}
@@ -906,19 +894,18 @@ function SettingsModal({
                 <Section title="证书">
                   <Row
                     title="忽略证书错误"
-                    desc="打开后不再校验证书，公共 WiFi 或代理可能替换你下载的内容，仅在必要时打开。"
+                    desc="打开后不校验证书，只在必要时用。"
                     err={rowErr.ignoreCert}
                   >
                     <Switch checked={!!s.ignoreCert} onChange={(v) => instant({ ignoreCert: v }, 'ignoreCert')} />
                   </Row>
                 </Section>
                 <Section title="其它">
-                  <Row stack title="自定义 User-Agent" desc="留默认即可。只有个别站点要求特定 UA 时才改。">
+                  <Row stack title="自定义 User-Agent">
                     <input type="text" value={s.userAgent} onChange={(e) => patch({ userAgent: e.target.value })} />
                   </Row>
                   <NumberRow
                     title="aria2 RPC 端口"
-                    desc="端口被占用时改这里（改完会重启下载引擎）。"
                     value={s.aria2Port}
                     min={1024}
                     max={65535}
@@ -950,11 +937,7 @@ function SettingsModal({
                   })}
                 </div>
 
-                <Row
-                  stack
-                  title="用你自己的账号（夸克 / UC / 迅雷 / 百度必须登录）"
-                  desc="凭证只存在这台电脑上，程序只用你账号本来应有的速度，不做身份伪造。"
-                >
+                <Row stack title="账号" desc="凭证只存在这台电脑上。">
                   <div className="acct-form">
                     <div className="row">
                       <select className="select" value={cookieKey} onChange={(e) => setCookieKey(e.target.value)}>
@@ -964,47 +947,41 @@ function SettingsModal({
                           </option>
                         ))}
                       </select>
-                      <input
-                        type="text"
-                        placeholder={maskedCookie ? '已保存；粘贴新凭证可换账号' : '粘贴凭证，或点下面「登录」自动获取'}
-                        value={maskedCookie ? '' : s.cookies[cookieKey] ?? ''}
-                        onChange={(e) => {
-                          const v = e.target.value
-                          /* 清空输入框永远不等于「删凭证」：磁盘上本来有一份就退回那份（打码串），
-                           * 只有本来就什么都没有（或点「退出登录」）才会真的变成空。
-                           * 不然用户打一半反悔、或者手滑全选删掉，就得重新登录一遍。 */
-                          const val = v === '' ? (storedMasked ? COOKIE_MASK : '') : v
-                          patch({ cookies: { ...s.cookies, [cookieKey]: val } })
-                        }}
-                      />
+                      {LOGIN_TARGETS.includes(cookieKey) && (
+                        <>
+                          <button disabled={loginBusy} onClick={doLogin}>
+                            {loginBusy ? '请在弹出的窗口里登录…' : `登录${label(cookieKey)}`}
+                          </button>
+                          <button
+                            onClick={async () => {
+                              await api.clearLogin(cookieKey)
+                              /* 退出登录要立刻落盘：这里清了浏览器分区，配置里那份也一起清掉，
+                               * 免得留下一个「分区已登出、配置里还攥着旧凭证」的中间状态。 */
+                              const next = await api.setSettings({ cookies: { ...s.cookies, [cookieKey]: '' } })
+                              setS((v) => ({ ...v, cookies: { ...next.cookies } }))
+                              setSaved(next)
+                              onSaved(next)
+                              setLoginMsg(`已清除 ${label(cookieKey)} 的登录状态`)
+                            }}
+                          >
+                            退出登录
+                          </button>
+                        </>
+                      )}
                     </div>
-                    <div className={`chint${cookiesOk ? ' ok' : ''}`}>
-                      <i className={cookiesOk ? 'dot ok' : 'dot'} />
-                      {cookiesOk
-                        ? `${label(cookieKey)} 的凭证已保存在本机，输入框留空即沿用。`
-                        : `${label(cookieKey)} 还没有凭证，解析只能拿到游客直链。`}
-                    </div>
-                    {LOGIN_TARGETS.includes(cookieKey) && (
-                      <div className="row">
-                        <button disabled={loginBusy} onClick={doLogin}>
-                          {loginBusy ? '请在弹出的窗口里登录…' : `登录${label(cookieKey)}`}
-                        </button>
-                        <button
-                          onClick={async () => {
-                            await api.clearLogin(cookieKey)
-                            /* 退出登录要立刻落盘：这里清了浏览器分区，配置里那份也一起清掉，
-                             * 免得留下一个「分区已登出、配置里还攥着旧凭证」的中间状态。 */
-                            const next = await api.setSettings({ cookies: { ...s.cookies, [cookieKey]: '' } })
-                            setS((v) => ({ ...v, cookies: { ...next.cookies } }))
-                            setSaved(next)
-                            onSaved(next)
-                            setLoginMsg(`已清除 ${label(cookieKey)} 的登录状态`)
-                          }}
-                        >
-                          退出登录
-                        </button>
-                      </div>
-                    )}
+                    <input
+                      type="text"
+                      placeholder={maskedCookie ? '已保存，粘贴新凭证可换账号' : '粘贴凭证'}
+                      value={maskedCookie ? '' : s.cookies[cookieKey] ?? ''}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        /* 清空输入框永远不等于「删凭证」：磁盘上本来有一份就退回那份（打码串），
+                         * 只有本来就什么都没有（或点「退出登录」）才会真的变成空。
+                         * 不然用户打一半反悔、或者手滑全选删掉，就得重新登录一遍。 */
+                        const val = v === '' ? (storedMasked ? COOKIE_MASK : '') : v
+                        patch({ cookies: { ...s.cookies, [cookieKey]: val } })
+                      }}
+                    />
                     {loginMsg && <div className="desc">{loginMsg}</div>}
                   </div>
                 </Row>
@@ -1106,7 +1083,6 @@ function SettingsModal({
                   </div>
                   <Row
                     title="自动检查更新"
-                    desc="启动后自动查一次新版本。"
                     err={rowErr.autoCheckUpdate}
                   >
                     <Switch
@@ -1116,7 +1092,7 @@ function SettingsModal({
                   </Row>
                 </Section>
                 <Section title="链接">
-                  <Row title="项目主页 / 源码" desc="GitHub 仓库与浏览器插件目录。">
+                  <Row title="项目主页 / 源码">
                     <div className="row">
                       <button onClick={() => api.openRelease('https://github.com/Ygq156/PanBox')}>打开 GitHub</button>
                       <button onClick={() => api.bridgeOpenFolder()}>插件文件夹</button>
@@ -1142,8 +1118,7 @@ function SettingsModal({
                 <div className="danger">
                   <div className="danger-title">恢复默认设置</div>
                   <div className="danger-desc">
-                    把下载、网络、端口、外观这些设置全部改回出厂值。
-                    <b>登录凭证和你自己填的解析接口会保留</b> —— 不必重新登录四个网盘。
+                    把设置改回出厂值。<b>登录凭证和你自己填的解析接口会保留</b>，不必重新登录四个网盘。
                   </div>
                   {confirmReset ? (
                     <div className="row">
@@ -1674,7 +1649,7 @@ export default function App() {
           <div className="link-row">
             <input
               type="text"
-              placeholder="粘贴网盘分享链接或 http(s) 直链（一行一个，可批量）—— 蓝奏云 / 夸克 / UC / 百度 / 迅雷 / 123 …"
+              placeholder="粘贴网盘分享链接或直链，一行一个"
               value={text}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && !parsing && doParse()}
@@ -1743,8 +1718,6 @@ export default function App() {
             {tasks.length === 0 ? (
               <div className="empty">
                 还没有下载任务。
-                <br />
-                粘贴一个分享链接，点「解析」开始。
               </div>
             ) : (
               tasks.map((t) => {
