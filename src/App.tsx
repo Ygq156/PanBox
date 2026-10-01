@@ -25,8 +25,24 @@ const label = (k: string) => NETDISK_LABEL[k] ?? k
 
 /** 能一键开登录窗抓凭证的网盘，同时也是「网盘账号」下拉的顺序 */
 const LOGIN_TARGETS = ['baidu', 'quark', 'uc', 'xunlei']
+/* 主进程把凭证打码后才发到界面（防止页面脚本读到原文）。这个串表示「本机已有一份，
+ * 界面不回显」——保存时原样传回去，主进程认这个串就保留磁盘上那份。 */
+const COOKIE_MASK = '__PANBOX_KEEP__'
 /** 只能手贴凭证的网盘 */
 const COOKIE_TARGETS = [...LOGIN_TARGETS, 'lanzou', '123pan']
+
+/** 键顺序无关的 JSON（比「有没有改动」用；两侧对象是不同地方拼出来的，键顺序不保证一致） */
+function stableJson(v: unknown): string {
+  return JSON.stringify(v, (_k, val: unknown) => {
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      const o = val as Record<string, unknown>
+      const sorted: Record<string, unknown> = {}
+      for (const k of Object.keys(o).sort()) sorted[k] = o[k]
+      return sorted
+    }
+    return val
+  })
+}
 
 /** 走自研分段引擎的网盘。百度不在此列 —— 它是账号级总量限速，加连接只会招 403。 */
 const SEG_TARGETS = ['quark', 'uc', 'direct']
@@ -587,7 +603,16 @@ function SettingsModal({
   }, [])
 
   const patch = (p: Partial<Settings>) => setS((v) => ({ ...v, ...p }))
-  const dirty = JSON.stringify(s) !== JSON.stringify(saved)
+  /* 「有没有改动」不能直接比 JSON.stringify：两侧的键顺序不一定一样（本地这份是编辑出来的，
+   * 主进程回的那份是按它自己的顺序拼的），看起来一样的内容也会被判成「有改动」——
+   * 结果就是点过任意一个开关之后，底部一直提示「文本框改完请点保存」、「保存」也一直是可点的。 */
+  const dirty = stableJson(s) !== stableJson(saved)
+  /* 网盘账号那页用：主进程只发打码串过来，打码串 = 本机存着一份真凭证（不是游客模式）。
+   * maskedCookie 看的是「当前编辑框里是不是打码串」，storedMasked 看的是「磁盘上那份还在不在」——
+   * 后者才是「清空输入框也不能把凭证弄丢」的依据（改完又清空时，编辑框里已经不是打码串了）。 */
+  const maskedCookie = (s.cookies[cookieKey] ?? '') === COOKIE_MASK
+  const storedMasked = (saved.cookies[cookieKey] ?? '') === COOKIE_MASK
+  const cookiesOk = !!(s.cookies[cookieKey] ?? '').trim()
   const setErr = (key: string, msg: string) => setRowErr((m) => ({ ...m, [key]: msg }))
 
   /**
@@ -913,6 +938,25 @@ function SettingsModal({
 
             {tab === 'account' && (
               <Section title="网盘账号">
+                {/* 四家各自的状态摆在一行里，不用来回切下拉才知道谁登过 */}
+                <div className="acct-chips">
+                  {LOGIN_TARGETS.map((k) => {
+                    const on = !!(s.cookies[k] || '').trim()
+                    return (
+                      <button
+                        key={k}
+                        className={`acct-chip${cookieKey === k ? ' on' : ''}`}
+                        onClick={() => setCookieKey(k)}
+                        title={on ? `${label(k)}：本机已保存凭证` : `${label(k)}：还没有凭证，解析会走游客身份`}
+                      >
+                        <i className={on ? 'dot ok' : 'dot'} />
+                        {label(k)}
+                        <span className="dim">{on ? '已保存' : '未登录'}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+
                 <Row
                   stack
                   title="用你自己的账号（夸克 / UC / 迅雷 / 百度必须登录）"
@@ -933,10 +977,27 @@ function SettingsModal({
                     </select>
                     <input
                       type="text"
-                      placeholder="粘贴该网盘的凭证字符串，或点下面「登录」自动获取"
-                      value={s.cookies[cookieKey] ?? ''}
-                      onChange={(e) => patch({ cookies: { ...s.cookies, [cookieKey]: e.target.value } })}
+                      placeholder={
+                        maskedCookie
+                          ? '已保存；要换账号就粘贴新凭证，或点下面「登录」重新登一次'
+                          : '粘贴该网盘的凭证字符串，或点下面「登录」自动获取'
+                      }
+                      value={maskedCookie ? '' : s.cookies[cookieKey] ?? ''}
+                      onChange={(e) => {
+                        const v = e.target.value
+                        /* 清空输入框永远不等于「删凭证」：磁盘上本来有一份就退回那份（打码串），
+                         * 只有本来就什么都没有（或点「退出登录」）才会真的变成空。
+                         * 不然用户打一半反悔、或者手滑全选删掉，就得重新登录一遍。 */
+                        const val = v === '' ? (storedMasked ? COOKIE_MASK : '') : v
+                        patch({ cookies: { ...s.cookies, [cookieKey]: val } })
+                      }}
                     />
+                  </div>
+                  <div className={`chint${cookiesOk ? ' ok' : ''}`}>
+                    <i className={cookiesOk ? 'dot ok' : 'dot'} />
+                    {cookiesOk
+                      ? `${label(cookieKey)} 的凭证已保存在本机配置里，界面上不回显原文（打字框留空就是这个意思，不是游客模式）。解析和下载直接用这份凭证。`
+                      : `${label(cookieKey)} 还没有凭证：这种情况下解析只能拿到游客直链，夸克 / UC 会被 CDN 拒（412 / 403）。`}
                   </div>
                   {LOGIN_TARGETS.includes(cookieKey) && (
                     <div className="row" style={{ marginTop: 8 }}>
@@ -946,7 +1007,12 @@ function SettingsModal({
                       <button
                         onClick={async () => {
                           await api.clearLogin(cookieKey)
-                          patch({ cookies: { ...s.cookies, [cookieKey]: '' } })
+                          /* 退出登录要立刻落盘：这里清了浏览器分区，配置里那份也一起清掉，
+                           * 免得留下一个「分区已登出、配置里还攥着旧凭证」的中间状态。 */
+                          const next = await api.setSettings({ cookies: { ...s.cookies, [cookieKey]: '' } })
+                          setS((v) => ({ ...v, cookies: { ...next.cookies } }))
+                          setSaved(next)
+                          onSaved(next)
                           setLoginMsg(`已清除 ${label(cookieKey)} 的登录状态`)
                         }}
                       >
@@ -1111,10 +1177,12 @@ function SettingsModal({
 function ResultPanel({
   result,
   onDownload,
+  onRemoveFiles,
   needsLogin = false,
 }: {
   result: ParseResult
   onDownload: (result: ParseResult, ids: string[]) => void
+  onRemoveFiles?: (ids: string[]) => void
   needsLogin?: boolean
 }) {
   const [checked, setChecked] = useState<Record<string, boolean>>({})
@@ -1142,6 +1210,15 @@ function ResultPanel({
             解析接口 · {result.endpointName || '自定义'}
           </span>
         )}
+        {onRemoveFiles && (
+          <button
+            className="ghost tiny"
+            title="把这个链接的解析结果整个从列表里删掉（网盘上的文件不会动）"
+            onClick={() => onRemoveFiles(result.files.map((f) => f.id))}
+          >
+            ✕
+          </button>
+        )}
       </div>
 
       {result.endpointError && (
@@ -1163,6 +1240,15 @@ function ResultPanel({
               {f.name}
             </span>
             <span className="fsize">{formatSize(f.size)}</span>
+            {onRemoveFiles && (
+              <button
+                className="fdel"
+                title="从列表里删掉这一项（只是不在界面上列出来，网盘上的文件不会动）"
+                onClick={() => onRemoveFiles([f.id])}
+              >
+                ✕
+              </button>
+            )}
           </div>
         ))}
       </div>
@@ -1285,6 +1371,33 @@ export default function App() {
     }
     sessionsRef.current = keep
   }, [])
+
+  /* 从解析结果里删条目：只动界面上这张列表，网盘上的文件一个都不碰。
+   * 一个链接的文件被删光时整张卡片消失，顺手通知主进程把那个会话缓存释放掉。 */
+  const removeFiles = useCallback(
+    (sessionId: string, ids: string[]) => {
+      const drop = new Set(ids)
+      let gone = 0
+      const next = results
+        .map((r) => {
+          if (!r.ok || r.sessionId !== sessionId) return r
+          const files = r.files.filter((f) => {
+            if (drop.has(f.id)) {
+              gone++
+              return false
+            }
+            return true
+          })
+          return { ...r, files }
+        })
+        .filter((r) => !r.ok || r.files.length > 0)
+      if (!gone) return
+      setResults(next)
+      dropSessionsOf(next)
+      setHint({ kind: 'ok', msg: `已从列表移除 ${gone} 项（网盘上的文件没有动）` })
+    },
+    [results, dropSessionsOf],
+  )
 
   const doParse = useCallback(async () => {
     const raw = text.trim()
@@ -1456,6 +1569,7 @@ export default function App() {
                     result={r}
                     needsLogin={!settings.cookies?.[r.netdisk]}
                     onDownload={doDownload}
+                    onRemoveFiles={(ids) => removeFiles(r.sessionId || '', ids)}
                   />
                 ) : (
                   <ErrorPanel key={r.source || `e${i}`} result={r} />
