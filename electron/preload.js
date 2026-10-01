@@ -6,6 +6,8 @@ const invoke = (channel, payload) => ipcRenderer.invoke(channel, payload)
 
 contextBridge.exposeInMainWorld('panbox', {
   parseShare: (p) => invoke('parse:share', p),
+  /* 界面丢掉一条解析结果时通知主进程释放对应会话 */
+  dropParseSession: (sessionId) => invoke('parse:drop', sessionId),
 
   listDownloads: () => invoke('downloads:list'),
   addDownloads: (p) => invoke('downloads:add', p),

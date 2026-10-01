@@ -1,7 +1,102 @@
 'use strict'
 
+const dns = require('node:dns').promises
+
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
+/* ------------------------------------------------------------------ */
+/* 出站请求护栏                                                        */
+/* ------------------------------------------------------------------ */
+
+/** 解析（或重定向到）本机/局域网地址的拦截。 */
+const MAX_RESP_SIZE = Number(process.env.PANBOX_MAX_RESP || 8 * 1024 * 1024) || 8 * 1024 * 1024
+
+/** 日志/错误里出现的 URL 去掉 query —— 分享链接的 ?pwd= 与直链签名都在 query 里 */
+function safeUrl(u) {
+  try {
+    const x = new URL(String(u))
+    return `${x.protocol}//${x.host}${x.pathname}`
+  } catch {
+    return '(非法地址)'
+  }
+}
+
+/** 这个 host 是不是「本机或局域网」的字面量地址 */
+function isPrivateHost(host) {
+  const h = String(host || '')
+    .replace(/^\[|\]$/g, '')
+    .toLowerCase()
+  if (!h) return true
+  if (h === 'localhost' || h.endsWith('.localhost')) return true
+  if (h === '::1' || h === '::') return true
+  /* IPv6：fc00::/7 唯一本地地址、fe80::/10 链路本地 */
+  if (h.includes(':')) return /^(fc|fd|fe8|fe9|fea|feb)/.test(h)
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h)
+  if (!m) return false /* 普通域名：交给 assertOutbound 做 DNS 解析再判 */
+  const [a, b] = [Number(m[1]), Number(m[2])]
+  if (a === 0 || a === 10 || a === 127) return true
+  if (a === 100 && b >= 64 && b <= 127) return true /* 100.64/10 CGNAT */
+  if (a === 169 && b === 254) return true /* 链路本地 */
+  if (a === 192 && b === 168) return true
+  if (a === 172 && b >= 16 && b <= 31) return true
+  return false
+}
+
+/**
+ * 出站准入：只允许 http(s)，且默认拒绝本机/局域网地址。
+ *
+ * 为什么：网盘页面/接口的响应里会带「下一步去哪儿」（蓝奏的 json.dom、页面里的
+ * P_AJAX_ABSOLUTE、夸克的 download_url）。如果不去校验，被黑掉或被中间人的响应就能
+ * 指挥主进程带着用户 Cookie 去打 127.0.0.1:7799 或 192.168.x.x —— 内网探测 + 凭据外发。
+ *
+ * allowLocal 只对**本机字面量**生效（用户自己把解析接口指向 localhost 是合理用法）；
+ * 域名解析到内网（DNS rebinding）一律拒绝，因为那正是攻击手法。
+ */
+async function assertOutbound(url, { allowLocal = false } = {}) {
+  let u
+  try {
+    u = new URL(String(url))
+  } catch {
+    throw new Error(`出站地址不是合法 URL：${safeUrl(url)}`)
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    throw new Error(`只允许 http(s) 出站，拒绝 ${u.protocol}//`)
+  }
+  if (isPrivateHost(u.hostname)) {
+    if (allowLocal && u.protocol === 'http:') return
+    throw new Error(`拒绝访问本机/局域网地址：${u.hostname}（如确有需要，请在解析接口设置里允许）`)
+  }
+  let addrs = []
+  try {
+    addrs = await dns.lookup(u.hostname, { all: true })
+  } catch {
+    return /* 解析不了就交给 fetch 去报错，别在这里编错误信息 */
+  }
+  if (addrs.some((a) => isPrivateHost(a.address))) {
+    throw new Error(`拒绝访问解析到内网的地址：${u.hostname}`)
+  }
+}
+
+/** 带上限的响应体读取：被控/被黑的服务器塞一个超大响应不能把主进程读爆 */
+async function readTextCapped(res, limit) {
+  const buf = Buffer.from(await readAll(res.body, limit))
+  return buf.toString('utf8')
+}
+
+/** 把 Web ReadableStream 读成 Buffer，超过 limit 直接抛错（不静默截断） */
+async function readAll(readable, limit) {
+  const chunks = []
+  let n = 0
+  if (!readable) return Buffer.alloc(0)
+  for await (const chunk of readable) {
+    const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    n += b.length
+    if (n > limit) throw new Error(`响应体过大（超过 ${Math.round(limit / 1024 / 1024)}MB），已中止`)
+    chunks.push(b)
+  }
+  return Buffer.concat(chunks)
+}
 
 /**
  * 带超时的 fetch 封装。所有网盘解析都走这里，便于统一加 UA / Cookie / Referer。
@@ -51,10 +146,16 @@ async function req(url, opts = {}) {
     method = 'GET',
     headers = {},
     body,
-    redirect = 'follow',
     timeout = 25000,
     cookie,
     jar,
+    /* 'manual' = 不跟重定向，把 3xx 原样返回给调用方（蓝奏/优享要靠 Location 头自己走下一步）。
+     * 'follow'（默认）= 自己跟，但每一跳都过 assertOutbound（fetch 自带的 follow 做不到这点）。 */
+    redirect = 'follow',
+    /* 是否允许这条请求打向本机/局域网地址。默认 false —— 远端响应不该把请求
+     * 带去内网（见下面 assertOutbound 的注释）。只有用户**自己**在设置里把解析
+     * 接口或直链指向内网时，才由调用方显式放开。 */
+    allowLocal = false,
   } = opts
 
   const h = { 'User-Agent': DEFAULT_UA, ...headers }
@@ -64,18 +165,44 @@ async function req(url, opts = {}) {
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), timeout)
   try {
-    const res = await fetch(url, { method, headers: h, body, redirect, signal: ac.signal })
+    /* 自己跟重定向（以前交给 fetch 的 redirect:'follow'）：这样每一跳都能校验
+     * 目标地址，避免「网盘接口/页面返回一个 302 到 127.0.0.1 或 192.168.x.x」时，
+     * 主进程带着 Cookie 打过去（内网探测 + 凭据外发）。最多 5 跳，与浏览器一致。
+     * redirect:'manual' 的调用方（蓝奏/优享）保持原样：只请求一次，3xx 交给它们自己处理。 */
+    let current = String(url)
+    let res = null
+    const maxHop = redirect === 'manual' ? 0 : 5
+    for (let hop = 0; ; hop++) {
+      await assertOutbound(current, { allowLocal })
+      res = await fetch(current, { method, headers: h, body, redirect: 'manual', signal: ac.signal })
+      const code = res.status
+      const loc = res.headers.get('location')
+      if (redirect === 'manual') break
+      if (code >= 300 && code < 400 && loc) {
+        if (hop >= maxHop) throw new Error('重定向次数过多')
+        const next = new URL(loc, current).toString()
+        if (jar) jar.absorb(res.headers)
+        try {
+          await res.body?.cancel()
+        } catch {
+          /* ignore */
+        }
+        current = next
+        continue
+      }
+      break
+    }
     if (jar) jar.absorb(res.headers)
-    const text = await res.text()
+    const text = await readTextCapped(res, MAX_RESP_SIZE)
     return {
       status: res.status,
       headers: res.headers,
       location: res.headers.get('location') || '',
       text,
-      url: res.url,
+      url: res.url || current,
     }
   } catch (e) {
-    const msg = e && e.name === 'AbortError' ? `请求超时：${url}` : `${e && e.message ? e.message : e}`
+    const msg = e && e.name === 'AbortError' ? `请求超时：${safeUrl(current)}` : `${e && e.message ? e.message : e}`
     throw new Error(msg)
   } finally {
     clearTimeout(timer)
@@ -235,6 +362,9 @@ module.exports = {
   Jar,
   req,
   reqJson,
+  assertOutbound,
+  isPrivateHost,
+  safeUrl,
   detectNetdisk,
   extractUrls,
   extractPassword,

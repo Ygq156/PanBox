@@ -205,7 +205,18 @@ async function callOne(ep, url, ctx) {
     if (!hasCt) headers['Content-Type'] = ep.contentType || 'application/x-www-form-urlencoded'
   }
 
-  const r = await req(target, { method, headers, body, timeout: 30000, redirect: 'follow' })
+  const r = await req(target, {
+    method,
+    headers,
+    body,
+    timeout: 30000,
+    redirect: 'follow',
+    /* 解析接口的地址是**用户自己**填的：本机跑一个 alist / 自建解析接口是常见用法，
+     * 所以要放行本机/内网地址（默认放行；用户想收紧可以在接口配置里写 allowLocal:false）。
+     * 真正要防的是「远端响应决定下一跳」—— 那些地方在 parsers/util.js 的 assertOutbound()
+     * 和 segmentDownloader 的入参校验里，没有这个豁免。 */
+    allowLocal: ep.allowLocal !== false,
+  })
 
   /* 有些接口直接 302 到直链 */
   if (r.location && /^https?:\/\//i.test(r.location)) {

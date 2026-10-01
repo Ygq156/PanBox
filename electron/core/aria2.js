@@ -82,7 +82,9 @@ class Aria2 {
       '--timeout=60',
       '--lowest-speed-limit=0',
       '--disk-cache=64M',
-      '--check-certificate=false',
+      /* 证书校验默认开着。以前这里硬编码 false，等于把下载内容交给中间人；
+       * 只有用户在设置里显式勾选「忽略证书错误」才关。 */
+      `--check-certificate=${cfg.ignoreCert ? 'false' : 'true'}`,
       '--check-integrity=false',
       '--content-disposition-default-utf8=true',
       '--user-agent=' + (cfg.userAgent || 'PanBox/0.1'),

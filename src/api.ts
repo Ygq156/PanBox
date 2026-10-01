@@ -50,6 +50,8 @@ export interface ProxyStatus {
 
 export interface PanboxAPI {
   parseShare(p: ParsePayload): Promise<ParseResponse>
+  /** 界面丢掉一条解析结果时通知主进程释放对应会话缓存 */
+  dropParseSession(sessionId: string): Promise<boolean>
   listDownloads(): Promise<DownloadTask[]>
   addDownloads(p: AddPayload): Promise<{ ok: boolean; added: string[]; errors: string[] }>
   pauseTask(gid: string): Promise<boolean>
