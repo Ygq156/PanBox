@@ -36,7 +36,7 @@ const { cleanupDownloaded } = parsers
  *   迅雷 8 条最好，16 条以上回 503；
  *   直链/网盘直链在 16 条时已经接近服务端上限（npmmirror 16→3.99、64→4.86 MB/s）。
  */
-const SEG_CONNECTIONS = { quark: 96, uc: 96 }
+const SEG_CONNECTIONS = { quark: 96, uc: 96, direct: 128 }
 
 /**
  * 某个网盘该用自研分段引擎开多少连接（0 = 不用这个引擎，继续走 aria2）。
@@ -44,7 +44,10 @@ const SEG_CONNECTIONS = { quark: 96, uc: 96 }
  * 表里**没有**这个网盘 → 不走分段引擎；表里有且 **> 0** 才走。
  */
 function segConnectionsFor(cfg, netdisk) {
-  const table = (cfg && cfg.segConnections) || SEG_CONNECTIONS
+  /* 必须「合并」而不是「覆盖」：老用户的 settings.json 是在 direct 这一项存在之前存的
+   * （实测用户盘上是 {"quark":96,"uc":96}），整表覆盖会让 direct 掉成 0 →
+   * 直链退回 aria2 的 split=16，这就是「NDM 是 32、我的软件是 16」的直接原因。 */
+  const table = { ...SEG_CONNECTIONS, ...((cfg && cfg.segConnections) || {}) }
   const n = Number(table[netdisk] || 0)
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
 }
@@ -239,8 +242,11 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
      * 那限速档位就不是用户的账号了，再限成单线程等于白配——所以跳过这个限制。 */
     const perEndpoint = session.some((x) => x.viaEndpoint)
     const isBaidu = netdisk === 'baidu' && !perEndpoint
-    /* 不用分段引擎的那几家，aria2 的并发也要按网盘调（默认 16 会招来 503/403） */
-    const split = isBaidu ? 1 : perEndpoint ? cfg.split : ARIA2_SPLIT_OVERRIDE[netdisk] || cfg.split
+    /* 不用分段引擎的那几家，aria2 的并发也要按网盘调（默认 16 会招来 503/403）。
+     * 百度默认仍然是 1：它按「账号」维度限速，并发调大只会招致几小时~几天的惩罚性降速。
+     * 但如果你本来就是超级会员（或开了客户端「下载提速」），账号本身有额度，
+     * 那 1 条就变成人为上限了 —— 所以设置里有 cfg.baiduConnections 让你自己调上去。 */
+    const split = isBaidu ? Math.max(1, Number(cfg.baiduConnections) || 1) : perEndpoint ? cfg.split : ARIA2_SPLIT_OVERRIDE[netdisk] || cfg.split
     const options = {
       dir: subdir,
       out: sanitizeName(f.name),

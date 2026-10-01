@@ -293,7 +293,7 @@ function SettingsModal({
           </div>
 
           <div className="field">
-            <label>分段下载连接数（夸克 / UC 专用，绕开 aria2 的 16 连接上限）</label>
+            <label>分段下载连接数（夸克 / UC / 普通直链专用，绕开 aria2 的 16 连接上限）</label>
             <div className="ep-netdisks">
               {SEG_TARGETS.map((k) => (
                 <span key={k} className="seg-conn">
@@ -316,7 +316,25 @@ function SettingsModal({
               夸克 / UC 的 CDN 是<strong>按每条 TCP 连接</strong>发额度的（实测夸克 ≈50KB/s、UC ≈64KB/s 一条），
               而 aria2 的「每服务器最大连接数」最多只能填 16 —— 于是速度被钉在 ~0.8 MB/s。
               这两个网盘改由 PanBox 自带的分段引擎下载，连接数由这里决定（默认 96）。填 0 = 退回 aria2。
-              百度是账号级总量限速，加连接只会招来 403，所以不在此列。
+              <br />
+              <strong>直链</strong>默认 128：下 GitHub 这类境外资源时线路会「先冲一阵、然后长时间不动」，
+              连接数不够就会一直在等。实测同一条 66 MB 链接，32 条平均 1.3 MB/s、128 条平均 3.0 MB/s。
+            </div>
+          </div>
+
+          <div className="field">
+            <label>百度网盘并发（默认 1）</label>
+            <input
+              type="number"
+              min={1}
+              max={32}
+              value={s.baiduConnections ?? 1}
+              onChange={(e) => patch({ baiduConnections: Math.max(1, Number(e.target.value) || 1) })}
+            />
+            <div className="hint">
+              百度是<strong>账号级总量限速</strong>：普通账号调大并发只会招来几小时到几天的惩罚性降速，所以默认 1。
+              但如果你本来就是超级会员（或者开了官方客户端的「设置 → 传输 → 下载提速」），账号本身就有额度，
+              那 1 条就是人为上限了 —— 这种情况可以往上调到 4~8 试试，<strong>调高后如果速度反而变成 0，就说明账号被限了，调回 1</strong>。
             </div>
           </div>
 
