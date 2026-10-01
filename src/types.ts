@@ -143,8 +143,9 @@ export interface Settings {
   bridgePort?: number
   bridgeToken?: string
   /**
-   * 代理。默认 `auto` = 跟随 Windows 系统代理（WinINET）。
-   * 实测 GitHub 这类资源裸连 0 B/s、走系统代理 10 MB/s，所以别轻易改成 off。
+   * 代理出口。默认 `auto` = 跟随 Windows 系统代理（WinINET）。
+   * 实测：直连境外 CDN 单连接 0.03–0.04 MB/s，走系统代理 8–11 MB/s；
+   * 但一台机器不一定有代理，所以分段引擎会自己比较两条路，哪条通用哪条。
    */
   proxyMode?: 'auto' | 'off' | 'custom'
   proxy?: string

@@ -14,6 +14,30 @@ const bridge = require('./core/bridge')
 const proxy = require('./core/proxy')
 const { detectNetdisk } = require('./parsers/util')
 
+/* ------------------------------------------------------------------ */
+/* 进程 / 内存精简（必须在 app ready 之前设置才生效）                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 界面就是一张深色列表：没有动画、没有半透明模糊、没有 canvas。
+ * 软件光栅完全够用，而关掉硬件加速会**整整少一个 GPU 进程**
+ * （实测空闲态 91–105 MB，占全部内存的四分之一）。
+ */
+app.disableHardwareAcceleration()
+/* 软件合成没必要单开一个进程，并回主进程再省一个进程（实测 ~77 MB） */
+app.commandLine.appendSwitch('in-process-gpu')
+
+/* 用不到的 Chromium 子系统，关掉省内存也省启动时间。
+ * 注意别把 CalculateNativeWinOcclusion 关掉——那个是窗口最小化后省 CPU 的。 */
+app.commandLine.appendSwitch(
+  'disable-features',
+  'MediaSessionService,HardwareMediaKeyHandling,Translate,BackForwardCache,AudioServiceOutOfProcess',
+)
+/* 崩溃上报和域名预取对本地下载器没有意义 */
+app.commandLine.appendSwitch('disable-breakpad')
+app.commandLine.appendSwitch('disable-domain-reliability')
+app.commandLine.appendSwitch('no-pings')
+
 /** 下载产物文件名 -> 解析会话 id，交给下面的 recycleTransferCopy 消费 */
 const downloadsCleanup = new Map()
 /* 有些网盘的下载需要先把文件「转存」到用户自己的网盘，取完直链再删。 */
@@ -510,11 +534,6 @@ function registerIpc() {
 
   ipcMain.handle('login:open', async (_e, netdisk) => login.openLogin(netdisk, win))
   ipcMain.handle('login:clear', async (_e, netdisk) => login.clearLogin(netdisk))
-  ipcMain.handle('login:refresh', async (_e, netdisk) => {
-    const r = await login.refreshCookie(netdisk, { force: true }).catch(() => null)
-    if (r && r.header) settings.save({ cookies: { ...settings.load().cookies, [netdisk]: r.header } })
-    return r ? { ok: true, count: r.list.length, loggedIn: r.loggedIn } : { ok: false }
-  })
 
   /**
    * 夸克 / UC 的 CDN 需要网页 JS 现场生成的短效令牌（`__puus`）：夸克不带它一律 412
@@ -799,20 +818,16 @@ if (!gotLock) {
 
     tasks.on('update', (list) => {
       if (win && !win.isDestroyed()) win.webContents.send('downloads:update', list)
-      /* 下载完成 → 回收转存副本，别让用户网盘里堆 `xxx(1).zip`。
-       * ⚠️ 这里必须用模块级的 `downloadsCleanup`：
-       * 之前误写成了 `downloads:add` 处理函数里的局部别名 `cleanupOn`，
-       * 那个作用域在监听器里根本不存在 → 每 tick 抛 ReferenceError 被吞掉，
-       * 回收从来没真正跑过。 */
-      for (const t of list) {
-        if (!t || t.status !== 'complete') continue
-        recycleTransferCopy(t.name, 'complete')
-      }
     })
 
-    /* 首次完成：可选自动打开下载目录 */
+    /* 下载完成 → 回收转存副本，别让用户网盘里堆 `xxx(1).zip`；顺便按需打开下载目录。
+     * 这个事件每个 gid 只发一次，所以不用像以前那样在每个 tick 里扫全表。
+     * ⚠️ 必须用模块级的 `downloadsCleanup`：之前误写成了 `downloads:add` 处理函数里的
+     * 局部别名 `cleanupOn`，那个作用域在监听器里根本不存在 → 每 tick 抛 ReferenceError
+     * 被吞掉，回收从来没真正跑过。 */
     tasks.on('complete', (t) => {
       boot('complete', String(t.name))
+      recycleTransferCopy(t.name, 'complete')
       if (settings.load().openFolderWhenDone && win && !win.isDestroyed()) {
         shell.openPath(t.dir || settings.load().downloadDir).catch(() => {})
       }

@@ -5,10 +5,10 @@
   --border: #2a2f3a;
   --text: #e6e9ef;
   --text-dim: #8b93a7;
+  --text-faint: #5c6478;
   --accent: #4c8dff;
   --accent-dim: #2f5fb0;
   --ok: #34c759;
-  --warn: #ffb020;
   --err: #ff5b5b;
   font-synthesis: none;
 }
@@ -33,18 +33,44 @@ body {
   user-select: none;
 }
 
-input,
-button,
-select,
-textarea {
-  font-family: inherit;
-  font-size: 13px;
+/* ---------- 通用小工具 ---------- */
+.grow {
+  flex: 1;
+  min-width: 0;
 }
 
-.app {
+.dim {
+  color: var(--text-dim);
+}
+
+/* 竖向排列的一组控件（代理 / 插件那段原来靠内联样式堆出来的） */
+.stack {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.stack-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.stack-row > input[type='text'] {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 带勾选框的一行 */
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  margin: 0;
 }
 
 /* ---------- header ---------- */
@@ -69,10 +95,6 @@ textarea {
   color: var(--accent);
 }
 
-.header .spacer {
-  flex: 1;
-}
-
 .header .dot {
   width: 8px;
   height: 8px;
@@ -89,7 +111,7 @@ textarea {
   font-size: 12px;
 }
 
-/* ---------- buttons ---------- */
+/* ---------- 按钮 ---------- */
 button {
   -webkit-app-region: no-drag;
   background: var(--bg-elev2);
@@ -141,10 +163,12 @@ button.tiny {
   font-size: 12px;
 }
 
-/* ---------- inputs ---------- */
+/* ---------- 输入控件 ---------- */
 input[type='text'],
 input[type='password'],
-input[type='number'] {
+input[type='number'],
+textarea,
+.select {
   background: var(--bg);
   color: var(--text);
   border: 1px solid var(--border);
@@ -152,17 +176,44 @@ input[type='number'] {
   padding: 7px 10px;
   outline: none;
   width: 100%;
+  font-family: inherit;
+  font-size: 13px;
 }
 
-input:focus {
+textarea {
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.select {
+  width: auto;
+  cursor: pointer;
+}
+
+input:focus,
+textarea:focus,
+.select:focus {
   border-color: var(--accent-dim);
 }
 
-input::placeholder {
-  color: #5c6478;
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-faint);
 }
 
-/* ---------- layout ---------- */
+input[readonly] {
+  color: var(--text-dim);
+}
+
+input[type='checkbox'] {
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+/* ---------- 主区布局 ---------- */
 .body {
   flex: 1;
   display: flex;
@@ -190,11 +241,21 @@ input::placeholder {
   text-align: center;
 }
 
-.hint {
+.hint,
+.desc {
   color: var(--text-dim);
   font-size: 12px;
+  line-height: 1.6;
   margin-top: 6px;
+}
+
+.hint {
   min-height: 16px;
+}
+
+.desc {
+  font-size: 11px;
+  color: var(--text-faint);
 }
 
 .hint.err {
@@ -229,9 +290,17 @@ input::placeholder {
   flex: none;
 }
 
-/* ---------- parse result ---------- */
+/* ---------- 解析结果 ---------- */
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 46vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
 .result {
-  margin-top: 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
   overflow: hidden;
@@ -255,17 +324,34 @@ input::placeholder {
   white-space: nowrap;
 }
 
+.result-head .title.err {
+  color: var(--err);
+}
+
 .badge {
   font-size: 11px;
   padding: 2px 7px;
   border-radius: 99px;
   background: var(--accent-dim);
   color: #dbe8ff;
+  white-space: nowrap;
 }
 
 .badge.gray {
   background: #333a48;
   color: var(--text-dim);
+}
+
+.badge.ok {
+  background: rgba(52, 199, 89, 0.16);
+  color: var(--ok);
+  border: 1px solid rgba(52, 199, 89, 0.35);
+}
+
+.badge.err {
+  background: rgba(255, 91, 91, 0.14);
+  color: var(--err);
+  border: 1px solid rgba(255, 91, 91, 0.3);
 }
 
 .filelist {
@@ -299,16 +385,24 @@ input::placeholder {
 }
 
 .file-item .fdir {
-  color: #5c6478;
+  color: var(--text-faint);
   font-size: 11px;
 }
 
-input[type='checkbox'] {
-  accent-color: var(--accent);
-  width: 14px;
-  height: 14px;
-  cursor: pointer;
-  flex: 0 0 auto;
+/* 结果面板里的提示条（之前这个类名根本没定义，提示一直是裸文本） */
+.result-note {
+  padding: 7px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-dim);
+  background: #12151c;
+  border-top: 1px solid #1c2029;
+}
+
+.result-note.warn {
+  color: #d8b878;
+  background: #1a1710;
+  border-top-color: #2e2716;
 }
 
 .result-actions {
@@ -320,28 +414,8 @@ input[type='checkbox'] {
   border-top: 1px solid var(--border);
 }
 
-/* 一次解析多个链接时的结果列表 */
-.results {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  max-height: 46vh;
-  overflow-y: auto;
-  padding-right: 2px;
-}
-
-.results .result {
-  margin-top: 0;
-}
-
-.result-head .title.err {
-  color: var(--err);
-}
-
 .error-result {
-  border: 1px solid #4a2222;
-  border-radius: 8px;
-  overflow: hidden;
+  border-color: #4a2222;
   background: #1a1213;
 }
 
@@ -358,14 +432,7 @@ input[type='checkbox'] {
   word-break: break-all;
 }
 
-.err-body .src {
-  color: #8b6b6b;
-  display: block;
-  margin-top: 3px;
-  font-size: 11px;
-}
-
-/* ---------- downloads ---------- */
+/* ---------- 下载队列 ---------- */
 .pane-list {
   flex: 1;
   display: flex;
@@ -383,10 +450,6 @@ input[type='checkbox'] {
   font-size: 12px;
 }
 
-.list-head .spacer {
-  flex: 1;
-}
-
 .scroll {
   flex: 1;
   overflow-y: auto;
@@ -395,7 +458,7 @@ input[type='checkbox'] {
 
 .task {
   display: grid;
-  grid-template-columns: 1fr 190px 110px 96px;
+  grid-template-columns: minmax(0, 1fr) 190px 110px 100px;
   gap: 10px;
   align-items: center;
   padding: 9px 16px;
@@ -404,6 +467,10 @@ input[type='checkbox'] {
 
 .task:hover {
   background: #13161d;
+}
+
+.task .tcell {
+  min-width: 0;
 }
 
 .task .tname {
@@ -416,6 +483,9 @@ input[type='checkbox'] {
   color: var(--text-dim);
   font-size: 11px;
   margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .bar {
@@ -492,10 +562,10 @@ input[type='checkbox'] {
 .empty {
   padding: 48px 20px;
   text-align: center;
-  color: #5c6478;
+  color: var(--text-faint);
 }
 
-/* ---------- modal ---------- */
+/* ---------- 设置弹窗 ---------- */
 .mask {
   position: fixed;
   inset: 0;
@@ -507,13 +577,16 @@ input[type='checkbox'] {
 }
 
 .modal {
-  width: 520px;
-  max-height: 84vh;
-  overflow-y: auto;
+  width: 640px;
+  max-width: calc(100vw - 40px);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: 10px;
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
 }
 
 .modal h2 {
@@ -521,10 +594,32 @@ input[type='checkbox'] {
   padding: 14px 18px;
   font-size: 14px;
   border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
 }
 
 .modal .content {
-  padding: 14px 18px;
+  padding: 4px 18px 14px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+/* 分组：原来几十个字段平铺成一条，很难找 */
+.sec {
+  margin-top: 16px;
+}
+
+.sec h3 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.4px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sec-body {
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -540,13 +635,7 @@ input[type='checkbox'] {
 .field .row {
   display: flex;
   gap: 8px;
-}
-
-.field .desc {
-  color: #5c6478;
-  font-size: 11px;
-  margin-top: 4px;
-  line-height: 1.5;
+  align-items: center;
 }
 
 .grid2 {
@@ -557,13 +646,22 @@ input[type='checkbox'] {
 
 .modal .footer {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
   padding: 12px 18px;
   border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+  background: var(--bg-elev);
 }
 
-/* ---- 解析接口管理 ---- */
+/* ---------- 解析接口 ---------- */
+.endpoint-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
 
 .endpoint {
   border: 1px solid var(--border);
@@ -584,6 +682,7 @@ input[type='checkbox'] {
 
 .endpoint-head input[type='text'] {
   flex: 1;
+  min-width: 0;
 }
 
 .endpoint .row {
@@ -614,56 +713,8 @@ input[type='checkbox'] {
 }
 
 .ep-hint {
-  color: #5c6478;
+  color: var(--text-faint);
   font-size: 11px;
-}
-
-/* 「解析接口」用户承诺勾选框 */
-.ep-ack {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  margin-top: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: #14161c;
-  font-size: 12px;
-  line-height: 1.65;
-  color: #9aa3b8;
-  cursor: pointer;
-}
-
-.ep-ack input {
-  margin-top: 3px;
-  flex: none;
-}
-
-.ep-ack b {
-  color: #d6dbe6;
-}
-
-/* 还没勾选时高亮提醒，并把保存按钮挡住 */
-.ep-ack.need {
-  border-color: #4a3a1e;
-  background: #1a1710;
-  color: #d8c08a;
-}
-
-/* 分段下载连接数（夸克 / UC 专用） */
-.seg-conn {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 10px 4px 2px;
-}
-
-.seg-conn .meta {
-  white-space: nowrap;
-}
-
-.seg-conn input {
-  width: 84px;
 }
 
 .chip {
@@ -690,13 +741,54 @@ input[type='checkbox'] {
   margin: 0;
 }
 
-.badge.ok {
-  background: rgba(52, 199, 89, 0.16);
-  color: var(--ok);
-  border: 1px solid rgba(52, 199, 89, 0.35);
+/* 用户承诺勾选框：没勾时高亮，并把保存按钮挡住 */
+.ep-ack {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #14161c;
+  font-size: 12px;
+  line-height: 1.65;
+  color: #9aa3b8;
+  cursor: pointer;
 }
 
-/* ---------- scrollbar ---------- */
+.ep-ack input {
+  margin-top: 3px;
+  flex: none;
+}
+
+.ep-ack b {
+  color: #d6dbe6;
+}
+
+.ep-ack.need {
+  border-color: #4a3a1e;
+  background: #1a1710;
+  color: #d8c08a;
+}
+
+/* 分段引擎连接数 */
+.seg-conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px 0 0;
+}
+
+.seg-conn .ep-hint {
+  white-space: nowrap;
+}
+
+.seg-conn input {
+  width: 84px;
+}
+
+/* ---------- 滚动条 ---------- */
 ::-webkit-scrollbar {
   width: 9px;
   height: 9px;

@@ -8,7 +8,10 @@ const aria2 = require('./aria2')
 const seg = require('./segmentDownloader')
 
 const META_FILE = () => path.join(app.getPath('userData'), 'tasks.json')
+/** 有任务在跑时的轮询间隔 */
 const POLL_MS = 800
+/** 空闲时的轮询间隔（没人下载时没必要每 800ms 敲一次 aria2） */
+const IDLE_MS = 2500
 
 /**
  * 把 aria2 的三份列表（active/waiting/stopped）合并成 UI 用的任务数组，
@@ -21,6 +24,9 @@ class TaskManager extends EventEmitter {
     this.tasks = []
     this.timer = null
     this.running = false
+    this.stopped = false
+    /** 上一次广播出去的内容指纹：没变就不广播 */
+    this._sig = ''
     this._notifiedComplete = new Set()
     this._loadMeta()
   }
@@ -65,14 +71,25 @@ class TaskManager extends EventEmitter {
     return this.meta.get(gid) || null
   }
 
+  /**
+   * 空闲时没必要每 800ms 敲一次 aria2。用 setTimeout 自链代替 setInterval，
+   * 节奏才能跟着任务状态走：有任务在跑 800ms，没人下载 2.5s。
+   */
   start() {
     if (this.timer) return
-    this.timer = setInterval(() => this._tick().catch(() => {}), POLL_MS)
-    this._tick().catch(() => {})
+    this.stopped = false
+    const loop = async () => {
+      await this._tick().catch(() => {})
+      if (this.stopped) return
+      const busy = this.tasks.some((t) => t.status === 'active' || t.status === 'waiting')
+      this.timer = setTimeout(loop, busy ? POLL_MS : IDLE_MS)
+    }
+    loop()
   }
 
   stop() {
-    if (this.timer) clearInterval(this.timer)
+    this.stopped = true
+    if (this.timer) clearTimeout(this.timer)
     this.timer = null
   }
 
@@ -140,7 +157,16 @@ class TaskManager extends EventEmitter {
           this.emit('complete', t)
         }
       }
-      this.emit('update', all)
+
+      /* 内容没变就不广播。空闲时每 800ms 全量推一次，渲染层会白白重建一遍列表，
+       * 那点垃圾正是把内存慢慢推高的东西。 */
+      const sig = all
+        .map((t) => `${t.gid}|${t.status}|${t.completed}|${t.speed}|${t.connections || ''}|${t.route || ''}`)
+        .join('\n')
+      if (sig !== this._sig) {
+        this._sig = sig
+        this.emit('update', all)
+      }
     } finally {
       this.running = false
     }
