@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { api, formatEta, formatSize, formatSpeed } from './api'
 import type { BridgeStatus, ProxyStatus } from './api'
@@ -424,6 +424,7 @@ function SettingsModal({
 }) {
   const [s, setS] = useState<Settings>(initial)
   const [busy, setBusy] = useState(false)
+  const [saveErr, setSaveErr] = useState('')
   const [cookieKey, setCookieKey] = useState(LOGIN_TARGETS[0])
   const [loginBusy, setLoginBusy] = useState(false)
   const [loginMsg, setLoginMsg] = useState('')
@@ -437,9 +438,14 @@ function SettingsModal({
   const save = async () => {
     if (needAck) return
     setBusy(true)
+    setSaveErr('')
     try {
       onSaved(await api.setSettings(s))
       onClose()
+    } catch (e: unknown) {
+      /* 主进程会校验设置（范围、路径、令牌长度…），把它的原话显示出来，
+       * 否则用户只会看到「点了保存没反应」。 */
+      setSaveErr(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
     }
@@ -650,6 +656,11 @@ function SettingsModal({
         </div>
 
         <div className="footer">
+          {saveErr && (
+            <span className="hint err" style={{ marginRight: 'auto' }}>
+              {saveErr}
+            </span>
+          )}
           {needAck && (
             <span className="hint err" style={{ marginRight: 'auto' }}>
               请先勾选上面的「用户承诺」
@@ -831,6 +842,17 @@ export default function App() {
     return () => clearInterval(t)
   }, [aria2.running])
 
+  /* 界面上「当前这批解析结果」对应的会话 id。丢掉结果时顺手通知主进程释放缓存，
+   * 不然那些会话要在主进程里挂满 30 分钟 TTL（每个都攥着一份文件树）。 */
+  const sessionsRef = useRef<string[]>([])
+  const dropSessionsOf = useCallback((list: ParseResult[]) => {
+    const keep = list.map((x) => x.sessionId).filter(Boolean) as string[]
+    for (const id of sessionsRef.current) {
+      if (!keep.includes(id)) api.dropParseSession(id).catch(() => {})
+    }
+    sessionsRef.current = keep
+  }, [])
+
   const doParse = useCallback(async () => {
     const raw = text.trim()
     if (!raw) {
@@ -839,11 +861,13 @@ export default function App() {
     }
     setParsing(true)
     setHint({ kind: '', msg: '正在解析，请稍候…' })
+    dropSessionsOf([])
     setResults([])
     try {
       const r = await api.parseShare({ text: raw, password: pwd.trim() || undefined })
       const list = r?.results ?? []
       setResults(list)
+      dropSessionsOf(list)
       const okCount = list.filter((x) => x.ok).length
       const fileCount = list.reduce((a, x) => a + (x.ok ? x.files.length : 0), 0)
       if (okCount > 0) {
@@ -856,7 +880,7 @@ export default function App() {
     } finally {
       setParsing(false)
     }
-  }, [text, pwd])
+  }, [text, pwd, dropSessionsOf])
 
   const doDownload = useCallback(async (r: ParseResult, ids: string[]) => {
     if (!r.sessionId) return
@@ -876,6 +900,8 @@ export default function App() {
           msg: `已加入下载队列：${res.added.length} 个任务${res.errors.length ? `（${res.errors.length} 个失败）` : ''}`,
         })
         setResults((prev) => prev.filter((x) => x.sessionId !== r.sessionId))
+        api.dropParseSession(r.sessionId).catch(() => {})
+        sessionsRef.current = sessionsRef.current.filter((id) => id !== r.sessionId)
       } else {
         const msg = `提交失败：${res.errors.join('; ')}`
         setHint({ kind: 'err', msg })

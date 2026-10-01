@@ -75,7 +75,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
  * 走系统代理能到 10 MB/s（实测，见 electron/core/proxy.js 顶部注释）。
  * 本机地址（localhost/127.0.0.1/::1）永远绕过代理，否则本地测试服务器会被代理掉。
  */
-function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5, proxy = '' } = {}) {
+function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5, proxy = '', insecure = false } = {}) {
+  /* 默认按 Node 的规矩校验证书。以前这里硬编码 rejectUnauthorized:false，
+   * 等于把所有直链内容暴露给任何中间人（公共 WiFi / 系统代理都能静默换文件）；
+   * 只有用户在设置里显式勾选「忽略证书错误」才关掉。 */
+  const tls = insecure ? { rejectUnauthorized: false } : {}
   return new Promise((resolve, reject) => {
     let parsed
     try {
@@ -99,7 +103,7 @@ function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5,
       if (code >= 300 && code < 400 && res.headers.location && redirects > 0) {
         res.resume()
         const next = new URL(res.headers.location, url).toString()
-        return openStream(next, { headers, signal, timeout, redirects: redirects - 1, proxy }).then(resolve, reject)
+        return openStream(next, { headers, signal, timeout, redirects: redirects - 1, proxy, insecure }).then(resolve, reject)
       }
       resolve({ status: code, headers: res.headers, stream: res, url })
     }
@@ -119,7 +123,7 @@ function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5,
 
     if (!px) {
       const mod = parsed.protocol === 'http:' ? http : https
-      return armReq(mod.request(parsed, { method: 'GET', headers, agent: false, rejectUnauthorized: false, timeout }, onRes))
+      return armReq(mod.request(parsed, { method: 'GET', headers, agent: false, ...tls, timeout }, onRes))
     }
 
     const pxPort = Number(px.port) || (px.protocol === 'https:' ? 443 : 80)
@@ -138,7 +142,7 @@ function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5,
             path: parsed.toString(),
             headers: { ...headers, Host: parsed.host, ...(auth ? { 'Proxy-Authorization': auth } : {}) },
             agent: false,
-            rejectUnauthorized: false,
+            ...tls,
             timeout,
           },
           onRes,
@@ -154,7 +158,7 @@ function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5,
       path: target,
       headers: { Host: target, ...(auth ? { 'Proxy-Authorization': auth } : {}) },
       agent: false,
-      rejectUnauthorized: false,
+      ...tls,
       timeout,
     })
     connectReq.on('connect', (res, socket, head) => {
@@ -175,7 +179,7 @@ function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5,
           path: parsed.pathname + parsed.search,
           method: 'GET',
           headers: { ...headers, Host: parsed.host },
-          rejectUnauthorized: false,
+          ...tls,
         },
         onRes,
       )
@@ -244,6 +248,7 @@ class SegmentDownloader extends EventEmitter {
       source = '',
       knownSize = 0,
       proxy = '',
+      insecure = false,
     } = opts
     if (!url) throw new Error('缺少下载地址')
     const gid = 'seg-' + (++this._seq).toString(36) + '-' + crypto.randomBytes(4).toString('hex')
@@ -255,6 +260,8 @@ class SegmentDownloader extends EventEmitter {
       headers: { ...headers },
       /* 走不走代理由上层按设置决定（默认跟随 Windows 系统代理） */
       proxy: proxy || '',
+      /* 是否跳过证书校验（默认否，由设置里的「忽略证书错误」决定，见 main.js addResolved） */
+      insecure: !!insecure,
       /* 探测阶段选出来的实际出口：'direct' | 'proxy'（空串 = 还没探） */
       route: '',
       dir,
@@ -496,6 +503,7 @@ class SegmentDownloader extends EventEmitter {
       signal,
       timeout: 30000,
       proxy,
+      insecure: t.insecure,
     })
     const cr = String(res.headers['content-range'] || '')
     const m = /\/(\d+)\s*$/.exec(cr)
@@ -730,6 +738,7 @@ class SegmentDownloader extends EventEmitter {
           signal: ac.signal,
           timeout: 45000,
           proxy: t.proxy,
+          insecure: t.insecure,
         })
         if (res.status >= 400) {
           const body = await readAll(res.stream, 4096)

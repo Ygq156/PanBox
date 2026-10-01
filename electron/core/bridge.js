@@ -43,6 +43,9 @@ function isExtensionOrigin(origin) {
   return /^(chrome|moz|safari-web|ms-browser)-extension:\/\//i.test(String(origin || ''))
 }
 
+/* 本机回环地址的各种写法（Host 头里出现这些才算「本机来的」） */
+const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
+
 class Bridge {
   constructor() {
     this.server = null
@@ -133,14 +136,36 @@ class Bridge {
     return true
   }
 
+  /**
+   * 请求的 Host 必须是本机地址。
+   *
+   * 为什么必须有这一道：`/pair` 只靠 Origin 判断「是不是插件」，而浏览器对**同源 GET
+   * 不发 Origin**。攻击者只要把自己的域名（TTL=0）重绑到 127.0.0.1，受害者页面里的
+   * `fetch('/pair')` 就成了同源请求、不带 Origin，于是能读到配对令牌，再用它 POST /add
+   * 往下载队列里塞任意 URL —— DNS rebinding。而 Host 头是浏览器**无法伪造**的：
+   * 重绑之后请求里的 Host 仍然是 evil.com:7799（或 IP 字面量），不是 127.0.0.1/localhost。
+   */
+  _hostAllowed(req) {
+    const raw = String(req.headers.host || '').trim().toLowerCase()
+    if (!raw) return false
+    const host = raw.startsWith('[')
+      ? raw.slice(0, raw.indexOf(']') + 1) /* IPv6 字面量：[::1]:7799 */
+      : raw.split(':')[0]
+    return LOCAL_HOSTS.has(host)
+  }
+
   _cors(res, origin) {
-    /* 预检与读响应都可能来自扩展页面；扩展的 Origin 是 chrome-extension://<id>，
-     * 这里不做白名单（token 才是门），但要允许浏览器把响应交给扩展脚本。 */
-    res.setHeader('Access-Control-Allow-Origin', origin || '*')
+    /* 预检与读响应都可能来自扩展页面；扩展的 Origin 是 chrome-extension://<id>。
+     * 早期版本这里回显任意 Origin，等于给「任何网页」发了读响应的许可；现在收成白名单：
+     * 只认扩展源。本机工具（curl / 脚本）没有 Origin，浏览器也不会因为缺 ACAO 就拦它们，
+     * 所以收紧这一条不影响扩展配对与投递。 */
+    if (isExtensionOrigin(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', String(origin))
+      res.setHeader('Vary', 'Origin')
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     res.setHeader('Access-Control-Allow-Headers', 'content-type, x-panbox-token')
     res.setHeader('Access-Control-Max-Age', '600')
-    res.setHeader('Vary', 'Origin')
   }
 
   _json(res, code, obj) {
@@ -177,6 +202,13 @@ class Bridge {
     const u = new URL(req.url || '/', `http://127.0.0.1:${this.port}`)
     const p = u.pathname.replace(/\/+$/, '') || '/'
 
+    /* Host 校验放在最前面：它不是「某个端点」的防护，而是整个回环通道的准入。
+     * 先设 CORS 再判 Host，是为了让被拒的响应也能被扩展读出原因（若真出问题好排查）。 */
+    if (!this._hostAllowed(req)) {
+      this._json(res, 403, { ok: false, message: '只接受来自本机（127.0.0.1 / localhost）的请求' })
+      return
+    }
+
     if (req.method === 'OPTIONS') {
       res.writeHead(204)
       res.end()
@@ -211,7 +243,7 @@ class Bridge {
         this._json(res, 400, { ok: false, message: 'body 不是合法 JSON' })
         return
       }
-      const sent = body.token || req.headers['x-panbox-token'] || u.searchParams.get('token')
+      const sent = body.token || req.headers['x-panbox-token']
       if (!sent || !sameToken(sent, this.token)) {
         this.lastError = 'token 不匹配'
         this._json(res, 403, { ok: false, message: '配对令牌不对：请在 PanBox 的「浏览器插件」里点「重新配对」' })

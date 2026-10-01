@@ -1,6 +1,6 @@
 'use strict'
 
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron')
+const { app, BrowserWindow, ipcMain, dialog, shell, session } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 
@@ -40,6 +40,67 @@ app.commandLine.appendSwitch('no-pings')
 
 /** 下载产物文件名 -> 解析会话 id，交给下面的 recycleTransferCopy 消费 */
 const downloadsCleanup = new Map()
+/* 已经登记过的 key（以文件名为键）。同名任务（第二次下同一个文件、
+ * 或者转存出两个同名文件）以前会把 Map 里那条记录**覆盖掉**，
+ * 结果是先完成的那份转存副本永远回收不了 —— 用户网盘里白留一份。
+ * 现在同名就走 name~2、name~3 这样的备用键。 */
+const cleanupKeysBy = new Map()
+
+/** 给某个文件名分配一个还没被占用的 key（正常情况下就是文件名本身） */
+function _cleanupKeyFor(name) {
+  const k = String(name)
+  const used = cleanupKeysBy.get(k)
+  if (!used || !used.size) return k
+  let n = 2
+  while (used.has(`${k}~${n}`)) n++
+  return `${k}~${n}`
+}
+
+/** 登记「这个任务完成后要回收哪次转存」（下载创建时调用） */
+function cleanupRemember(name, sessionId) {
+  if (!sessionId) return ''
+  const k = String(name)
+  const key = _cleanupKeyFor(k)
+  downloadsCleanup.set(key, String(sessionId))
+  if (!cleanupKeysBy.has(k)) cleanupKeysBy.set(k, new Set())
+  cleanupKeysBy.get(k).add(key)
+  return key
+}
+
+/** 取出「这个文件名对应的转存会话」但**不删除**（换直链时要用它，任务还没结束） */
+function cleanupPeek(name) {
+  const k = String(name)
+  const used = cleanupKeysBy.get(k)
+  if (used) {
+    /* 从后往前：同名的多条记录里，最后登记的那条才是「这个任务」的那条 */
+    const keys = [...used]
+    for (let i = keys.length - 1; i >= 0; i--) {
+      const sid = downloadsCleanup.get(keys[i])
+      if (sid) return sid
+    }
+  }
+  return downloadsCleanup.get(k) || ''
+}
+
+/** 取出并注销（任务完成 / 用户删除任务时调用） */
+function cleanupTake(name) {
+  const k = String(name)
+  const used = cleanupKeysBy.get(k)
+  const keys = used && used.size ? [...used] : [k]
+  /* 从后往前取第一条「真的存在」的记录：同名多条时，最后登记的才是这个任务的 */
+  for (let i = keys.length - 1; i >= 0; i--) {
+    if (!downloadsCleanup.has(keys[i])) continue
+    const sid = downloadsCleanup.get(keys[i]) || ''
+    downloadsCleanup.delete(keys[i])
+    const set = cleanupKeysBy.get(k)
+    if (set) {
+      set.delete(keys[i])
+      if (!set.size) cleanupKeysBy.delete(k)
+    }
+    return sid
+  }
+  return ''
+}
 /* 有些网盘的下载需要先把文件「转存」到用户自己的网盘，取完直链再删。 */
 const { cleanupDownloaded } = parsers
 
@@ -79,6 +140,9 @@ function segConnectionsFor(cfg, netdisk) {
 /** 这几家的 aria2 并发要单独调（默认的 16 会招来 503/403） */
 const ARIA2_SPLIT_OVERRIDE = { baidu: 1, xunlei: 8 }
 
+/** shell:openPath 不允许打开的可执行/脚本类扩展名（Windows 上「打开」= 执行） */
+const OPEN_PATH_BLOCKED_EXT = /^\.(exe|com|bat|cmd|scr|pif|ps1|psm1|vbs|vbe|js|jse|wsf|wsh|msi|msp|lnk|url|reg|hta|cpl|dll|jar|sh)$/i
+
 /**
  * 回收某次下载对应的转存副本（幂等：同一名字只回收一次）。
  *
@@ -92,9 +156,8 @@ const ARIA2_SPLIT_OVERRIDE = { baidu: 1, xunlei: 8 }
  */
 async function recycleTransferCopy(name, tag) {
   const key = String(name)
-  const sid = downloadsCleanup.get(key)
+  const sid = cleanupTake(key)
   if (!sid) return false
-  downloadsCleanup.delete(key)
   try {
     const ok = await cleanupDownloaded(sid)
     boot('recycle', key, `${tag} ok=${ok}`)
@@ -164,19 +227,36 @@ function extensionDir() {
 /* 工具                                                                */
 /* ------------------------------------------------------------------ */
 
+/** Windows 保留设备名：这些名字（含带扩展名的形式）不能作为文件名 */
+const WIN_DEVICE_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i
+
 function sanitizeName(s) {
-  return String(s || '')
-    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
-    .replace(/^\.+/, '_')
-    .trim()
-    .slice(0, 180) || 'unnamed'
+  let name =
+    String(s || '')
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+      .replace(/^\.+/, '_')
+      .trim()
+      .slice(0, 180) || 'unnamed'
+  /* Windows 上文件名不能以点或空格结尾（会被静默截断，导致落盘名和任务名对不上，
+   * 后续「换直链/续传」按名字找不到文件） */
+  name = name.replace(/[. ]+$/, '')
+  if (!name) name = 'unnamed'
+  /* 设备名：NUL / CON / COM1 … 会被 Windows 当成设备，写进去等于丢弃数据 */
+  const base = name.replace(/\.[^.]*$/, '')
+  if (WIN_DEVICE_NAMES.test(base)) name = `_${name}`
+  return name
 }
 
 function buildHeaders(obj) {
   const out = []
   for (const [k, v] of Object.entries(obj || {})) {
     if (v === undefined || v === null || v === '') continue
-    out.push(`${k}: ${v}`)
+    /* 请求头是拼成字符串交给 aria2 / 自研分段的：里面有 CR/LF 就能凭空插一行
+     * 新的请求头（cookie/referer 都来自页面与接口响应，是外部输入）。 */
+    const key = String(k).replace(/[\r\n:]/g, '').trim()
+    const val = String(v).replace(/[\r\n]/g, ' ').trim()
+    if (!key) continue
+    out.push(`${key}: ${val}`)
   }
   return out
 }
@@ -208,7 +288,34 @@ async function startAria2() {
 /* 窗口                                                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 给渲染层上 CSP。以前没有任何 CSP：渲染层一旦出现注入点（比如某天有人给
+ * 任务名加了 dangerouslySetInnerHTML），脚本就能直接 fetch 外网把账号 cookie 发出去 /
+ * 用 img 打点。这里按「界面只需要自己的脚本、自己的样式、本地图片」来收紧。
+ * 只对应用自己的窗口生效：登录窗口（core/login.js）要跑网盘页面，不在这里处理。
+ */
+function applyCsp() {
+  const csp = [
+    "default-src 'self'",
+    "script-src 'self'",
+    /* React 的行内 style 属性（进度条宽度）需要 unsafe-inline */
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self' data:",
+    /* 界面只通过 IPC 跟主进程说话，不需要任何网络出口 */
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join('; ')
+  session.defaultSession.webRequest.onHeadersReceived((details, cb) => {
+    cb({ responseHeaders: { ...(details.responseHeaders || {}), 'Content-Security-Policy': [csp] } })
+  })
+}
+
 function createWindow() {
+  applyCsp()
   win = new BrowserWindow({
     width: 1120,
     height: 740,
@@ -223,11 +330,28 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      /* 界面里没有 <webview>，关掉可以少一类「渲染层加载任意页面」的入口 */
+      webviewTag: false,
     },
   })
   win.once('ready-to-show', () => win.show())
   win.on('closed', () => {
     win = null
+  })
+
+  /* 导航管控：界面是单页应用，任何「整页跳转」都不是正常行为
+   * （任务列表里的链接都是走主进程/系统浏览器）。外链一律拦下并交给系统浏览器，
+   * 其余跳转直接拒绝，避免渲染层被导航到一个外部页面后继承 preload 的能力。 */
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch(() => {})
+    return { action: 'deny' }
+  })
+  win.webContents.on('will-navigate', (e, url) => {
+    const devUrl = isDev ? process.env.PANBOX_DEV_URL : ''
+    if (devUrl && url.startsWith(devUrl)) return
+    if (url.startsWith('file://')) return
+    e.preventDefault()
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url).catch(() => {})
   })
 
   const devUrl = process.env.PANBOX_DEV_URL
@@ -279,7 +403,8 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
       'max-connection-per-server': String(split),
       'min-split-size': cfg.minSplitSize,
       'user-agent': cfg.userAgent,
-      'check-certificate': 'false',
+      /* 默认必须校验证书（false = 校验）。用户显式勾了「忽略证书错误」才关。 */
+      'check-certificate': cfg.ignoreCert ? 'false' : 'true',
     }
     const header = buildHeaders(f.headers)
     if (header.length) options.header = header
@@ -303,6 +428,7 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
             netdisk,
             source,
             proxy: useProxy,
+            insecure: !!cfg.ignoreCert,
           })
           engine = 'seg'
         } catch (e) {
@@ -334,8 +460,9 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
         },
       })
       /* 夸克/UC 是「转存→取直链」，用户网盘里会多一份拷贝；登记下来，
-       * 等这个任务 complete 时回收（见下面的 tasks.on('update')）。 */
-      if (sessionId) downloadsCleanup.set(String(f.name), sessionId)
+       * 等这个任务 complete 时回收（见下面的 tasks.on('update')）。
+       * 用 cleanupRemember 而不是直接 set：同名任务不会互相覆盖记录。 */
+      cleanupRemember(f.name, sessionId)
       added.push(gid)
     } catch (e) {
       errors.push(`${f.name}: ${e && e.message ? e.message : e}`)
@@ -430,11 +557,20 @@ function bridgeInfo() {
 }
 
 function registerIpc() {
-  ipcMain.handle('settings:get', () => settings.load())
+  /* 渲染层拿到的是脱敏副本：cookies 逐键打码（回传时打码串 = 保持原值，见 settings.js）。
+   * 这样即便渲染层被注入脚本，也读不到百度 BDUSS / 夸克 __puus / 迅雷 access_token 原文。 */
+  ipcMain.handle('settings:get', () => settings.forRenderer(settings.load()))
 
   ipcMain.handle('settings:set', async (_e, partial) => {
     const before = settings.load()
-    const after = settings.save(partial || {})
+    /* 白名单 + 类型/范围校验：渲染层只能改用户在设置页本来就能改的东西。
+     * 想换配对令牌请走 bridge:newToken，这里不接受短令牌/空令牌。 */
+    const checked = settings.sanitizePatch(partial || {})
+    if (!checked.ok) throw new Error(checked.message)
+    const patch = checked.value
+    /* cookies 单独合并：打码串（用户没动那一格）保留旧值，空串清除，其它为新值 */
+    if (patch.cookies) patch.cookies = settings.mergeCookies(patch.cookies, before.cookies)
+    const after = settings.save(patch || {})
     try {
       fs.mkdirSync(after.downloadDir, { recursive: true })
     } catch {
@@ -510,8 +646,19 @@ function registerIpc() {
     return r.canceled || !r.filePaths.length ? null : r.filePaths[0]
   })
 
+  /* 打开目录/文件。这个通道以前把渲染层给的任意字符串直接交给 shell.openPath ——
+   * 在 Windows 上打开一个 .exe/.bat/.lnk 就是**执行程序**，等于给渲染层一个任意代码执行入口。
+   * 现在只允许「下载目录之内」的路径，并挡掉可执行/脚本类扩展名。 */
   ipcMain.handle('shell:openPath', async (_e, p) => {
-    const dir = p || settings.load().downloadDir
+    const root = path.resolve(settings.load().downloadDir)
+    const dir = p ? path.resolve(String(p)) : root
+    const rel = path.relative(root, dir)
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error('只能打开下载目录里的内容')
+    }
+    if (OPEN_PATH_BLOCKED_EXT.test(path.extname(dir))) {
+      throw new Error('出于安全考虑，不打开可执行文件')
+    }
     try {
       fs.mkdirSync(dir, { recursive: true })
     } catch {
@@ -633,6 +780,11 @@ function registerIpc() {
   })
 
   ipcMain.handle('downloads:list', () => tasks.list())
+  /* 渲染层丢掉一条解析结果时，顺手把主进程里那份会话缓存也丢掉（否则要等 30 分钟 TTL）。 */
+  ipcMain.handle('parse:drop', (_e, sessionId) => {
+    if (sessionId) parsers.dropSession(String(sessionId))
+    return true
+  })
   ipcMain.handle('downloads:pause', (_e, gid) =>
     (isSegTask(gid) ? seg.pause(gid) : aria2.pause(gid)).then(() => true).catch(() => false),
   )
@@ -701,7 +853,7 @@ function registerIpc() {
         await aria2.removeDownloadResult(gid).catch(() => {})
       }
       tasks.forget(gid)
-      downloadsCleanup.delete(String(o.name))
+      cleanupTake(o.name)
       let ngid = ''
       let nengine = 'aria2'
       if (o.engine === 'seg') {
@@ -733,7 +885,7 @@ function registerIpc() {
         engine: nengine,
         origin: { ...o, engine: nengine },
       })
-      if (newSession) downloadsCleanup.set(String(o.name), newSession)
+      if (newSession) cleanupRemember(o.name, newSession)
       await tasks._tick().catch(() => {})
       boot('refresh', o.name, `re-add ok gid=${ngid} engine=${nengine} was=${st ? st.status : 'gone'} live=${!!live}`)
       return { ok: true, gid: ngid, message: '已用新的下载地址重新加入队列（会从断点接着下）' }
@@ -863,10 +1015,9 @@ if (!gotLock) {
       const sids = new Set()
       for (const t of tasks.list()) {
         if (!t || t.status !== 'complete') continue
-        const sid = downloadsCleanup.get(String(t.name))
+        const sid = cleanupTake(String(t.name))
         if (sid) {
           sids.add(sid)
-          downloadsCleanup.delete(String(t.name))
         }
       }
       if (sids.size) {
