@@ -28,6 +28,10 @@ const DEFAULTS = () => ({
   cookies: {},
   aria2Port: 6800,
   openFolderWhenDone: false,
+  /* 点右上角 × 之后留在后台继续跑（窗口隐藏到托盘）。
+   * 默认开：PanBox 的下载主力是 aria2 与自研分段引擎，关掉窗口不该把下载掐死，
+   * 浏览器插件的本地通道也要一直在。真正退出走托盘菜单的「退出」。 */
+  closeToTray: true,
   /* 用户自备的「网盘解析接口」（见 electron/parsers/custom.js 顶部注释）。
    * 默认空 —— 程序不内置、也不推荐任何具体解析站。 */
   parseEndpoints: [],
@@ -154,6 +158,7 @@ function sanitizePatch(patch) {
     if ('userAgent' in patch) out.userAgent = str(patch.userAgent, 512, 'User-Agent')
     if ('aria2Port' in patch) out.aria2Port = int(patch.aria2Port, 1024, 65535, 'aria2 端口')
     if ('openFolderWhenDone' in patch) out.openFolderWhenDone = bool(patch.openFolderWhenDone, '完成后打开目录')
+    if ('closeToTray' in patch) out.closeToTray = bool(patch.closeToTray, '关闭到后台')
     if ('ignoreCert' in patch) out.ignoreCert = bool(patch.ignoreCert, '忽略证书错误')
     if ('endpointAck' in patch) out.endpointAck = bool(patch.endpointAck, '解析接口承诺')
     if ('baiduConnections' in patch) out.baiduConnections = int(patch.baiduConnections, 1, 16, '百度连接数')

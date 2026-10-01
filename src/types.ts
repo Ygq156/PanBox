@@ -119,6 +119,11 @@ export interface Settings {
   aria2Port: number
   /** 完成后是否自动打开下载目录 */
   openFolderWhenDone: boolean
+  /**
+   * 点右上角 × 之后是否留在后台（收进托盘）继续下载。默认开。
+   * 关掉后恢复「关窗口即退出」的老行为。
+   */
+  closeToTray?: boolean
   /** 用户自备的网盘解析接口，优先于内置解析 */
   parseEndpoints: ParseEndpoint[]
   /**
