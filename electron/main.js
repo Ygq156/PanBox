@@ -11,6 +11,7 @@ const tasks = require('./core/taskManager')
 const parsers = require('./parsers')
 const login = require('./core/login')
 const bridge = require('./core/bridge')
+const proxy = require('./core/proxy')
 const { detectNetdisk } = require('./parsers/util')
 
 /** 下载产物文件名 -> 解析会话 id，交给下面的 recycleTransferCopy 消费 */
@@ -159,6 +160,9 @@ function buildHeaders(obj) {
 
 async function startAria2() {
   const cfg = settings.load()
+  /* 代理每次启动都重新算（设置可能刚改过，系统代理也可能刚换） */
+  cfg.proxy = proxy.effective(cfg)
+  boot('proxy', cfg.proxy ? 'using ' + cfg.proxy : '(direct)')
   aria2.setOptions({ exePath: aria2ExePath(), port: cfg.aria2Port })
   try {
     const v = await aria2.start(cfg)
@@ -249,6 +253,11 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
     }
     const header = buildHeaders(f.headers)
     if (header.length) options.header = header
+    /* 代理只给「普通直链」用。为什么不给网盘 CDN：那些直链可能是按 IP 授权的，
+     * 而解析请求走的是本机直连（undici 不读系统代理），换出口 IP 有被拒的风险。
+     * 用户报的 GitHub 慢恰好就是 direct，所以这样已经解决问题。 */
+    const useProxy = netdisk === 'direct' ? proxy.effective(cfg) : ''
+    if (useProxy) options['all-proxy'] = useProxy
     const segConns = perEndpoint ? 0 : segConnectionsFor(cfg, netdisk)
     try {
       let gid = ''
@@ -263,6 +272,7 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
             connections: segConns,
             netdisk,
             source,
+            proxy: useProxy,
           })
           engine = 'seg'
         } catch (e) {
@@ -400,7 +410,12 @@ function registerIpc() {
     } catch {
       /* ignore */
     }
-    if (String(after.aria2Port) !== String(before.aria2Port)) {
+    /* 代理是 aria2 的**命令行参数**，改不了运行时（changeGlobalOption 不支持 all-proxy），
+     * 所以只要代理设置变了就得重启 aria2 子进程。 */
+    const proxyChanged =
+      String(after.proxyMode) !== String(before.proxyMode) || String(after.proxy) !== String(before.proxy)
+    if (String(after.aria2Port) !== String(before.aria2Port) || proxyChanged) {
+      if (proxyChanged) proxy.clearCache()
       await startAria2()
     } else {
       await aria2
@@ -442,6 +457,18 @@ function registerIpc() {
     settings.save({ bridgeToken: bridge.ensureToken('') })
     await startBridge()
     return bridgeInfo()
+  })
+
+  /* 设置页要显示「系统代理是多少、当前实际用哪个」。每次现读一遍注册表（fresh=true），
+   * 因为用户可能刚在 Clash 里改了端口。 */
+  ipcMain.handle('proxy:status', async () => {
+    const cfg = settings.load()
+    return {
+      mode: cfg.proxyMode || 'auto',
+      system: proxy.systemProxy({ fresh: true }),
+      custom: cfg.proxy || '',
+      effective: proxy.effective(cfg),
+    }
   })
 
   ipcMain.handle('dialog:pickDir', async () => {
@@ -662,6 +689,7 @@ function registerIpc() {
             connections: segConnectionsFor(settings.load(), o.netdisk) || 96,
             netdisk: o.netdisk,
             source: o.source,
+            proxy: o.netdisk === 'direct' ? proxy.effective(settings.load()) : '',
           })
           nengine = 'seg'
         } catch (e) {

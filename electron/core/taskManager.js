@@ -88,6 +88,8 @@ class TaskManager extends EventEmitter {
       netdisk: m.netdisk || 'unknown',
       /** 哪个引擎在跑：'aria2' | 'seg'。暂停/继续/移除要按它路由 */
       engine: m.engine || (String(st.gid).startsWith('seg-') ? 'seg' : 'aria2'),
+      /** 实际出口：'direct' | 'proxy'（分段引擎探测完才知道；aria2 任务不带这个字段） */
+      route: st.route || '',
       source: m.source,
       dir: st.dir || '',
       total,

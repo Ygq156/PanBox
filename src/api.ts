@@ -38,6 +38,16 @@ export interface BridgeStatus {
   extExists: boolean
 }
 
+export interface ProxyStatus {
+  mode: 'auto' | 'off' | 'custom'
+  /** Windows 系统里读到的代理（'' = 系统没开代理） */
+  system: string
+  /** 设置里手填的那个 */
+  custom: string
+  /** 最终会用的那个（'' = 直连） */
+  effective: string
+}
+
 export interface PanboxAPI {
   parseShare(p: ParsePayload): Promise<ParseResponse>
   listDownloads(): Promise<DownloadTask[]>
@@ -60,6 +70,7 @@ export interface PanboxAPI {
   bridgeStart(): Promise<BridgeStatus>
   bridgeOpenFolder(): Promise<{ ok: boolean; dir: string; message: string }>
   bridgeNewToken(): Promise<BridgeStatus>
+  proxyStatus(): Promise<ProxyStatus>
   onDownloadsUpdate(cb: (tasks: DownloadTask[]) => void): () => void
   onBridgePrefill(cb: (data: { url: string; netdisk: string }) => void): () => void
 }

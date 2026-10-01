@@ -77,6 +77,8 @@ export interface DownloadTask {
   filesize?: number
   /** 哪个引擎在跑：'aria2' 或 'seg'（自研分段下载器） */
   engine?: 'aria2' | 'seg'
+  /** 实际出口：'direct' 直连 / 'proxy' 走系统代理（分段引擎探测后才知道） */
+  route?: 'direct' | 'proxy' | ''
 }
 
 /**
@@ -138,6 +140,12 @@ export interface Settings {
   bridgeEnabled?: boolean
   bridgePort?: number
   bridgeToken?: string
+  /**
+   * 代理。默认 `auto` = 跟随 Windows 系统代理（WinINET）。
+   * 实测 GitHub 这类资源裸连 0 B/s、走系统代理 10 MB/s，所以别轻易改成 off。
+   */
+  proxyMode?: 'auto' | 'off' | 'custom'
+  proxy?: string
 }
 
 export interface Aria2Status {
