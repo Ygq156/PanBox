@@ -38,11 +38,13 @@ const DEFAULTS = () => ({
   // 「解析接口」的用户承诺开关：默认关，必须在设置页勾选后才允许保存启用中的接口
   endpointAck: false,
   /* 自研分段下载器的连接数（按网盘）。
-   * 为什么需要它：夸克/UC 的 CDN 是**按每条 TCP 连接**发额度的（实测夸克 ≈50KB/s/连接、
-   * UC ≈64KB/s/连接），而 aria2 的 `--max-connection-per-server` 上限只有 16，
+   * 为什么需要它：夸克/UC 的 CDN 是**按每条 TCP 连接**发额度的（实测夸克 36~51KB/s/连接、
+   * UC 单条就有 480KB/s），而 aria2 的 `--max-connection-per-server` 上限只有 16，
    * 于是被钉死在 16 × 0.05 ≈ 0.8 MB/s。这个引擎自己开连接，不受那个上限约束。
+   * 夸克给 192：实测 96 条 = 4.08MB/s、192 条 = 7.54MB/s（1.85×，两轮 60s 稳定复现）。
+   * UC 保持 96：实测 96 条 = 10.93MB/s、192 条 = 10.91MB/s（1.00×，96 条已跑满线路）。
    * 百度不在此表 —— 它是**账号级总量**限速，加连接只会招致 403（实测 16/24 连接直接 403）。 */
-  segConnections: { quark: 96, uc: 96, direct: 128 },
+  segConnections: { quark: 192, uc: 96, direct: 128 },
   /* 百度走 aria2，连接数单独一个开关。默认 1 = 只吃账号本来的额度、不招惹惩罚性限速；
    * 超级会员可以往上调（油小猴那类脚本也是「建议开通超级会员后使用」，道理一样）。 */
   baiduConnections: 1,
@@ -62,6 +64,14 @@ const DEFAULTS = () => ({
   bridgePort: 7799,
   bridgeToken: '',
 })
+
+/* 配置版本号：用于「把旧版本写进去的默认值跟上新默认值」这种一次性迁移。
+ * 0.6.6 及更早写出的 settings.json 没有这个字段（视作 0）。 */
+const SETTINGS_REV = 1
+
+/* 只按「旧默认值」迁移，判据刻意收得很窄：用户手动改过的任何一位都不匹配，原样保留。
+ * segConnections.quark：0.6.7 之前的默认是 96，实测 192 快 1.85×，跟着新默认走。 */
+const LEGACY_DEFAULTS = [{ key: 'segConnections', values: { quark: 96 } }]
 
 let cache = null
 
@@ -240,16 +250,29 @@ function load() {
   try {
     if (fs.existsSync(FILE())) {
       const raw = JSON.parse(fs.readFileSync(FILE(), 'utf8'))
+      /* segConnections 必须按 key 合并：老用户的这份配置是在 direct 这一项存在之前存的，
+       * 整表覆盖会让 direct 掉成 0，直链于是退回 aria2 的 16 线程。 */
+      const seg = { ...base.segConnections, ...(raw.segConnections || {}) }
+      const rev = Number(raw.settingsRev || 0)
+      const migrated = rev < SETTINGS_REV
+      if (migrated) {
+        for (const m of LEGACY_DEFAULTS) {
+          if (m.key !== 'segConnections') continue
+          for (const [k, v] of Object.entries(m.values)) {
+            if (seg[k] === v) seg[k] = base.segConnections[k]
+          }
+        }
+      }
       cache = {
         ...base,
         ...raw,
+        settingsRev: SETTINGS_REV,
         cookies: { ...base.cookies, ...(raw.cookies || {}) },
-        /* segConnections 必须按 key 合并：老用户的这份配置是在 direct 这一项存在之前存的，
-         * 整表覆盖会让 direct 掉成 0，直链于是退回 aria2 的 16 线程。 */
-        segConnections: { ...base.segConnections, ...(raw.segConnections || {}) },
+        segConnections: seg,
       }
+      if (migrated) save({}) /* 落盘一次，之后不再重复判断（用户再改回 96 也不会被覆盖） */
     } else {
-      cache = base
+      cache = { ...base, settingsRev: SETTINGS_REV }
     }
   } catch {
     cache = base

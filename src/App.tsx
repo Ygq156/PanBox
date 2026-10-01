@@ -37,8 +37,7 @@ const EP_NETDISKS = ['lanzou', 'ilanzou', 'quark', 'uc', 'baidu', 'xunlei', '123
 /** 解析成功后，结果面板底下的一句话提示（原来每个网盘一段 if，现在一张表） */
 const NETDISK_TIP: Record<string, { warn?: boolean; text: string }> = {
   quark: {
-    warn: true,
-    text: '夸克这条下载通道按「账号」总量限速，多开连接基本没用。大文件想更快只能用夸克官方客户端的「快传 → 发送网盘文件 → 下载到本地」。',
+    text: '夸克按「每条连接」发额度（单条约 50KB/s），已交给自带的分段引擎多连接下载，连接越多越快。',
   },
   uc: { text: 'UC 按每条连接发额度，已交给自带的分段引擎多连接下载。' },
   xunlei: { text: '走「转存到你的迅雷云盘 → 取直链」，下载完成后会自动删掉转存副本。' },
