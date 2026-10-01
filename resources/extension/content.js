@@ -17,6 +17,9 @@
  *   4. **入口永远在**（v1.1.1 的教训）：✕ 只是「这一会儿先收起来」，不是永久关闭；
  *      一旦发现新的可下载内容、或者页面换了（SPA 换视频 / 换页），它自己会回来。
  *      想彻底关掉去插件弹窗里取消勾选。
+ *   5. **位置随用户**（v1.1.2）：收起态的按钮和展开后的标题栏都能按住拖动，位置存进
+ *      chrome.storage.local.panelPos，换页 / 刷新 / 重开浏览器都还在。以前 .wrap 自己是
+ *      position:fixed，改 host 的 left/top 根本挪不动它 —— 看着能拖其实钉死在左上角。
  */
 
 ;(function () {
@@ -245,17 +248,18 @@
 :host { all: initial; }
 * { box-sizing: border-box; }
 .wrap {
-  position: fixed; left: 12px; top: 12px; z-index: 2147483647;
+  position: relative; z-index: 2147483647;
   font: 12px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   color: #e6e9ef; user-select: none;
 }
 .pill {
-  display: flex; align-items: center; gap: 6px; cursor: pointer;
+  display: flex; align-items: center; gap: 6px; cursor: grab;
   background: linear-gradient(180deg, #2b3550, #1b2130);
   border: 1px solid #3a4560;
   border-radius: 999px; padding: 4px 10px 4px 8px;
   box-shadow: 0 4px 14px rgba(0,0,0,.45);
 }
+.pill.dragging { cursor: grabbing; }
 .pill:hover { border-color: #4c8dff; }
 .pill .n { font-weight: 700; color: #8fb6ff; }
 .pill .ico { width: 12px; height: 12px; display: block; }
@@ -320,7 +324,10 @@
   function buildUi() {
     const host = document.createElement('div')
     host.id = '__panbox_panel_host'
-    host.style.cssText = 'all: initial; position: fixed; z-index: 2147483647;'
+    /* 位置只由 host 决定（.wrap 是 position:relative）——
+     * 以前 .wrap 自己也是 position:fixed，于是 host.style.left/top 根本挪不动它，
+     * 面板/按钮看着能拖其实钉在左上角。 */
+    host.style.cssText = 'all: initial; position: fixed; left: 12px; top: 12px; z-index: 2147483647;'
     const root = host.attachShadow({ mode: 'open' })
     const st = document.createElement('style')
     st.textContent = CSS
@@ -329,7 +336,7 @@
     const wrap = document.createElement('div')
     wrap.className = 'wrap'
     wrap.innerHTML =
-      '<div class="pill" part="pill">' +
+      '<div class="pill" part="pill" title="按住可以拖到别处；点一下展开面板">' +
       ICON +
       '<span><span class="n">0</span> 个文件</span>' +
       '<span class="x" title="暂时收起（发现新内容或页面切换后会自动再出现；想永久关掉请点插件图标）">✕</span>' +
@@ -429,9 +436,9 @@
     function bind() {
       ui.pill.addEventListener('click', (e) => {
         if (e.target.classList.contains('x')) return
-        open = !open
-        ui.card.hidden = !open
-        if (open) refresh(true)
+        /* 拖动结束时浏览器还会补一个 click，别把它当成「点开面板」 */
+        if (Date.now() < suppressClickUntil) return
+        toggleCard()
       })
       /* ✕ = 这一会儿先收起来，不是永久关闭。
        * 以前这里往 storage 写 panelHidden:true，用户点一次面板就再也不出现（被投诉过）。 */
@@ -450,7 +457,10 @@
       })
       ui.refresh.addEventListener('click', () => refresh(true, { dom: true }))
       ui.sendAll.addEventListener('click', () => sendItems(items, true))
+      /* 标题栏与那个收起状态的小按钮都能拖 —— 用户点名说「按钮没办法挪动」 */
       ui.head.addEventListener('pointerdown', startDrag)
+      ui.pill.addEventListener('pointerdown', startDrag)
+      window.addEventListener('resize', keepInView)
       ui.list.addEventListener('click', (e) => {
         const btn = e.target.closest('button[data-url]')
         if (!btn) return
@@ -459,39 +469,85 @@
       })
     }
 
-    /* ---- 位置：默认左上角，可拖动，记进 storage ---- */
+    /* ---- 位置：默认左上角，pill（收起态的小按钮）与面板标题栏都能拖，位置记进 storage ---- */
     let drag = null
-    function startDrag(e) {
-      if (e.target.closest('button')) return
-      const r = ui.wrap ? ui.wrap.getBoundingClientRect() : e.currentTarget.getBoundingClientRect()
-      drag = { dx: e.clientX - r.left, dy: e.clientY - r.top, moved: false }
-      ui.host.style.left = r.left + 'px'
-      ui.host.style.top = r.top + 'px'
+    let suppressClickUntil = 0
+
+    function toggleCard() {
+      open = !open
+      ui.card.hidden = !open
+      if (open) refresh(true)
+    }
+    function setHostPos(x, y) {
+      ui.host.style.left = Math.round(x) + 'px'
+      ui.host.style.top = Math.round(y) + 'px'
       ui.host.style.right = 'auto'
+      ui.host.style.bottom = 'auto'
+    }
+    function clampPos(x, y, w, h) {
+      const maxX = Math.max(0, window.innerWidth - w)
+      const maxY = Math.max(0, window.innerHeight - h)
+      return [Math.min(Math.max(0, x), maxX), Math.min(Math.max(0, y), maxY)]
+    }
+    /* 窗口变小 / 换显示器后，别把面板留在屏幕外 */
+    function keepInView() {
+      if (!ui || !ui.host.isConnected) return
+      const r = ui.host.getBoundingClientRect()
+      const [x, y] = clampPos(r.left, r.top, Math.min(r.width, window.innerWidth), Math.min(r.height, window.innerHeight))
+      setHostPos(x, y)
+    }
+    function startDrag(e) {
+      if (e.button !== 0) return
+      if (e.target.closest && e.target.closest('button')) return
+      if (e.target.classList && e.target.classList.contains('x')) return /* ✕ 是「临时收起」，不是拖拽把手 */
+      const box = (ui.card.hidden ? ui.pill : ui.host).getBoundingClientRect()
+      drag = {
+        dx: e.clientX - box.left,
+        dy: e.clientY - box.top,
+        sx: e.clientX,
+        sy: e.clientY,
+        w: box.width,
+        h: box.height,
+        moved: false,
+        /* pill = 点一下开合面板，所以「没移动」要当成点击；标题栏只管拖 */
+        toggle: e.currentTarget === ui.pill,
+      }
       window.addEventListener('pointermove', onDrag, true)
       window.addEventListener('pointerup', endDrag, true)
-      e.preventDefault()
+      window.addEventListener('pointercancel', endDrag, true)
     }
     function onDrag(e) {
       if (!drag) return
-      drag.moved = true
-      const w = ui.host.getBoundingClientRect()
-      const x = Math.max(0, Math.min(window.innerWidth - Math.min(w.width, 60), e.clientX - drag.dx))
-      const y = Math.max(0, Math.min(window.innerHeight - 24, e.clientY - drag.dy))
-      ui.host.style.left = x + 'px'
-      ui.host.style.top = y + 'px'
+      /* 3px 以内当作手抖，仍然算点击 */
+      if (!drag.moved && Math.abs(e.clientX - drag.sx) < 3 && Math.abs(e.clientY - drag.sy) < 3) return
+      if (!drag.moved) {
+        drag.moved = true
+        ui.pill.classList.add('dragging')
+      }
+      const [x, y] = clampPos(e.clientX - drag.dx, e.clientY - drag.dy, drag.w, drag.h)
+      setHostPos(x, y)
+      e.preventDefault()
     }
     function endDrag() {
       window.removeEventListener('pointermove', onDrag, true)
       window.removeEventListener('pointerup', endDrag, true)
-      if (drag && drag.moved) {
+      window.removeEventListener('pointercancel', endDrag, true)
+      const d = drag
+      drag = null
+      ui.pill.classList.remove('dragging')
+      if (!d) return
+      if (d.moved) {
         try {
           chrome.storage.local.set({ panelPos: { left: ui.host.style.left, top: ui.host.style.top } })
         } catch {
           /* ignore */
         }
+        /* 拖完浏览器会补一个 click，别让它顺手把面板也打开/关掉 */
+        suppressClickUntil = Date.now() + 500
+      } else if (d.toggle) {
+        suppressClickUntil = Date.now() + 500
+        toggleCard() /* 点一下 = 开合面板（click 处理器会被上面的时间戳挡住） */
       }
-      drag = null
     }
 
     /* ---- 渲染 ---- */
@@ -650,8 +706,11 @@
       globalOff = got.panel === false
       ensure()
       if (got.panelPos && got.panelPos.left) {
-        ui.host.style.left = got.panelPos.left
-        ui.host.style.top = got.panelPos.top
+        const px = parseFloat(got.panelPos.left)
+        const py = parseFloat(got.panelPos.top)
+        const r = ui.pill.getBoundingClientRect()
+        const [x, y] = clampPos(px || 12, py || 12, r.width || 90, r.height || 24)
+        setHostPos(x, y)
       }
       refresh(false, { dom: true })
     })

@@ -52,6 +52,11 @@ $('panel').addEventListener('change', async (e) => {
   refresh()
 })
 
+$('resetPos').addEventListener('click', async () => {
+  await chrome.storage.local.set({ panelPos: null })
+  say('已重置：刷新页面后悬浮按钮回到左上角', 'ok')
+})
+
 $('port').addEventListener('change', async (e) => {
   await ask({ type: 'set', port: e.target.value })
   say('端口已改成 ' + e.target.value, 'ok')

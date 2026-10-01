@@ -124,6 +124,12 @@ export interface Settings {
    * 关掉后恢复「关窗口即退出」的老行为。
    */
   closeToTray?: boolean
+  /** 启动后查一次有没有新版本（只提示 + 打开下载页，不做静默自动更新）。默认开。 */
+  autoCheckUpdate?: boolean
+  /** 开机自启动（写 Windows 登录项，启动时收在托盘里）。默认关。 */
+  autoStart?: boolean
+  /** 开机自启动时要不要顺手打开主窗口。默认关（静静地待在托盘里）。 */
+  startupShowWindow?: boolean
   /** 用户自备的网盘解析接口，优先于内置解析 */
   parseEndpoints: ParseEndpoint[]
   /**
@@ -154,6 +160,11 @@ export interface Settings {
    */
   proxyMode?: 'auto' | 'off' | 'custom'
   proxy?: string
+  /**
+   * 忽略证书错误。默认**关**：打开后公共 WiFi 或系统代理里的中间人能静默替换下载内容。
+   * 只有确实遇到自签 / 过期的网盘 CDN 时才打开（见设置页「网络 → 证书」）。
+   */
+  ignoreCert?: boolean
 }
 
 export interface Aria2Status {

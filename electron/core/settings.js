@@ -63,6 +63,14 @@ const DEFAULTS = () => ({
   bridgeEnabled: true,
   bridgePort: 7799,
   bridgeToken: '',
+  /* 启动后查一次有没有新版本（匿名 GET GitHub Releases 的公开接口，不带任何本机信息）。
+   * 只提示 + 打开下载页，**不做静默自动更新**：装不装、什么时候装由用户自己决定。 */
+  autoCheckUpdate: true,
+  /* 开机自启动（写 Windows 的登录项）。启动时带 --startup 参数 = 直接收到托盘，不弹主窗口。 */
+  autoStart: false,
+  /* 开机自启动时要不要顺手把主窗口也打开。默认**不**：登录后自己弹窗很打扰，
+   * 收在托盘里该下的任务照下（配合 closeToTray）。 */
+  startupShowWindow: false,
 })
 
 /* 配置版本号：用于「把旧版本写进去的默认值跟上新默认值」这种一次性迁移。
@@ -169,6 +177,9 @@ function sanitizePatch(patch) {
     if ('aria2Port' in patch) out.aria2Port = int(patch.aria2Port, 1024, 65535, 'aria2 端口')
     if ('openFolderWhenDone' in patch) out.openFolderWhenDone = bool(patch.openFolderWhenDone, '完成后打开目录')
     if ('closeToTray' in patch) out.closeToTray = bool(patch.closeToTray, '关闭到后台')
+    if ('autoCheckUpdate' in patch) out.autoCheckUpdate = bool(patch.autoCheckUpdate, '自动检查更新')
+    if ('autoStart' in patch) out.autoStart = bool(patch.autoStart, '开机自启动')
+    if ('startupShowWindow' in patch) out.startupShowWindow = bool(patch.startupShowWindow, '启动时显示窗口')
     if ('ignoreCert' in patch) out.ignoreCert = bool(patch.ignoreCert, '忽略证书错误')
     if ('endpointAck' in patch) out.endpointAck = bool(patch.endpointAck, '解析接口承诺')
     if ('baiduConnections' in patch) out.baiduConnections = int(patch.baiduConnections, 1, 16, '百度连接数')
@@ -300,10 +311,27 @@ function save(partial) {
   return next
 }
 
+/**
+ * 「恢复默认设置」用：把可重置项换回默认值。
+ * 刻意保留三样东西 —— 登录凭证（cookies）、用户自备的解析接口、以及那条用户承诺，
+ * 否则点一下红按钮就得把四个网盘重新登一遍，这种「恢复默认」没人敢按。
+ */
+function resetDefaults() {
+  const cur = load()
+  return save({
+    ...DEFAULTS(),
+    cookies: cur.cookies,
+    parseEndpoints: cur.parseEndpoints,
+    endpointAck: cur.endpointAck,
+    settingsRev: SETTINGS_REV,
+  })
+}
+
 module.exports = {
   load,
   save,
   defaultDownloadDir,
+  resetDefaults,
   /* 渲染层脱敏 / 入参校验（IPC 用，见 electron/main.js 的 settings:get / settings:set） */
   forRenderer,
   sanitizePatch,
