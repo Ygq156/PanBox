@@ -7,13 +7,16 @@
  * 上面写着「N 个文件」；点开就是这一页能下的东西（正在播的视频、页面里的文件链接、
  * 以及浏览器实际发出去过的媒体请求），点条目直接交给本机 PanBox。
  *
- * 三条实现原则：
+ * 四条实现原则：
  *   1. 只读页面，不改页面。所有 DOM 都塞进一个 Shadow DOM 里，绝不污染站点样式；
  *      任何一步出错都静默吞掉，宁可面板不出现，也不能让页面崩。
  *   2. 只有顶层框架画面板（iframe 里的视频会被子框架上报给后台脚本汇总），
  *      否则一个页面里会浮出好几个一模一样的按钮。
  *   3. blob: / data: 的媒体下不了 —— 那是页面用 MSE 自己喂给 <video> 的流，
  *      地址离开这个页面就不存在。面板会如实标出来，不假装能下。
+ *   4. **入口永远在**（v1.1.1 的教训）：✕ 只是「这一会儿先收起来」，不是永久关闭；
+ *      一旦发现新的可下载内容、或者页面换了（SPA 换视频 / 换页），它自己会回来。
+ *      想彻底关掉去插件弹窗里取消勾选。
  */
 
 ;(function () {
@@ -43,6 +46,31 @@
     })
   }
 
+  function storageGet(defs) {
+    return new Promise((resolve) => {
+      try {
+        chrome.storage.local.get(defs, (got) => {
+          void chrome.runtime.lastError
+          resolve(got || defs)
+        })
+      } catch {
+        resolve(defs)
+      }
+    })
+  }
+
+  function storageRemove(key) {
+    try {
+      chrome.storage.local.remove(key)
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /* v1.1.0 的 ✕ 会写 panelHidden:true 造成「关了就再也不出现」。
+   * 语义已经改成「临时收起」，这个键作废，见到就清掉，免得老用户升级后被它永久压住。 */
+  storageRemove('panelHidden')
+
   const MEDIA_EXT =
     /\.(mp4|m4v|mkv|webm|flv|mov|avi|wmv|ts|m4s|m3u8|mpd|mp3|m4a|flac|wav|aac|ogg|opus|ape|wma)(?:$|[?#])/i
   const FILE_EXT =
@@ -63,10 +91,13 @@
     return /^https?:/i.test(u || '')
   }
 
-  function kindOf(url) {
-    const e = extOf(url)
+  function kindOf(url, ct) {
+    const c = String(ct || '')
     if (STREAM_EXT.test(url)) return 'stream'
+    if (/^application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)/i.test(c)) return 'stream'
+    const e = extOf(url)
     if (e === 'ts' || e === 'm4s') return 'segment'
+    if (/^(video|audio)\//i.test(c)) return 'media'
     if (MEDIA_EXT.test(url)) return 'media'
     return 'file'
   }
@@ -79,31 +110,87 @@
     }
   }
 
-  function nameOf(url, fallback) {
-    const f = (fallback || '').trim()
-    if (f && f.length <= 120) return f
+  /* 抖音的视频地址长这样：
+   *   https://v3-web.douyinvod.com/xxxx/video/tos/cn/tos-cn-ve-15/yyyy/?a=6383&mime_type=video_mp4
+   * 路径里没有扩展名，所以名字得靠 Content-Type 补出来，否则存下来的是个没后缀的文件。 */
+  const KIND_EXT = { media: 'mp4', stream: 'm3u8', segment: 'ts', file: 'bin' }
+
+  function pickExt(url, kind, ct) {
+    const e = extOf(url)
+    if (e) return e
+    const c = String(ct || '')
+    if (/^audio\//i.test(c)) {
+      if (/mpeg/i.test(c)) return 'mp3'
+      if (/webm|ogg/i.test(c)) return 'ogg'
+      if (/wav/i.test(c)) return 'wav'
+      return 'm4a'
+    }
+    if (/^video\//i.test(c)) {
+      if (/webm/i.test(c)) return 'webm'
+      if (/quicktime/i.test(c)) return 'mov'
+      if (/matroska/i.test(c)) return 'mkv'
+      return 'mp4'
+    }
+    if (/mpegurl/i.test(c)) return 'm3u8'
+    if (/dash\+xml/i.test(c)) return 'mpd'
+    return KIND_EXT[kind] || 'bin'
+  }
+
+  function nameOf(url, fallback, kind, ct) {
+    const f = String(fallback || '')
+      .trim()
+      .replace(/\s+/g, ' ')
+    const ext = pickExt(url, kind, ct)
     try {
       const u = new URL(url)
-      let n = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '')
-      if (!n || !/\.[a-z0-9]{1,6}$/i.test(n)) {
-        for (const k of ['filename', 'file', 'name', 'download']) {
-          const v = u.searchParams.get(k)
-          if (v && /\.[a-z0-9]{1,6}$/i.test(v)) {
-            n = v
-            break
-          }
+      for (const k of ['filename', 'file', 'name', 'download', 'title']) {
+        const v = u.searchParams.get(k)
+        if (v && /\.[a-z0-9]{1,6}$/i.test(v)) {
+          return clean(decodeURIComponent(v), ext)
         }
       }
-      return n || hostOf(url) || 'download.bin'
+      if (f && /\.[a-z0-9]{1,6}$/i.test(f)) return clean(f, ext)
+      let n = ''
+      try {
+        n = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '')
+      } catch {
+        n = u.pathname.split('/').filter(Boolean).pop() || ''
+      }
+      n = n.replace(/\.[a-z0-9]{1,6}$/i, '')
+      if (!n || n.length > 50 || /^[0-9a-f]{16,}$/i.test(n) || /^\d+$/.test(n)) {
+        n = hostOf(url).replace(/^www\./, '')
+      }
+      if (f) n = f.slice(0, 60) || n
+      return clean(n, ext)
     } catch {
-      return 'download.bin'
+      return clean(f, ext)
     }
+  }
+
+  function clean(base, ext) {
+    let n = String(base || '')
+      .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_')
+      .replace(/^[.\s]+/, '')
+      .trim()
+    n = n.replace(/\.[a-z0-9]{1,6}$/i, '')
+    if (!n) n = 'download'
+    if (n.length > 70) n = n.slice(0, 70)
+    return n + '.' + ext
+  }
+
+  function fmtSize(n) {
+    n = Number(n) || 0
+    if (!n) return ''
+    if (n < 1024) return n + ' B'
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB'
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB'
+    return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB'
   }
 
   const KIND_LABEL = { stream: '播放列表', segment: '分片', media: '视频/音频', file: '文件' }
 
   /* ------------------------------------------------------------------ */
-  /* 采集                                                                */
+  /* 采集（DOM 侧）                                                       */
   /* ------------------------------------------------------------------ */
 
   function domItems() {
@@ -119,11 +206,14 @@
       }
       if (!isHttp(url) || seen.has(url)) return
       seen.add(url)
+      const kind = forceKind || kindOf(url, '')
       out.push({
         url,
-        name: nameOf(url, label),
-        kind: forceKind || kindOf(url),
+        name: nameOf(url, label, kind, ''),
+        kind,
         host: hostOf(url),
+        size: 0,
+        ct: '',
       })
     }
 
@@ -174,7 +264,7 @@
 }
 .pill .x:hover { color: #ff5b5b; background: rgba(255,91,91,.12); }
 .card {
-  margin-top: 6px; width: 340px; max-height: 60vh; display: flex; flex-direction: column;
+  margin-top: 6px; width: 360px; max-height: 62vh; display: flex; flex-direction: column;
   background: #171a21; border: 1px solid #3a4560; border-radius: 10px;
   box-shadow: 0 10px 30px rgba(0,0,0,.55); overflow: hidden;
 }
@@ -242,7 +332,7 @@
       '<div class="pill" part="pill">' +
       ICON +
       '<span><span class="n">0</span> 个文件</span>' +
-      '<span class="x" title="在这个站点上隐藏（可在插件弹窗里恢复）">✕</span>' +
+      '<span class="x" title="暂时收起（发现新内容或页面切换后会自动再出现；想永久关掉请点插件图标）">✕</span>' +
       '</div>' +
       '<div class="card" hidden>' +
       '<div class="head">' +
@@ -282,23 +372,6 @@
     return s.length > n ? s.slice(0, n - 1) + '…' : s
   }
 
-  if (!TOP) {
-    /* iframe 只上报，不画界面：一个页面里浮出好几个面板只会让人烦。 */
-    const report = async () => {
-      const { items } = domItems()
-      if (items.length) await ask({ type: 'items', items })
-    }
-    report()
-    new MutationObserver(debounce(report, 1500)).observe(document.documentElement, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      attributeFilter: ['src', 'href'],
-    })
-  } else {
-    startPanel()
-  }
-
   function debounce(fn, ms) {
     let t = 0
     return () => {
@@ -307,13 +380,44 @@
     }
   }
 
+  if (!TOP) {
+    /* iframe 只上报，不画界面：一个页面里浮出好几个面板只会让人烦。
+     * 定时上报是必须的 —— 播放器换集 / SPA 换内容不会触发 DOM 变更事件。 */
+    const report = async () => {
+      const { items } = domItems()
+      if (items.length) await ask({ type: 'items', items })
+    }
+    report()
+    setInterval(report, 5000)
+    try {
+      new MutationObserver(debounce(report, 1200)).observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ['src', 'href'],
+      })
+    } catch {
+      /* ignore */
+    }
+    return
+  }
+
+  startPanel()
+
   function startPanel() {
     let ui = null
     let items = []
     let blobCount = 0
-    let hidden = false
+    let globalOff = false /* 插件弹窗里关掉了面板 */
+    let hiddenNow = false /* 刚点了 ✕，暂时收起 */
+    let hiddenUrls = new Set()
+    let hiddenAt = 0
     let open = false
-    let lastSent = 0
+    let domCache = []
+    let blobCache = 0
+    let lastDom = 0
+    let lastHref = location.href
+    let busy = false
 
     function ensure() {
       if (ui && ui.host.isConnected) return ui
@@ -325,26 +429,26 @@
     function bind() {
       ui.pill.addEventListener('click', (e) => {
         if (e.target.classList.contains('x')) return
-        if (!open && !items.length) return
         open = !open
         ui.card.hidden = !open
         if (open) refresh(true)
       })
+      /* ✕ = 这一会儿先收起来，不是永久关闭。
+       * 以前这里往 storage 写 panelHidden:true，用户点一次面板就再也不出现（被投诉过）。 */
       ui.pill.querySelector('.x').addEventListener('click', (e) => {
         e.stopPropagation()
-        hidden = true
+        hiddenNow = true
+        hiddenAt = Date.now()
+        hiddenUrls = new Set(items.map((x) => x.url))
+        open = false
+        ui.card.hidden = true
         ui.host.style.display = 'none'
-        try {
-          chrome.storage.local.set({ panelHidden: true })
-        } catch {
-          /* ignore */
-        }
       })
       ui.close.addEventListener('click', () => {
         open = false
         ui.card.hidden = true
       })
-      ui.refresh.addEventListener('click', () => refresh(true))
+      ui.refresh.addEventListener('click', () => refresh(true, { dom: true }))
       ui.sendAll.addEventListener('click', () => sendItems(items, true))
       ui.head.addEventListener('pointerdown', startDrag)
       ui.list.addEventListener('click', (e) => {
@@ -400,8 +504,9 @@
         ui.note.hidden = true
       } else {
         ui.list.innerHTML = items
-          .map(
-            (it) =>
+          .map((it) => {
+            const sub = [it.host, fmtSize(it.size)].filter(Boolean).join(' · ')
+            return (
               '<div class="item"><span class="tag ' +
               it.kind +
               '">' +
@@ -409,25 +514,31 @@
               '</span><span class="meta"><span class="nm" title="' +
               esc(it.name) +
               '">' +
-              esc(trunc(it.name, 60)) +
+              esc(trunc(it.name, 58)) +
               '</span><span class="sub">' +
-              esc(trunc(it.host, 46)) +
+              esc(trunc(sub || it.host, 52)) +
               '</span></span><button data-url="' +
               esc(it.url) +
-              '">下载</button></div>',
-          )
+              '">下载</button></div>'
+            )
+          })
           .join('')
         if (blobCount) {
           ui.note.hidden = false
           ui.note.textContent =
             '这一页还有 ' +
             blobCount +
-            ' 个 blob: 流媒体（MSE 分片），地址离开页面就失效，只能下上面抓到的分片文件。'
+            ' 个 blob: 流媒体（MSE 分片）。' +
+            (items.some((x) => x.kind === 'media' && x.size > 200 * 1024)
+              ? '已经抓到可直接下载的整段视频，优先下它。'
+              : '地址离开页面就失效，只能下上面抓到的分片。')
         } else {
           ui.note.hidden = true
         }
       }
-      ui.host.style.display = hidden || !items.length ? 'none' : ''
+      /* 入口默认一直在（哪怕暂时 0 个），这样用户永远找得到它 —— NDM 也是这样。
+       * 只有两种情况才真的藏起来：插件弹窗里关掉了，或者用户刚点了 ✕（临时收起）。 */
+      ui.host.style.display = globalOff || hiddenNow ? 'none' : ''
     }
 
     function esc(s) {
@@ -437,30 +548,63 @@
     }
 
     /* ---- 采集 + 合并后台脚本记下的媒体请求 ---- */
-    async function refresh(showBusy) {
-      const dom = domItems()
-      blobCount = dom.blobCount
-      const net = await ask({ type: 'mediaList' })
-      const merged = dom.items.slice()
-      const have = new Set(merged.map((x) => x.url))
-      for (const it of (net && net.items) || []) {
-        if (!it || !it.url || have.has(it.url)) continue
-        have.add(it.url)
-        merged.push({
-          url: it.url,
-          name: nameOf(it.url, ''),
-          kind: it.kind || kindOf(it.url),
-          host: hostOf(it.url),
-        })
-        if (merged.length >= 150) break
+    async function refresh(showBusy, opts) {
+      if (busy) return
+      busy = true
+      try {
+        const now = Date.now()
+        const wantDom = (opts && opts.dom) || now - lastDom > 4000
+        if (wantDom) {
+          const dom = domItems()
+          domCache = dom.items
+          blobCache = dom.blobCount
+          lastDom = now
+        }
+        blobCount = blobCache
+        const net = await ask({ type: 'mediaList' })
+
+        const merged = domCache.slice()
+        const have = new Set(merged.map((x) => x.url))
+        for (const it of (net && net.items) || []) {
+          if (!it || !it.url || have.has(it.url)) continue
+          have.add(it.url)
+          const kind = it.kind || kindOf(it.url, it.ct)
+          merged.push({
+            url: it.url,
+            name: nameOf(it.url, '', kind, it.ct),
+            kind,
+            host: hostOf(it.url),
+            size: Number(it.size) || 0,
+            ct: it.ct || '',
+          })
+          if (merged.length >= 200) break
+        }
+        /* 直接能下的整段视频排最前（并按体积降序），别让几十个 3KB 的 MSE 分片
+         * 把抖音/B 站那个真正要下的文件淹掉。 */
+        const rank = { media: 0, stream: 1, segment: 2, file: 3 }
+        merged.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || (b.size || 0) - (a.size || 0))
+        items = merged
+
+        /* ✕ 只是临时收起：一旦出现「隐藏时还没有的」新东西，面板自己回来。 */
+        if (hiddenNow && Date.now() - hiddenAt > 1200) {
+          const fresh = items.find((x) => !hiddenUrls.has(x.url))
+          if (fresh) {
+            hiddenNow = false
+            ui.msg.textContent = '发现新的可下载内容，面板已自动打开'
+            ensure()
+          }
+        }
+
+        render()
+        if (showBusy) ui.msg.textContent = `扫描完成：${items.length} 个`
+      } finally {
+        busy = false
       }
-      items = merged
-      render()
-      if (showBusy) ui.msg.textContent = `扫描完成：${items.length} 个`
     }
 
     async function sendItems(list, all) {
       if (!list.length) return
+      ensure()
       ui.msg.textContent = '正在交给 PanBox…'
       const r = await ask({
         type: 'sendUrls',
@@ -472,38 +616,80 @@
       ui.msg.textContent = n
         ? `已交给 PanBox：${n} 个${all ? '（全部）' : ''}`
         : (r && r.message) || '投递失败：确认 PanBox 正在运行'
-      lastSent = Date.now()
     }
 
-    /* ---- 触发时机 ---- */
-    chrome.storage.local.get({ panelHidden: false, panelPos: null, panel: true }, (got) => {
-      hidden = !!got.panelHidden
-      if (got.panel === false) hidden = true
+    /* ---- SPA：抖音这种换视频不刷文档，得自己发现 ---- */
+    function onNavigate() {
+      hiddenNow = false
+      hiddenUrls = new Set()
+      open = false
+      if (ui) ui.card.hidden = true
+      lastDom = 0
+      domCache = []
+      items = []
+      refresh(true, { dom: true })
+    }
+    const onNavigateSoon = debounce(onNavigate, 400)
+
+    window.addEventListener('popstate', onNavigateSoon, true)
+    window.addEventListener('hashchange', onNavigateSoon, true)
+    /* 后台脚本用 webNavigation 抓到的导航（pushState/replaceState）会转告过来 */
+    try {
+      chrome.runtime.onMessage.addListener((m) => {
+        if (m && m.type === 'panbox:navigated') {
+          lastDom = 0
+          onNavigateSoon()
+        }
+      })
+    } catch {
+      /* ignore */
+    }
+
+    /* ---- 启动 ---- */
+    storageGet({ panel: true, panelPos: null }).then((got) => {
+      globalOff = got.panel === false
       ensure()
       if (got.panelPos && got.panelPos.left) {
         ui.host.style.left = got.panelPos.left
         ui.host.style.top = got.panelPos.top
       }
-      refresh(false)
+      refresh(false, { dom: true })
     })
 
+    /* 播放器开始播 = 有新视频，立刻重扫 */
     document.addEventListener(
       'play',
       () => {
-        refresh(false)
+        refresh(false, { dom: false })
       },
       true,
     )
 
-    new MutationObserver(
-      debounce(() => {
-        refresh(false)
-      }, 1500),
-    ).observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'href'] })
+    /* DOM 变了（换集、翻页、加载出新的下载链接）→ 重扫 DOM */
+    try {
+      new MutationObserver(
+        debounce(() => {
+          refresh(false, { dom: true })
+        }, 1200),
+      ).observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        attributeFilter: ['src', 'href'],
+      })
+    } catch {
+      /* ignore */
+    }
 
-    /* 面板可见时每 5 秒刷一次网络媒体列表（播放器换码率会换地址） */
+    /* 常驻轮询：不管面板开着还是收起，每 2 秒都对一次网络媒体列表 + 看看地址有没有变。
+     * v1.1.0 只在面板展开时每 5 秒刷一次，于是「网页换了内容面板却不刷新」。 */
     setInterval(() => {
-      if (open) refresh(false)
-    }, 5000)
+      if (location.href !== lastHref) {
+        lastHref = location.href
+        onNavigateSoon()
+        return
+      }
+      refresh(false, { dom: false })
+    }, 2000)
   }
 })()
