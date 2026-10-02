@@ -5,7 +5,7 @@
  *
  * 为什么需要它
  * ------------
- * 实测（test/probe-quark-threads2.js、test/probe-thread-scaling.js）：
+ * 实测（本机，夸克 / UC 分享直链）：
  * 夸克 / UC 这类网盘的 CDN 是**按每条 TCP 连接**发额度的 ——
  *   夸克 ≈ 50 KB/s/连接，UC ≈ 64 KB/s/连接。
  * 总速度 ≈ 连接数 × 每连接额度，实测线性关系：
@@ -45,13 +45,15 @@ const TICK_MS = 500
 const PERSIST_MS = 2000
 const MIN_CHUNK = 128 * 1024
 const MAX_CHUNK = 4 * 1024 * 1024
+/** 每个分片收数据时的攒批大小：socket 给的是 16KB 的小块，攒够这个数才写一次盘（writev） */
+const FLUSH_BYTES = 256 * 1024
 /** 单个分片的失败重试次数 */
 const CHUNK_TRIES = 5
 
 /* 「空档看门狗」。直连跨境线路的典型症状是「先冲一阵、然后几十秒一个字节都不来」，
  * 死等到 45 秒的连接超时只会把整条任务拖垮（实测直连 CDN 峰值能到 11 MB/s，平均却只有 0.9 MB/s）。
  * 这里只要超过 STALL_MS 没有新数据就掐掉这一片，worker 会换一条全新连接重下。
- * 注意计时器每收到一个数据块就重置，所以「只是慢、但在持续动」的连接不会被误杀。
+ * 注意计时窗口每收到一个数据块就往后推，所以「只是慢、但在持续动」的连接不会被误杀。
  * 要复现实验：PANBOX_SEG_STALL_MS=0 可关掉。 */
 const STALL_MS = Math.max(0, Number(process.env.PANBOX_SEG_STALL_MS ?? 3000))
 /** 并发被拒时最低降到几条 */
@@ -227,6 +229,11 @@ class SegmentDownloader extends EventEmitter {
     this.tasks = new Map()
     this._seq = 0
     this._timer = null
+    /** 同时下载数的上限（0 = 不限）。上层用设置里的「同时下载数」调 setLimit()。
+     *  没有这个闸门时，10 个夸克任务会同时各开 192 条连接把线路和自己都打满。 */
+    this.limit = 0
+    /** 排队中的 gid，先来先下；插队就是把 gid 挪到队首 */
+    this.queue = []
   }
 
   /* ------------------------------------------------------------------ */
@@ -302,10 +309,7 @@ class SegmentDownloader extends EventEmitter {
       await this._close(task)
       throw e
     }
-    if (task.status !== 'complete') {
-      task.status = 'active'
-      this._pool(task).catch((e) => this._fail(task, e))
-    }
+    if (task.status !== 'complete') this._enqueue(task)
     return gid
   }
 
@@ -324,14 +328,85 @@ class SegmentDownloader extends EventEmitter {
     return this.tasks.has(gid)
   }
 
+  /* ------------------------------------------------------------------ */
+  /* 队列：并发上限、排队、插队                                          */
+  /* ------------------------------------------------------------------ */
+
+  /** 上层设置「同时下载数」。0 或非法值 = 不限（保留旧行为） */
+  setLimit(n) {
+    const v = Math.floor(Number(n))
+    this.limit = Number.isFinite(v) && v > 0 ? v : 0
+    this._pump()
+    return this.limit
+  }
+
+  /** 正在下载的任务数（上层用它判断队列满没满） */
+  activeCount() {
+    let n = 0
+    for (const t of this.tasks.values()) if (t.status === 'active') n++
+    return n
+  }
+
+  /** 放进排队区（已经在排队的不重复放），状态显示为「等待中」。
+   *  入队后立刻试着放行：有空闲名额就直接开跑，没有就老实排着。 */
+  _enqueue(t) {
+    t.status = 'waiting'
+    if (!this.queue.includes(t.gid)) this.queue.push(t.gid)
+    this._pump()
+  }
+
+  /** 出队开跑：状态与统计一次性复位 */
+  _start(t) {
+    t.status = 'active'
+    t.connLimit = t.connWanted
+    t.speed = 0
+    t.samples = []
+    t.active = 0
+    this._pool(t).catch((e) => this._fail(t, e))
+  }
+
+  /** 有位置就把排队最前的任务放出去；limit 为 0 时全部放行。
+   *  每条任务的收尾（_finish / _fail / pause / remove）都要调一次，名额才不会空着。 */
+  _pump() {
+    if (!this.queue.length) return
+    let room = Infinity
+    if (this.limit > 0) room = this.limit - this.activeCount()
+    while (room > 0 && this.queue.length) {
+      const gid = this.queue.shift()
+      const t = this.tasks.get(gid)
+      if (!t || t.status !== 'waiting') continue
+      this._start(t)
+      room--
+    }
+  }
+
+  /** 插队：排队中的挪到队首（已经在下载/已结束的不动），返回它当前的状态 */
+  jumpTop(gid) {
+    const t = this.tasks.get(gid)
+    if (!t) throw new Error('任务不存在')
+    const i = this.queue.indexOf(gid)
+    if (t.status === 'waiting') {
+      /* 只处理还在排队的：先把原来的位置摘掉（本来就在队首时 splice 再 unshift 等价），
+       * 再插到队首并立刻试着放行。非 waiting 的 gid 本就不在队列里，不用动。 */
+      if (i >= 0) this.queue.splice(i, 1)
+      this.queue.unshift(gid)
+      this._pump()
+    }
+    return t.status
+  }
+
   async pause(gid) {
     const t = this.tasks.get(gid)
     if (!t) throw new Error('任务不存在')
     if (t.status === 'active' || t.status === 'waiting') {
+      const i = this.queue.indexOf(gid)
+      if (i >= 0) this.queue.splice(i, 1)
       t.status = 'paused'
       this._settleLive(t)
       this._abortInflight(t)
+      t.active = 0
       await this._persist(t, true)
+      this._pump() /* 空出来的名额立刻给排队最前的任务 */
     }
     return true
   }
@@ -340,11 +415,8 @@ class SegmentDownloader extends EventEmitter {
     const t = this.tasks.get(gid)
     if (!t) throw new Error('任务不存在')
     if (t.status === 'paused') {
-      t.status = 'active'
-      t.connLimit = t.connWanted
-      t.speed = 0
-      t.samples = []
-      this._pool(t).catch((e) => this._fail(t, e))
+      this._enqueue(t)
+      this._pump()
     }
     return true
   }
@@ -365,10 +437,13 @@ class SegmentDownloader extends EventEmitter {
     if (!t) return false
     t.status = 'removed'
     this._abortInflight(t)
+    const qi = this.queue.indexOf(gid)
+    if (qi >= 0) this.queue.splice(qi, 1)
     this.tasks.delete(gid)
     await this._close(t)
     await fsp.rm(t.partPath, { force: true }).catch(() => {})
     await fsp.rm(t.sidecarPath, { force: true }).catch(() => {})
+    this._pump()
     return true
   }
 
@@ -383,6 +458,7 @@ class SegmentDownloader extends EventEmitter {
       await this._persist(t, true).catch(() => {})
       await this._close(t)
     }
+    this.queue = []
   }
 
   /* ------------------------------------------------------------------ */
@@ -470,9 +546,12 @@ class SegmentDownloader extends EventEmitter {
     t.errorMessage = (e && e.message) || String(e)
     t.errorCode = t.errorCode || 1
     t.speed = 0
+    /* 已停下的任务不该再报「N 连接」（界面副标题直接显示 connections） */
+    t.active = 0
     this._abortInflight(t)
     await this._persist(t, true).catch(() => {})
     await this._close(t)
+    this._pump() /* 让出名额 */
   }
 
   async _persist(t, force = false) {
@@ -573,7 +652,7 @@ class SegmentDownloader extends EventEmitter {
      * 这是「同一条 GitHub 链接，NDM 有 5 MB/s 而 PanBox 只有 1 MB/s」的另一半原因：
      * github.com 那一跳在本机是间歇性被重置的，如果每个分片都从它开始跟 302，
      * 那么「换一条新连接重下」就永远要重新过一次鬼门关 —— 实测直连原始链接平均只有 0.68 MB/s，
-     * 换成终点 CDN 直连能到 3.02 MB/s（128 连接，见 test/probe-direct-conn.js）。 */
+     * 换成终点 CDN 直连能到 3.02 MB/s（128 连接，本机实测）。 */
     if (best && best.pr.finalUrl && best.pr.finalUrl !== t.url) {
       const from = new URL(t.url).host
       const to = new URL(best.pr.finalUrl).host
@@ -726,10 +805,43 @@ class SegmentDownloader extends EventEmitter {
       t.running.add(ac)
       let written = 0
       let stallTimer = null
+      let lastDataAt = Date.now()
+      // 攒批写盘：socket 读出来是 16KB 一个 buffer，直接一个个 write 的话，
+      // 1200MB 就是 7 万多次 write 系统调用（实测 sys 时间占引擎 CPU 的一大半）。
+      // 攒到 FLUSH_BYTES 再写一次，系统调用数掉到 1/16，字节落盘顺序完全不变。
+      let pend = []
+      let pendLen = 0
+      const flushPending = async () => {
+        if (!pendLen) return
+        const bufs = pend
+        const at = start + written
+        const n = pendLen
+        pend = []
+        pendLen = 0
+        // writev：一次系统调用写多段，既不拷贝（concat 会多一份 FLUSH_BYTES 大小的临时内存），
+        // 也不用为每个 16KB 小块各来一次 write
+        const r = bufs.length === 1 ? await t.fh.write(bufs[0], 0, n, at) : await t.fh.writev(bufs, at)
+        if (r && r.bytesWritten !== n) throw new Error(`写入不完整（${r.bytesWritten}/${n}）`)
+        written += n
+        t.liveBytes += n
+      }
+      // 停顿检测：一个计时窗口只建一次计时器（原来是每收到一个 buffer 就
+      // clearTimeout + setTimeout，纯属给 libuv 的计时器堆添乱）
       const armStall = (stream) => {
         if (!STALL_MS) return
-        if (stallTimer) clearTimeout(stallTimer)
-        stallTimer = setTimeout(() => stream.destroy(new Error('长时间没有数据（停顿）')), STALL_MS)
+        lastDataAt = Date.now()
+        if (stallTimer) return
+        const tick = () => {
+          stallTimer = null
+          const idle = Date.now() - lastDataAt
+          if (idle >= STALL_MS) {
+            stream.destroy(new Error('长时间没有数据（停顿）'))
+            return
+          }
+          stallTimer = setTimeout(tick, STALL_MS - idle)
+          if (stallTimer.unref) stallTimer.unref()
+        }
+        stallTimer = setTimeout(tick, STALL_MS)
         if (stallTimer.unref) stallTimer.unref()
       }
       try {
@@ -752,14 +864,18 @@ class SegmentDownloader extends EventEmitter {
         for await (const buf of res.stream) {
           if (t.status !== 'active') throw new Error('已取消')
           if (!buf.length) continue
-          const remain = need - written
+          const remain = need - written - pendLen
+          if (remain <= 0) break
           const chunk = buf.length > remain ? buf.subarray(0, remain) : buf
-          await t.fh.write(chunk, 0, chunk.length, start + written)
-          written += chunk.length
-          t.liveBytes += chunk.length
+          pend.push(chunk)
+          pendLen += chunk.length
           armStall(res.stream)
-          if (written >= need) break
+          if (pendLen >= FLUSH_BYTES) {
+            await flushPending()
+            if (written >= need) break
+          }
         }
+        await flushPending()
         res.stream.destroy()
         if (written < need) throw new Error(`只收到 ${written}/${need} 字节`)
         return written
@@ -781,6 +897,8 @@ class SegmentDownloader extends EventEmitter {
     t.liveBytes = 0
     t.status = 'complete'
     t.speed = 0
+    /* 同上：下完了就不该再报连接数 */
+    t.active = 0
     await this._close(t)
     try {
       await fsp.rm(t.filePath, { force: true })
@@ -790,6 +908,7 @@ class SegmentDownloader extends EventEmitter {
       return
     }
     await fsp.rm(t.sidecarPath, { force: true }).catch(() => {})
+    this._pump() /* 下完了，把这个名额给排队中的下一条 */
   }
 }
 

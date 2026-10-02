@@ -9,7 +9,7 @@
  *
  * 协议（全部只监听回环地址，公网访问不到）：
  *   GET  /ping   -> { ok, app:'PanBox', version, running:true }          不给任何密钥
- *   GET  /pair   -> { ok, token }   仅当请求来自 chrome-extension:// / moz-extension://
+ *   GET  /pair   -> { ok, token, app:'PanBox' }   仅当请求来自 chrome-extension:// / moz-extension://
  *                                    或没有 Origin 头的本机工具，网页拿不到
  *   POST /add    -> 需要 token，body 是 JSON：
  *        { url, name?, referer?, cookie?, userAgent?, headers?, pageTitle?, title? }
@@ -278,4 +278,3 @@ class Bridge {
 module.exports = new Bridge()
 module.exports.DEFAULT_PORT = DEFAULT_PORT
 module.exports.ensureToken = ensureToken
-module.exports.isExtensionOrigin = isExtensionOrigin

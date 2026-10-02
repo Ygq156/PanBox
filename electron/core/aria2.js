@@ -208,11 +208,15 @@ class Aria2 {
   }
 
   tellWaiting(offset = 0, num = 200) {
-    return this.rpc('aria2.tellWaiting', [offset, num, ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'connections', 'errorCode', 'errorMessage', 'dir', 'files']], 8000)
+    /* 不带 files：排队中的任务大多已经由 getGlobalStat 心跳门控挡住了，
+     * 这里少返回 files/files[].uris 能让响应小一个数量级。显示名走 taskManager 记的 meta。 */
+    return this.rpc('aria2.tellWaiting', [offset, num, ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'connections', 'errorCode', 'errorMessage', 'dir', 'filesize']], 8000)
   }
 
   tellStopped(offset = 0, num = 100) {
-    return this.rpc('aria2.tellStopped', [offset, num, ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'connections', 'errorCode', 'errorMessage', 'dir', 'files']], 8000)
+    /* 同上：已完成/已停止的任务是列表里最多的（默认 100 条），
+     * 每条都带 files[].uris 的话，一次轮询就是几十 KB 的 JSON。 */
+    return this.rpc('aria2.tellStopped', [offset, num, ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed', 'connections', 'errorCode', 'errorMessage', 'dir', 'filesize']], 8000)
   }
 
   /** 单个任务的状态（「换直链」需要先知道任务当前是不是还活着） */
@@ -278,6 +282,16 @@ class Aria2 {
   /** 改单个任务的选项（header / user-agent 等） */
   changeOption(gid, opts) {
     return this.rpc('aria2.changeOption', [gid, opts])
+  }
+
+  /**
+   * 把任务在队列里挪位置（插队用）。
+   * how：0 = 相对队首（POS_SET，pos 0 就是插到最前）、1 = 相对当前位置、2 = 相对队尾。
+   * aria2 只管队列顺序，排队任务要真正开跑还得有空闲的 --max-concurrent-downloads 名额，
+   * 所以「插队」= changePosition 之后必要时 pause 一条正在跑的（见 main.js 的 downloads:jumpTop）。
+   */
+  changePosition(gid, pos = 0, how = 0) {
+    return this.rpc('aria2.changePosition', [gid, pos, how])
   }
 }
 

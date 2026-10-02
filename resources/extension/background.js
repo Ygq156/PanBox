@@ -55,10 +55,19 @@ async function raw(path, init) {
   return { status: res.status, ok: res.ok, json, text }
 }
 
-/** 拉取配对令牌。只有带扩展 Origin 的请求能拿到，普通网页拿不到。 */
+/**
+ * 拉取配对令牌。只有带扩展 Origin 的请求能拿到，普通网页拿不到。
+ * 必须同时确认对端**自称是 PanBox**（`app` 字段）：本机任何进程都能抢在 7799 上
+ * 假冒服务端，只认「有没有 token」就等于把页面地址、Referer 与该域的 Cookie 交给它。
+ */
 async function pair() {
-  const r = await raw('/pair')
-  if (r.ok && r.json && r.json.token) {
+  let r
+  try {
+    r = await raw('/pair')
+  } catch {
+    return false
+  }
+  if (r.ok && r.json && r.json.app === 'PanBox' && r.json.token) {
     cfg.token = r.json.token
     await chrome.storage.local.set({ token: cfg.token })
     return true
@@ -80,7 +89,11 @@ async function ping() {
  */
 async function send(payload) {
   await loadCfg()
-  if (!cfg.token) await pair()
+  /* 没令牌就先配对；配不上说明 7799 上的不是 PanBox（或被别的程序占着），
+   * 这时**不要**继续投递 —— 免得把页面地址与该域 Cookie 送给一个陌生进程。 */
+  if (!cfg.token && !(await pair())) {
+    return { ok: false, message: `连不上 PanBox：127.0.0.1:${cfg.port} 上的服务没有回应配对（端口被占用或 PanBox 版本过旧）` }
+  }
   const body = JSON.stringify({ ...payload, token: cfg.token, via: payload.via || 'extension' })
   let r
   try {

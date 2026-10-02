@@ -53,11 +53,8 @@ export interface AppInfo {
   /** false = 开发模式（npm start） */
   packaged: boolean
   autoStart: boolean
-  /** 开发模式不写登录项，界面要据此提示「安装版才生效」 */
-  autoStartApplied: boolean
   /** 便携版：登录项里记的路径换个位置就失效，界面要据此提醒 */
   portable: boolean
-  platform: string
 }
 
 /** 回收站里的一条记录（删掉的下载文件） */
@@ -70,6 +67,8 @@ export interface TrashItem {
   dir: boolean
   netdisk: string
   at: number
+  /** 还有几天被自动清理（0 = 永不自动删时为 null），主进程按当前保留天数算好 */
+  leftDays: number | null
 }
 
 export interface UpdateInfo {
@@ -105,8 +104,10 @@ export interface PanboxAPI {
   addDownloads(p: AddPayload): Promise<{ ok: boolean; added: string[]; errors: string[] }>
   pauseTask(gid: string): Promise<boolean>
   resumeTask(gid: string): Promise<boolean>
+  /** 插队：把任务顶到最前；队满时主进程会暂停一条正在下载的让它先跑（结束后自动恢复） */
+  jumpTask(gid: string): Promise<{ ok: boolean; status?: string; paused?: string[]; message?: string }>
   refreshTask(gid: string): Promise<{ ok: boolean; gid?: string; message?: string }>
-  removeTask(gid: string, deleteFile?: boolean): Promise<boolean>
+  removeTask(gid: string): Promise<boolean>
   /** 删掉已下载完成的文件：文件进回收站，任务同时从队列移除 */
   deleteTaskFile(gid: string): Promise<{ ok: boolean; name?: string; size?: number; message?: string }>
   pauseAll(): Promise<boolean>
@@ -124,7 +125,7 @@ export interface PanboxAPI {
   openPath(p: string): Promise<string>
   aria2Status(): Promise<Aria2Status>
   restartAria2(): Promise<Aria2Status>
-  openLogin(netdisk: string): Promise<{ ok: boolean; cookie?: string; count?: number; loggedIn?: boolean; message?: string }>
+  openLogin(netdisk: string): Promise<{ ok: boolean; count?: number; loggedIn?: boolean; message?: string }>
   clearLogin(netdisk: string): Promise<boolean>
   bridgeStatus(): Promise<BridgeStatus>
   bridgeStart(): Promise<BridgeStatus>
@@ -132,7 +133,7 @@ export interface PanboxAPI {
   bridgeNewToken(): Promise<BridgeStatus>
   proxyStatus(): Promise<ProxyStatus>
   appInfo(): Promise<AppInfo>
-  setAutoStart(on: boolean): Promise<{ ok: boolean; autoStart: boolean; applied: boolean }>
+  setAutoStart(on: boolean): Promise<{ ok: boolean; autoStart: boolean }>
   checkUpdate(opts?: { manual?: boolean }): Promise<UpdateInfo>
   openRelease(url: string): Promise<{ ok: boolean; message?: string }>
   updateState(): Promise<UpdateState>

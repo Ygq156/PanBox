@@ -9,7 +9,8 @@
  * 必须用裸域 `123pan.com`（或 `www.123pan.cn` / `api.123pan.cn`）；
  * `/b/api/share/get` 与 `/b/api/share/info` 并不校验 `auth-key` 签名。
  *
- * 游客态即可完成「分享 → 列表 → 直链」，唯一门槛是查询串上的 `auth-key=<encode123>` 签名。
+ * 游客态即可完成「分享 → 列表 → 直链」。签名函数 `encode123` 保留下来是为了对齐参照实现
+ * （拿不到真实「要求签名」的响应，所以**没有**接上自动回退分支，见下面 crc32 一节）。
  * 硬限制：免费账号**每月提取流量 10GB**（服务端按账号算，客户端无法绕过）。
  */
 
@@ -24,7 +25,8 @@ const SHARE_RE =
  * **实测（2026）**：`www.123pan.com` 对 API 路径一律回 404 HTML（那是前端 SPA 的兜底路由），
  * 必须换成不带 `www.` 的裸域 `123pan.com`；`www.123pan.cn`、`api.123pan.cn` 也都能用。
  * 另外 `/b/api/share/get`、`/b/api/share/info` **不校验 `auth-key` 签名**（裸请求返回同样的 JSON），
- * 所以默认不带签名，只有被明确拒绝时才回退到 `encode123`。
+ * 所以请求里不带签名。签名实现（crc32 / encode123）与 `smoke-parsers.js` 里那两条对参照实现的
+ * 断言都还在，但**没有**「被拒绝就带签名重试」这条分支 —— 手上没有会拒绝的样本可验证。
  */
 const API_HOST_CANDIDATES = ['123pan.com', 'www.123pan.cn', 'api.123pan.cn']
 

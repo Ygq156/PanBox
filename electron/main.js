@@ -78,21 +78,6 @@ function cleanupRemember(name, sessionId) {
   return key
 }
 
-/** 取出「这个文件名对应的转存会话」但**不删除**（换直链时要用它，任务还没结束） */
-function cleanupPeek(name) {
-  const k = String(name)
-  const used = cleanupKeysBy.get(k)
-  if (used) {
-    /* 从后往前：同名的多条记录里，最后登记的那条才是「这个任务」的那条 */
-    const keys = [...used]
-    for (let i = keys.length - 1; i >= 0; i--) {
-      const sid = downloadsCleanup.get(keys[i])
-      if (sid) return sid
-    }
-  }
-  return downloadsCleanup.get(k) || ''
-}
-
 /** 取出并注销（任务完成 / 用户删除任务时调用） */
 function cleanupTake(name) {
   const k = String(name)
@@ -118,7 +103,7 @@ const { cleanupDownloaded } = parsers
 /**
  * 哪些网盘该用自研分段下载器，以及开多少条连接。
  *
- * 起因（实测见 test/probe-quark-threads2.js、test/probe-thread-scaling.js）：
+ * 起因（本机实测）：
  * 夸克和 UC 的 CDN 是**按每条 TCP 连接**发额度的 ——
  *   夸克 ≈ 50 KB/s/连接：16 连接 0.82 MB/s → 64 连接 3.30 → 128 连接 6.90
  *   UC   ≈ 64 KB/s/连接：8 连接 0.77 MB/s → 128 连接 3.85（提速 5 倍）
@@ -191,13 +176,130 @@ function isSegTask(gid) {
   return String(gid).startsWith('seg-')
 }
 
-/* 启动诊断日志：打包版是 GUI 子系统程序，stdout 拿不到，只能写文件。 */const BOOT_LOG = process.env.PANBOX_BOOT_LOG || path.join(require('node:os').tmpdir(), 'panbox-boot.log')
+/* ------------------------------------------------------------------ */
+/* 插队（把一条排队中的任务顶到最前面）                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 插队记录：gid -> { at, items: [{ gid, engine }] }。
+ * aria2 和分段引擎都没有「抢占」接口：队列满时想让插队任务立刻开跑，
+ * 只能暂停一条正在下载的任务把名额腾出来（这是 aria2 前端通用的做法）。
+ * 让位的任务记在这里，等插队任务跑完（不再是 active/waiting）时自动恢复，
+ * 省得用户再去手动点一次「继续」。
+ */
+const preempted = new Map()
+
+/** 挑一个让位对象：正在下载、进度比例最低的那条（快下完的不要动） */
+function pickVictim(list, skipGid) {
+  const live = (list || []).filter((t) => t && t.status === 'active' && String(t.gid) !== String(skipGid))
+  if (!live.length) return null
+  /* aria2 的 tellActive 给的是 totalLength/completedLength（都是字符串），
+     分段引擎的 _status 也是同一套字段；total/filesize/completed 只作兜底。 */
+  const ratio = (t) => {
+    const total = Number(t.totalLength) || Number(t.total) || Number(t.filesize) || 0
+    const done = Number(t.completedLength) || Number(t.completed) || 0
+    return total > 0 ? done / total : 0
+  }
+  return live.sort((a, b) => ratio(a) - ratio(b))[0]
+}
+
+/** 让位任务在界面上的名字（取不到就退回 gid） */
+function taskLabel(gid) {
+  const m = tasks.info(gid)
+  if (m && m.name) return String(m.name)
+  if (seg.has(gid)) {
+    try {
+      const st = seg.tellStatus(gid)
+      const p = st && st.files && st.files[0] && st.files[0].path
+      if (p) return path.basename(String(p))
+      if (st && st.name) return String(st.name)
+    } catch {
+      /* ignore */
+    }
+  }
+  return String(gid)
+}
+
+/**
+ * 插队任务跑完（或被暂停/失败/移除）之后，把当初让位的任务恢复回来。
+ * - 只在让位任务**仍然是 paused** 时恢复：用户自己点过「继续」的绝不覆盖。
+ * - 插队任务从列表里消失（被移除）时也算结束，但连续 3 次看不到才认，
+ *   免得因为某次列表还没刷新就把名额提前还回去。
+ */
+async function resumePreempted(list) {
+  if (!preempted.size) return
+  for (const [jumped, rec] of [...preempted]) {
+    const t = (list || []).find((x) => String(x.gid) === String(jumped))
+    if (!t) {
+      rec.misses = (rec.misses || 0) + 1
+      if (rec.misses < 3) continue
+    } else {
+      const st = String(t.status || '')
+      if (st === 'active' || st === 'waiting') {
+        rec.misses = 0
+        continue
+      }
+    }
+    preempted.delete(jumped)
+    for (const p of rec.items) {
+      try {
+        if (p.engine === 'seg') {
+          const s = seg.has(p.gid) ? seg.tellStatus(p.gid) : null
+          if (s && s.status === 'paused') await seg.unpause(p.gid)
+        } else {
+          const s = await aria2.tellStatus(p.gid).catch(() => null)
+          if (s && s.status === 'paused') await aria2.unpause(p.gid).catch(() => {})
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    tasks.kick()
+  }
+}
+
+/* 启动诊断日志：打包版是 GUI 子系统程序，stdout 拿不到，只能写文件。
+ * **必须带上限**：超过 MAX 只留尾部 KEEP。教训：曾有个测试进程在断掉的 stdout
+ * 管道上自旋刷了 148 万行未捕获异常，把 %TEMP% 里这个文件顶到 911 MB。 */
+const BOOT_LOG = process.env.PANBOX_BOOT_LOG || path.join(require('node:os').tmpdir(), 'panbox-boot.log')
+const BOOT_LOG_MAX = 2 * 1024 * 1024
+const BOOT_LOG_KEEP = 512 * 1024
+let bootBytes = -1
+function bootTrim() {
+  try {
+    const st = fs.statSync(BOOT_LOG)
+    if (st.size <= BOOT_LOG_MAX) {
+      bootBytes = st.size
+      return
+    }
+    const from = Math.max(0, st.size - BOOT_LOG_KEEP)
+    const buf = Buffer.allocUnsafe(st.size - from)
+    const fd = fs.openSync(BOOT_LOG, 'r')
+    try {
+      fs.readSync(fd, buf, 0, buf.length, from)
+    } finally {
+      fs.closeSync(fd)
+    }
+    fs.writeFileSync(BOOT_LOG, buf)
+    bootBytes = buf.length
+  } catch {
+    bootBytes = 0
+  }
+}
 function boot(...a) {
   try {
-    fs.appendFileSync(BOOT_LOG, `[${new Date().toISOString()}] ${a.join(' ')}\n`)
+    if (bootBytes < 0 || bootBytes > BOOT_LOG_MAX) bootTrim()
+    const line = `[${new Date().toISOString()}] ${a.join(' ')}\n`
+    fs.appendFileSync(BOOT_LOG, line)
+    bootBytes += Buffer.byteLength(line)
   } catch {
     /* ignore */
   }
+}
+/* 打包版常从控制台/脚本里启动，启动它的父进程一退出 stdout 管道就断了，之后任何
+ * console.* 都会抛 EPIPE —— 未被吞掉就会在 uncaughtException 里自旋。 */
+for (const s of [process.stdout, process.stderr]) {
+  if (s && typeof s.on === 'function') s.on('error', () => {})
 }
 process.on('uncaughtException', (e) => boot('UNCAUGHT', e && e.stack ? e.stack : String(e)))
 process.on('unhandledRejection', (e) => boot('UNHANDLED', e && e.stack ? e.stack : String(e)))
@@ -360,14 +462,17 @@ function createWindow() {
   })
   win.once('ready-to-show', () => {
     const boot0 = settings.load()
+    const trayOn = boot0.trayIcon !== false
     /* 开机自启动默认「收在托盘」：登录时自己把窗口弹出来很打扰。
-     * 只有在设置里明确勾了「启动时显示主窗口」才显示，或用户关掉了「关闭到后台」。 */
-    if (STARTUP_HIDDEN && boot0.closeToTray && !boot0.startupShowWindow) {
+     * 只有在设置里明确勾了「启动时显示主窗口」才显示，或用户关掉了「关闭到后台」/「托盘图标」。 */
+    if (STARTUP_HIDDEN && trayOn && boot0.closeToTray && !boot0.startupShowWindow) {
       boot('startup-hidden', '开机自启动，收在托盘里')
       ensureTray()
       return
     }
     win.show()
+    /* 托盘图标默认开：不然「关窗口留在后台」之后用户找不到程序（首次启动也没有托盘入口） */
+    if (trayOn) ensureTray()
   })
   win.on('closed', () => {
     win = null
@@ -379,7 +484,9 @@ function createWindow() {
    * 托盘图标本身已经说明它还在跑（气泡还会被 Windows 记成一条通知）。 */
   win.on('close', (e) => {
     if (isQuitting) return
-    if (!settings.load().closeToTray) return
+    const cfgNow = settings.load()
+    /* 关了托盘图标就没有「叫回窗口」的入口了，这时候关窗口必须真的退出 */
+    if (!cfgNow.closeToTray || cfgNow.trayIcon === false) return
     e.preventDefault()
     win.hide()
     ensureTray()
@@ -514,7 +621,7 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
       errors.push(`${f.name}: ${e && e.message ? e.message : e}`)
     }
   }
-  await tasks._tick().catch(() => {})
+  tasks.kick()
   return { added, errors }
 }
 
@@ -638,7 +745,7 @@ async function purgeTask(gid) {
     }
   }
   tasks.forget(gid)
-  await tasks._tick().catch(() => {})
+  tasks.kick()
 }
 
 function registerIpc() {
@@ -675,19 +782,16 @@ function registerIpc() {
     if (!checked.ok) throw new Error(checked.message)
     settings.save(checked.value)
     applyAutoStart(settings.load())
-    return { ok: true, autoStart: !!settings.load().autoStart, applied: app.isPackaged }
+    return { ok: true, autoStart: !!settings.load().autoStart }
   })
 
   ipcMain.handle('app:info', () => ({
     version: app.getVersion(),
     packaged: app.isPackaged,
     autoStart: !!settings.load().autoStart,
-    /* 开发模式没写注册表，界面要据此说明「安装版才生效」 */
-    autoStartApplied: app.isPackaged,
     /* 便携版：登录项里记的是解包后的临时路径，换个位置/换台机器就失效，
      * 界面要据此给一句提醒（见设置页「开机自启动」那行） */
     portable: !!process.env.PORTABLE_EXECUTABLE_FILE,
-    platform: process.platform,
   }))
 
   /* 恢复默认设置：默认值这份知识只在主进程里（见 settings.resetDefaults）。
@@ -837,7 +941,19 @@ function registerIpc() {
 
   ipcMain.handle('aria2:restart', () => startAria2())
 
-  ipcMain.handle('login:open', async (_e, netdisk) => login.openLogin(netdisk, win))
+  /**
+ * 打开某个网盘的登录窗口。**凭证留在主进程**：登录窗口抓到的 Cookie 原文
+ * 直接落盘（settings.save），回给渲染层只有「成没成、抓了几条」。
+ * 界面需要的只是一句状态 —— 让原文经过 IPC 等于把它交给页面脚本。
+ */
+  ipcMain.handle('login:open', async (_e, netdisk) => {
+    const r = await login.openLogin(netdisk, win)
+    if (r && r.ok && r.cookie) {
+      settings.save({ cookies: { [String(netdisk)]: r.cookie } })
+      boot('login', String(netdisk), 'saved len=' + String(r.cookie).length)
+    }
+    return { ok: !!(r && r.ok), loggedIn: !!(r && r.loggedIn), count: r && r.count, message: r && r.message }
+  })
   ipcMain.handle('login:clear', async (_e, netdisk) => login.clearLogin(netdisk))
 
   /**
@@ -944,11 +1060,77 @@ function registerIpc() {
     return true
   })
   ipcMain.handle('downloads:pause', (_e, gid) =>
-    (isSegTask(gid) ? seg.pause(gid) : aria2.pause(gid)).then(() => true).catch(() => false),
+    (isSegTask(gid) ? seg.pause(gid) : aria2.pause(gid))
+      .then(() => {
+        tasks.kick()
+        return true
+      })
+      .catch(() => false),
   )
   ipcMain.handle('downloads:resume', (_e, gid) =>
-    (isSegTask(gid) ? seg.unpause(gid) : aria2.unpause(gid)).then(() => true).catch(() => false),
+    (isSegTask(gid) ? seg.unpause(gid) : aria2.unpause(gid))
+      .then(() => {
+        tasks.kick()
+        return true
+      })
+      .catch(() => false),
   )
+
+  /* 插队 ⬆：把这条任务顶到最前面，必要时暂停一条正在下载的给它腾位置。
+   * - 排队中的任务：aria2 用 changePosition(gid, 0, 0) 挪到队首；分段引擎有自己的队列，用 seg.jumpTop()。
+   * - 名额不够：各挑一条「进度最低」的 active 任务暂停，记进 preempted，等插队任务结束后自动恢复。
+   * - 已经在下 / 已经结束的任务：只回报状态，不动队列。 */
+  ipcMain.handle('downloads:jumpTop', async (_e, gid) => {
+    const id = String(gid || '')
+    if (!id) return { ok: false, message: '任务不存在' }
+    const cfg = settings.load()
+    const limit = Math.max(1, Number(cfg.maxConcurrent) || 1)
+    const paused = []
+    try {
+      if (isSegTask(id)) {
+        const st0 = seg.tellStatus(id)
+        if (st0.status === 'complete' || st0.status === 'error') {
+          return { ok: false, message: `「${st0.name}」已经不在队列里了` }
+        }
+        if (st0.status === 'paused') await seg.unpause(id)
+        seg.jumpTop(id)
+        if (seg.tellStatus(id).status === 'waiting' && seg.activeCount() >= limit) {
+          const victim = pickVictim(seg.list(), id)
+          if (victim) {
+            await seg.pause(victim.gid)
+            paused.push({ gid: victim.gid, engine: 'seg', name: taskLabel(victim.gid) })
+          }
+        }
+      } else {
+        const st0 = await aria2.tellStatus(id).catch(() => null)
+        if (!st0) return { ok: false, message: '任务不存在' }
+        if (st0.status === 'complete' || st0.status === 'error') {
+          return { ok: false, message: `「${taskLabel(id)}」已经不在队列里了` }
+        }
+        if (st0.status === 'paused') await aria2.unpause(id).catch(() => {})
+        await aria2.changePosition(id, 0, 0).catch(() => {})
+        const gs = await aria2.getGlobalStat().catch(() => null)
+        if ((Number(gs && gs.numActive) || 0) >= limit) {
+          const victim = pickVictim(await aria2.tellActive().catch(() => []), id)
+          if (victim) {
+            await aria2.pause(victim.gid).catch(() => {})
+            paused.push({ gid: victim.gid, engine: 'aria2', name: taskLabel(victim.gid) })
+          }
+        }
+      }
+    } catch (e) {
+      return { ok: false, message: (e && e.message) || String(e) }
+    }
+    if (paused.length) preempted.set(id, { at: Date.now(), items: paused })
+    tasks.kick()
+    let status = ''
+    try {
+      status = isSegTask(id) ? seg.tellStatus(id).status : String((await aria2.tellStatus(id)).status || '')
+    } catch {
+      /* ignore */
+    }
+    return { ok: true, status, paused: paused.map((p) => p.name) }
+  })
 
   /* 「换直链」：重新解析同一条分享、拿一条新的下载地址替换掉当前任务的地址。
    * 直链过期、或者某次分到的 CDN 节点太慢时用得上（也相当于迅雷客户端那套
@@ -999,9 +1181,9 @@ function registerIpc() {
     const live = st && (st.status === 'active' || st.status === 'paused' || st.status === 'waiting')
     try {
       /* ⚠️ 这里**故意不用** aria2 的 `changeUri` 热替换。
-       * 实测（aria2 1.37，见 test/ui-refresh.js 的 B 分支）：对一个正在下载的任务调
-       * `changeUri` 之后，aria2 进程会失联——紧接着所有 RPC 都报 `TypeError: fetch failed`，
-       * 任务进度停在原地。所以统一改成「先移除、再用新地址重新加入」：
+       * 本机实测（aria2 1.37）：对一个正在下载的任务调 `changeUri` 之后，aria2 进程会失联——
+       * 紧接着所有 RPC 都报 `TypeError: fetch failed`，任务进度停在原地。
+       * 所以统一改成「先移除、再用新地址重新加入」：
        * `.aria2` 控制文件还在，`--continue=true` 会让它从断点续传，不会白下。 */
       if (isSegTask(gid)) {
         await seg.remove(gid).catch(() => {})
@@ -1012,19 +1194,24 @@ function registerIpc() {
       }
       tasks.forget(gid)
       cleanupTake(o.name)
+      /* 与「初次添加」保持同一套参数：连接数取设置里那份（0 = 不走分段引擎，退回 aria2），
+       * 忽略证书也要跟着带上 —— 否则勾了「忽略证书错误」的任务换一次直链就又开始校验证书。 */
+      const cfgNow = settings.load()
+      const segConns = segConnectionsFor(cfgNow, o.netdisk)
       let ngid = ''
       let nengine = 'aria2'
-      if (o.engine === 'seg') {
+      if (o.engine === 'seg' && segConns) {
         try {
           ngid = await seg.add({
             url: fresh.url,
             headers: fresh.headers || {},
             dir: opts.dir,
             out: sanitizeName(o.name),
-            connections: segConnectionsFor(settings.load(), o.netdisk) || 96,
+            connections: segConns,
             netdisk: o.netdisk,
             source: o.source,
-            proxy: o.netdisk === 'direct' ? proxy.effective(settings.load()) : '',
+            proxy: o.netdisk === 'direct' ? proxy.effective(cfgNow) : '',
+            insecure: !!cfgNow.ignoreCert,
           })
           nengine = 'seg'
         } catch (e) {
@@ -1044,7 +1231,7 @@ function registerIpc() {
         origin: { ...o, engine: nengine },
       })
       if (newSession) cleanupRemember(o.name, newSession)
-      await tasks._tick().catch(() => {})
+      tasks.kick()
       boot('refresh', o.name, `re-add ok gid=${ngid} engine=${nengine} was=${st ? st.status : 'gone'} live=${!!live}`)
       return { ok: true, gid: ngid, message: '已用新的下载地址重新加入队列（会从断点接着下）' }
     } catch (e) {
@@ -1090,7 +1277,7 @@ function registerIpc() {
     tasks.forget(gid)
     if (meta && meta.name) await recycleTransferCopy(meta.name, 'remove').catch(() => {})
     /* 立刻推一次，别让用户等下一个 800ms 轮询 */
-    await tasks._tick().catch(() => {})
+    tasks.kick()
     boot('remove', gid, `stopped=${stopped} purged=${purged} name=${(meta && meta.name) || ''}`)
 
     /* 只要 aria2 的结果清掉了就算成功；停不掉也没关系（本来就已停止） */
@@ -1139,10 +1326,16 @@ function registerIpc() {
   })
 
   ipcMain.handle('downloads:pauseAll', () =>
-    Promise.all([aria2.pauseAll().catch(() => {}), seg.pauseAll().catch(() => {})]).then(() => true),
+    Promise.all([aria2.pauseAll().catch(() => {}), seg.pauseAll().catch(() => {})]).then(() => {
+      tasks.kick()
+      return true
+    }),
   )
   ipcMain.handle('downloads:resumeAll', () =>
-    Promise.all([aria2.unpauseAll().catch(() => {}), seg.unpauseAll().catch(() => {})]).then(() => true),
+    Promise.all([aria2.unpauseAll().catch(() => {}), seg.unpauseAll().catch(() => {})]).then(() => {
+      tasks.kick()
+      return true
+    }),
   )
 }
 
@@ -1216,6 +1409,21 @@ async function applyRuntimeSettings(before, after) {
   /* 下载目录换了，回收站跟着搬到新目录下 */
   if (String(after.downloadDir) !== String(before.downloadDir)) {
     trash.configure({ downloadDir: after.downloadDir })
+  }
+  /* 托盘图标开关：关掉立刻撤图标，打开立刻建出来 */
+  if (!!after.trayIcon !== !!before.trayIcon) {
+    if (after.trayIcon === false) destroyTray()
+    else ensureTray()
+  }
+  /* 保留天数改了：立刻按新期限清一次（把期限调短能马上生效），并让索引里的剩余天数刷新 */
+  if (Number(after.trashRetentionDays) !== Number(before.trashRetentionDays)) {
+    trash.setRetention(after.trashRetentionDays)
+    purgeTrash('settings')
+  }
+  /* 「同时下载数」也要管住分段引擎：aria2 在上面走 changeGlobalOption，它有原生队列；
+     分段引擎有自己的队列（seg.setLimit），改了上限立刻把排队中的任务放出去。 */
+  if (Number(after.maxConcurrent) !== Number(before.maxConcurrent)) {
+    seg.setLimit(after.maxConcurrent)
   }
 }
 
@@ -1399,6 +1607,25 @@ function ensureTray() {
   return tray
 }
 
+/** 关掉「显示托盘图标」时把图标撤掉（设置页改一下就能立刻看到效果） */
+function destroyTray() {
+  if (tray && !tray.isDestroyed()) tray.destroy()
+  tray = null
+}
+
+/**
+ * 回收站到期清理。启动时、设置里改了保留天数时、以及每 6 小时各做一次。
+ * 删不掉的条目（文件被别的程序占用）会留在索引里，下次再试 —— 这里只记一行日志。
+ */
+function purgeTrash(why) {
+  try {
+    const r = trash.purgeExpired()
+    if (r.removed || r.kept) boot('trash-purge', String(why), 'removed=' + r.removed, 'kept=' + r.kept)
+  } catch (e) {
+    boot('trash-purge-err', String(why), String((e && e.message) || e))
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* 启动                                                                */
 /* ------------------------------------------------------------------ */
@@ -1420,9 +1647,19 @@ if (!gotLock) {
     trash.configure({
       indexPath: path.join(app.getPath('userData'), 'trash.json'),
       downloadDir: settings.load().downloadDir,
+      retentionDays: settings.load().trashRetentionDays,
     })
     createWindow()
     boot('window created')
+
+    /* 回收站到期清理：启动先扫一次（load() 里也会扫），之后每 6 小时一次。
+     * unref 掉，别让它拖着进程不退出。 */
+    purgeTrash('startup')
+    const trashTimer = setInterval(() => purgeTrash('timer'), 6 * 60 * 60 * 1000)
+    if (trashTimer.unref) trashTimer.unref()
+
+    /* 分段引擎的并发上限跟着设置走（0/非法值 = 不限，保留旧行为） */
+    seg.setLimit(settings.load().maxConcurrent)
 
     /* 开机自启动：每次启动都把登录项跟设置对齐一次（用户在别处删了登录项也能补回来） */
     applyAutoStart(settings.load())
@@ -1446,6 +1683,7 @@ if (!gotLock) {
     }, 4000)
 
     tasks.on('update', (list) => {
+      resumePreempted(list).catch(() => {})
       if (win && !win.isDestroyed()) win.webContents.send('downloads:update', list)
     })
 
@@ -1470,7 +1708,6 @@ if (!gotLock) {
     }
     await startAria2()
     boot('aria2 ready=' + aria2Ready + ' err=' + aria2Error)
-    if (win && !win.isDestroyed()) win.webContents.send('aria2:update', { running: aria2Ready, error: aria2Error })
 
     await startBridge().catch((e) => boot('bridge-err', String((e && e.message) || e)))
 
@@ -1484,7 +1721,8 @@ if (!gotLock) {
    * 关掉时保持老行为，关窗口就退出。 */
   app.on('window-all-closed', () => {
     if (isQuitting) return
-    if (!settings.load().closeToTray) app.quit()
+    const cfgNow = settings.load()
+    if (!cfgNow.closeToTray || cfgNow.trayIcon === false) app.quit()
   })
 
   /* 退出前把「已下载完成但还没轮到回收」的转存副本补收一次，

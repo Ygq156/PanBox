@@ -12,6 +12,8 @@ const META_FILE = () => path.join(app.getPath('userData'), 'tasks.json')
 const POLL_MS = 800
 /** 空闲时的轮询间隔（没人下载时没必要每 800ms 敲一次 aria2） */
 const IDLE_MS = 2500
+/** 心跳计数没变化时，最多隔这么久兜底拉一次完整列表 */
+const FULL_MS = 30000
 
 /**
  * 把 aria2 的三份列表（active/waiting/stopped）合并成 UI 用的任务数组，
@@ -28,6 +30,20 @@ class TaskManager extends EventEmitter {
     /** 上一次广播出去的内容指纹：没变就不广播 */
     this._sig = ''
     this._notifiedComplete = new Set()
+    /* 轮询节流用：上一次看到的「已停止」条数、上一次全量拉取的时间、有没有被要求立刻拉一次 */
+    this._lastStopped = -1
+    this._lastFull = 0
+    this._force = false
+    this._loop = null
+    /* 三份列表各自的上一次结果 + 计数：只拉数量变了的那一份，见 _tick() */
+    this._lists = { active: [], waiting: [], stopped: [] }
+    this._lastActive = -1
+    this._lastWaiting = -1
+    this._stoppedAt = 0
+    this._hadLists = false
+    /* 分段引擎任务的「gid:状态」指纹。引擎任务的状态跃迁（在下 → 完成/暂停/失败）
+     * 不会改变 aria2 的任何计数，必须靠它触发合并与推送，见 _tick() */
+    this._lastSegSig = ''
     this._loadMeta()
   }
 
@@ -84,13 +100,26 @@ class TaskManager extends EventEmitter {
       const busy = this.tasks.some((t) => t.status === 'active' || t.status === 'waiting')
       this.timer = setTimeout(loop, busy ? POLL_MS : IDLE_MS)
     }
+    this._loop = loop
     loop()
+  }
+
+  /** 用户刚做了操作（加入 / 暂停 / 移除…）：别等下一个轮询周期，立刻拉一次 */
+  kick() {
+    this._force = true
+    if (!this._loop || this.stopped) return
+    if (this.timer) {
+      clearTimeout(this.timer)
+      this.timer = null
+      this._loop()
+    }
   }
 
   stop() {
     this.stopped = true
     if (this.timer) clearTimeout(this.timer)
     this.timer = null
+    this._loop = null
   }
 
   _normalize(st) {
@@ -124,19 +153,85 @@ class TaskManager extends EventEmitter {
     if (this.running) return
     this.running = true
     try {
-      /* aria2 的 RPC 偶尔会抽风（比如被 changeUri 动过之后会丢端点），
-       * 单条失败不应该让整个列表空掉——所以各自兜底成空数组。 */
-      const [active, waiting, stopped] = await Promise.all([
-        aria2.tellActive().catch(() => []),
-        aria2.tellWaiting(0, 200).catch(() => []),
-        aria2.tellStopped(0, 100).catch(() => []),
-      ])
+      /* 先用一个极小的心跳（getGlobalStat 的响应只有两三百字节）问一下有没有变化。
+       * 三份列表的响应大得多 —— stopped 里每条任务都带 files/files[].uris（完整直链），
+       * 几十条已完成任务就是几十 KB，每 800ms 解析一遍纯属白烧 CPU。 */
+      let gs = null
+      try {
+        gs = await aria2.getGlobalStat()
+      } catch {
+        gs = null
+      }
       let segList = []
       try {
         segList = seg.list()
       } catch {
         /* ignore */
       }
+      const segBusy = segList.some((t) => t.status === 'active' || t.status === 'waiting')
+      /* 引擎任务的指纹只看 gid + 状态（在下时的进度由 segBusy 那条路覆盖）。
+       * 「在下 → 完成」如果正好发生在两次 tick 之间，aria2 的三个计数一个都不会动，
+       * 只看 gs 会误判成「什么都没变」而跳过合并 —— 界面就会一直停在过期的
+       * 「下载中 N%」上，直到下一次 30 秒兜底刷新（实测就是这个让插件测试超时）。 */
+      const segSig = segList.map((t) => `${t.gid}:${t.status}`).join('|')
+      const segChanged = segSig !== this._lastSegSig
+      const nStopped = gs ? Number(gs.numStopped || 0) : -1
+      /* 下面判断 stopped 列表该不该拉要用「上一轮的条数」，先存下来 */
+      const prevStopped = this._lastStopped
+      const now = Date.now()
+      /* kick() 的「立刻拉一次」用掉之前先记下来：下面拉哪几份列表也要看它 */
+      const kicked = this._force
+      const changed =
+        !gs ||
+        kicked ||
+        segChanged ||
+        segBusy ||
+        nStopped !== prevStopped ||
+        Number(gs.numActive || 0) > 0 ||
+        Number(gs.numWaiting || 0) > 0
+      this._force = false
+      if (!changed && now - this._lastFull < FULL_MS) return
+      this._lastStopped = nStopped
+      this._lastSegSig = segSig
+      this._lastFull = now
+
+      /* aria2 的 RPC 偶尔会抽风（比如被 changeUri 动过之后会丢端点），
+       * 单条失败不应该让整个列表空掉——所以失败时沿用上一次的结果。
+       * aria2 根本没起来时连问都不用问（问也是三条连接被拒）。 */
+      let active = this._lists.active
+      let waiting = this._lists.waiting
+      let stopped = this._lists.stopped
+      if (gs) {
+        const nActive = Number(gs.numActive || 0)
+        const nWaiting = Number(gs.numWaiting || 0)
+        const force = kicked || !this._hadLists
+        /* 只拉「数量变了」的那一份列表：
+         *   - 有在下的就必须每轮拉 active（进度在变）
+         *   - active/waiting 归零的那一轮也要拉一次，才能拿到收尾状态
+         *   - stopped 只在条数跳变时拉（它只增不减，条数没变内容就没变），30s 再兜底全量刷一次
+         * 这样稳态下载时每 800ms 只有一次心跳 + 一次 tellActive，而不是三份列表全拉。 */
+        const wantActive = force || nActive > 0 || this._lastActive > 0
+        const wantWaiting = force || nWaiting > 0 || this._lastWaiting > 0
+        const wantStopped = force || nStopped !== prevStopped || now - this._stoppedAt >= FULL_MS
+        const got = await Promise.all([
+          wantActive ? aria2.tellActive().catch(() => null) : null,
+          wantWaiting ? aria2.tellWaiting(0, 200).catch(() => null) : null,
+          wantStopped ? aria2.tellStopped(0, 100).catch(() => null) : null,
+        ])
+        if (got[0]) active = got[0]
+        if (got[1]) waiting = got[1]
+        if (got[2]) stopped = got[2]
+        if (got[2]) this._stoppedAt = now
+        this._lastActive = nActive
+        this._lastWaiting = nWaiting
+        this._hadLists = true
+      } else {
+        active = []
+        waiting = []
+        stopped = []
+        this._hadLists = false
+      }
+      this._lists = { active, waiting, stopped }
       const all = [...active, ...waiting, ...stopped, ...segList].map((s) => this._normalize(s))
       // 稳定排序：下载中 / 排队 / 暂停 在前，其次按加入时间倒序
       const rank = { active: 0, waiting: 1, paused: 2, error: 3, complete: 4, removed: 5 }

@@ -124,7 +124,14 @@ export interface Settings {
    * 关掉后恢复「关窗口即退出」的老行为。
    */
   closeToTray?: boolean
-  /** 启动后查一次有没有新版本（只提示 + 打开下载页，不做静默自动更新）。默认开。 */
+  /** 是否显示系统托盘图标。默认开；关掉后没有托盘入口，关闭窗口即退出。 */
+  trayIcon?: boolean
+  /**
+   * 回收站（<下载目录>\PanBox回收站）里超过这么多天的文件自动真删。默认 30，0 = 永不自动删。
+   * 索引另有 200 条的容量上限。
+   */
+  trashRetentionDays?: number
+  /** 启动后查一次有没有新版本（安装版可由用户点「下载更新」就地升级）。默认开。 */
   autoCheckUpdate?: boolean
   /** 开机自启动（写 Windows 登录项，启动时收在托盘里）。默认关。 */
   autoStart?: boolean
