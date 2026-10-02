@@ -377,13 +377,23 @@ async function followFileUrl(jar, downUrl, retried = false, ref = '') {
   const origin = new URL(downUrl).origin
   jar.set('down_ip', '1')
 
-  const r = await req(downUrl, {
-    headers: pageHeaders(origin + '/', downUrl),
-    jar,
-    redirect: 'manual',
-    timeout: 25000,
-    allowLocal: ALLOW_LOCAL,
-  })
+  let r
+  try {
+    r = await req(downUrl, {
+      headers: pageHeaders(origin + '/', downUrl),
+      jar,
+      redirect: 'manual',
+      timeout: 25000,
+      allowLocal: ALLOW_LOCAL,
+    })
+  } catch (e) {
+    /* 下载域这台主机有时不写真话：正文是几十 MB 的文件本体，`Content-Type` 却报成
+     * `text/html` / 干脆没有。这时 `req` 会按「网页太大」把它掐掉（防止把整个文件
+     * 读进内存）。掐掉这件事本身就说明**这个地址上放的是文件，不是网页** ——
+     * 在蓝奏这条链路上正好就是要找的直链，收下它，别再往上抛「响应体过大」。 */
+    if (/响应体过大/.test((e && e.message) || '')) return downUrl
+    throw e
+  }
 
   if (isDirectLink(r.location)) return r.location
   /* 没有 Location，返回的又不是网页 —— 这个地址本身就是直链（正文已由 req 丢掉） */

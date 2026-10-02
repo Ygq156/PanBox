@@ -65,7 +65,7 @@ const mapped = list
   if (!mapped.length && payload && payload.cookie) {
     mapped.push({ host, cookie: String(payload.cookie).slice(0, MAX_COOKIE) })
   }
-  if (!mapped.length && (userAgent || referer || Object.keys(pickHeaders(payload && payload.requestHeaders)).length)) {
+  if (!mapped.length && (userAgent || referer || Object.keys(pickHeaders(payload && payload.requestHeaders) || {}).length)) {
     mapped.push({ host, cookie: '' })
   }
 
