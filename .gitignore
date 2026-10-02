@@ -17,6 +17,9 @@ test/
 .DS_Store
 Thumbs.db
 
+# 历史版本的发版说明（只留当前这一版的 .rel-notes-<版本>.md）
+.rel-notes-v*.md
+
 # 绝不允许入库的凭证类文件
 *.cookie
 cookies*.json
