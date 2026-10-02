@@ -32,6 +32,14 @@ const DEFAULTS = () => ({
    * 默认开：PanBox 的下载主力是 aria2 与自研分段引擎，关掉窗口不该把下载掐死，
    * 浏览器插件的本地通道也要一直在。真正退出走托盘菜单的「退出」。 */
   closeToTray: true,
+  /* 托盘图标（首次启动就显示）。关掉之后没有托盘入口，关闭窗口 = 直接退出，
+   * 所以主进程会把「关闭到后台」也一并按「不留后台」处理。 */
+  trayIcon: true,
+  /* 回收站（<下载目录>\PanBox回收站）里超过这么多天的文件自动真删，0 = 永不自动删。
+   * 索引里另有 200 条的容量上限（trash.js 的 MAX_ITEMS）：双上限，免得回收站无限长大。
+   * 判据用条目入站时间，清理在启动时、设置变更时与每 6 小时各做一次；删不掉的（文件被占用）
+   * 保留记录下次再试。 */
+  trashRetentionDays: 30,
   /* 用户自备的「网盘解析接口」（见 electron/parsers/custom.js 顶部注释）。
    * 默认空 —— 程序不内置、也不推荐任何具体解析站。 */
   parseEndpoints: [],
@@ -63,8 +71,8 @@ const DEFAULTS = () => ({
   bridgeEnabled: true,
   bridgePort: 7799,
   bridgeToken: '',
-  /* 启动后查一次有没有新版本（匿名 GET GitHub Releases 的公开接口，不带任何本机信息）。
-   * 只提示 + 打开下载页，**不做静默自动更新**：装不装、什么时候装由用户自己决定。 */
+  /* 启动后查一次有没有新版本。安装版走 electron-updater 的 GitHub feed（能就地更新），
+   * 便携版/开发模式才去读公开的 Releases 接口 —— 只提示 + 打开下载页。 */
   autoCheckUpdate: true,
   /* 开机自启动（写 Windows 的登录项）。启动时带 --startup 参数 = 直接收到托盘，不弹主窗口。 */
   autoStart: false,
@@ -90,11 +98,11 @@ let cache = null
 /** 渲染层拿到的 cookie 是打码串；原样回传时主进程据此识别「用户没改这一格」 */
 const COOKIE_MASK = '__PANBOX_KEEP__'
 
-/** 给列表/设置页显示用的打码：只露尾巴 4 位，方便用户认出「是哪一个账号」 */
+/** 给渲染层的打码串：定长，既看不到原文也看不出长度 */
 function maskCookieValue(v) {
   const s = String(v || '')
   if (!s) return ''
-  return s.length <= 4 ? COOKIE_MASK : COOKIE_MASK /* 保持定长，避免从长度反推 */
+  return COOKIE_MASK
 }
 
 /**
@@ -177,6 +185,10 @@ function sanitizePatch(patch) {
     if ('aria2Port' in patch) out.aria2Port = int(patch.aria2Port, 1024, 65535, 'aria2 端口')
     if ('openFolderWhenDone' in patch) out.openFolderWhenDone = bool(patch.openFolderWhenDone, '完成后打开目录')
     if ('closeToTray' in patch) out.closeToTray = bool(patch.closeToTray, '关闭到后台')
+    if ('trayIcon' in patch) out.trayIcon = bool(patch.trayIcon, '托盘图标')
+    if ('trashRetentionDays' in patch) {
+      out.trashRetentionDays = int(patch.trashRetentionDays, 0, 3650, '回收站保留天数')
+    }
     if ('autoCheckUpdate' in patch) out.autoCheckUpdate = bool(patch.autoCheckUpdate, '自动检查更新')
     if ('autoStart' in patch) out.autoStart = bool(patch.autoStart, '开机自启动')
     if ('startupShowWindow' in patch) out.startupShowWindow = bool(patch.startupShowWindow, '启动时显示窗口')
@@ -260,7 +272,10 @@ function load() {
   const base = DEFAULTS()
   try {
     if (fs.existsSync(FILE())) {
-      const raw = JSON.parse(fs.readFileSync(FILE(), 'utf8'))
+      /* 去掉 BOM：记事本、PowerShell 的 `Set-Content -Encoding UTF8` 都会在开头写
+       * EF BB BF，JSON.parse 见到它就抛异常 —— 那样用户的配置会被整份当成坏文件
+       * 丢回默认值，凭证也会一起没了。 */
+      const raw = JSON.parse(fs.readFileSync(FILE(), 'utf8').replace(/^\uFEFF/, ''))
       /* segConnections 必须按 key 合并：老用户的这份配置是在 direct 这一项存在之前存的，
        * 整表覆盖会让 direct 掉成 0，直链于是退回 aria2 的 16 线程。 */
       const seg = { ...base.segConnections, ...(raw.segConnections || {}) }
@@ -330,7 +345,6 @@ function resetDefaults() {
 module.exports = {
   load,
   save,
-  defaultDownloadDir,
   resetDefaults,
   /* 渲染层脱敏 / 入参校验（IPC 用，见 electron/main.js 的 settings:get / settings:set） */
   forRenderer,

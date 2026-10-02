@@ -11,7 +11,6 @@ import type { Aria2Status, DownloadTask, ParseEndpoint, ParseResult, Settings } 
 const NETDISK_LABEL: Record<string, string> = {
   lanzou: '蓝奏云',
   ilanzou: '蓝奏云优享版',
-  'lanzou-xy': '蓝奏云优享版',
   quark: '夸克网盘',
   uc: 'UC网盘',
   baidu: '百度网盘',
@@ -432,6 +431,9 @@ const SET_TABS = [
 
 type TabId = (typeof SET_TABS)[number]['id']
 
+/** 回收站保留期限的可选档位（天）。0 = 永不自动删；跟主进程 settings.js 的 0~3650 取值域一致。 */
+const RETENTION_CHOICES = [0, 7, 14, 30, 60, 90]
+
 /** 开关本体。文案一律是「状态陈述」（登录时启动），不要写成「开启 XX」。 */
 function Switch({
   checked,
@@ -674,11 +676,14 @@ function SettingsModal({
     setLoginBusy(true)
     try {
       const r = await api.openLogin(cookieKey)
-      if (r && r.ok && r.cookie) {
-        patch({ cookies: { ...s.cookies, [cookieKey]: r.cookie } })
+      if (r && r.ok) {
+        /* 凭证由主进程直接落盘，渲染层只刷新一份脱敏副本（拿到的是打码串） */
+        const fresh = await api.getSettings()
+        setS(fresh)
+        setSaved(fresh)
         setLoginMsg(
           r.loggedIn
-            ? `${label(cookieKey)} 登录成功，已抓取 ${r.count ?? 0} 条凭证（记得点「保存」）`
+            ? `${label(cookieKey)} 已登录并保存（${r.count ?? 0} 条凭证）。`
             : `已抓取 ${r.count ?? 0} 条凭证，但没检测到明确的登录状态——下载时若提示需要登录，请重新登录一次。`,
         )
       } else {
@@ -772,12 +777,27 @@ function SettingsModal({
                 </Section>
                 <Section title="关闭">
                   <Row
+                    title="显示托盘图标"
+                    desc={
+                      s.trayIcon === false
+                        ? '关掉后没有托盘入口，关闭窗口会直接退出。'
+                        : '托盘图标可以叫回窗口、打开下载目录、退出程序。'
+                    }
+                    err={rowErr.trayIcon}
+                  >
+                    <Switch
+                      checked={s.trayIcon !== false}
+                      onChange={(v) => instant({ trayIcon: v }, 'trayIcon')}
+                    />
+                  </Row>
+                  <Row
                     title="关闭窗口后留在后台下载"
-                    desc="要完全退出：托盘图标右键 →「退出」。"
+                    desc={s.trayIcon === false ? undefined : '要完全退出：托盘图标右键 →「退出」。'}
                     err={rowErr.closeToTray}
                   >
                     <Switch
                       checked={s.closeToTray !== false}
+                      disabled={s.trayIcon === false}
                       onChange={(v) => instant({ closeToTray: v }, 'closeToTray')}
                     />
                   </Row>
@@ -805,6 +825,25 @@ function SettingsModal({
                         选择…
                       </button>
                     </div>
+                  </Row>
+                </Section>
+                <Section title="回收站">
+                  <Row
+                    title="自动清理"
+                    desc="超过期限的文件从回收站里彻底删除。"
+                    err={rowErr.trashRetentionDays}
+                  >
+                    <select
+                      className="select"
+                      value={String(RETENTION_CHOICES.includes(Number(s.trashRetentionDays)) ? Number(s.trashRetentionDays) : 30)}
+                      onChange={(e) => instant({ trashRetentionDays: Number(e.target.value) }, 'trashRetentionDays')}
+                    >
+                      {RETENTION_CHOICES.map((d) => (
+                        <option key={d} value={d}>
+                          {d === 0 ? '永不' : `${d} 天`}
+                        </option>
+                      ))}
+                    </select>
                   </Row>
                 </Section>
               </>
@@ -1021,7 +1060,7 @@ function SettingsModal({
                           <>
                             <div className="desc">正在下载 {auto.percent ? auto.percent.toFixed(0) : 0}%</div>
                             <div className="bar">
-                              <i style={{ width: `${auto.percent || 0}%` }} />
+                              <i style={{ transform: `scaleX(${(auto.percent || 0) / 100})` }} />
                             </div>
                           </>
                         )}
@@ -1318,7 +1357,7 @@ const STATUS_TEXT: Record<string, string> = {
 /* 回收站：删掉的下载文件先挪进这里，可以还原                                 */
 /* ------------------------------------------------------------------ */
 
-function TrashModal({ onClose }: { onClose: () => void }) {
+function TrashModal({ retentionDays, onClose }: { retentionDays: number; onClose: () => void }) {
   const [items, setItems] = useState<TrashItem[] | null>(null)
   const [msg, setMsg] = useState('')
   const [busy, setBusy] = useState(false)
@@ -1376,6 +1415,7 @@ function TrashModal({ onClose }: { onClose: () => void }) {
                   </div>
                   <div className="tsub">
                     {formatSize(it.size)} · {new Date(it.at).toLocaleString()}
+                    {it.leftDays === null ? '' : ` · ${it.leftDays} 天后自动清理`}
                   </div>
                 </div>
                 <button
@@ -1409,6 +1449,7 @@ function TrashModal({ onClose }: { onClose: () => void }) {
 
         <div className="trash-foot">
           <span className="trash-count">{items ? `${items.length} 个文件 · ${formatSize(total)}` : ''}</span>
+          <span className="trash-count">{retentionDays > 0 ? `超过 ${retentionDays} 天自动清理` : '不自动清理'}</span>
           {msg && <span className="trash-warn">{msg}</span>}
           <span className="grow" />
           <button className="tiny" disabled={busy} onClick={() => run(async () => `已打开 ${await api.trashOpenDir()}`)}>
@@ -1444,6 +1485,8 @@ export default function App() {
   const [needLogin, setNeedLogin] = useState<string | null>(null)
   const [tasks, setTasks] = useState<DownloadTask[]>([])
   const [refreshing, setRefreshing] = useState<string | null>(null)
+  /** 正在插队的任务（点 ⬆ 到主进程回话之间的过渡态） */
+  const [jumping, setJumping] = useState<string | null>(null)
   const [aria2, setAria2] = useState<Aria2Status>({ running: false })
   /** 启动时自动检查发现的新版本（只提示 + 打开下载页，不静默安装） */
   const [newVer, setNewVer] = useState<{ latest: string; current: string; url: string; name?: string } | null>(null)
@@ -1585,11 +1628,9 @@ export default function App() {
         setHint({ kind: 'err', msg: r?.message || '登录窗口未完成登录' })
         return
       }
+      /* 凭证由主进程落盘；界面这边只重新读一份脱敏副本 */
       const s = await api.getSettings()
-      const cookies = { ...(s.cookies || {}) }
-      if (r.cookie) cookies[netdisk] = r.cookie
-      await api.setSettings({ cookies })
-      setSettings((prev) => (prev ? { ...prev, cookies } : prev))
+      setSettings(s)
       setNeedLogin(null)
       setHint(
         r.loggedIn === false
@@ -1740,7 +1781,7 @@ export default function App() {
 
                     <div>
                       <div className={`bar ${barCls}`}>
-                        <i style={{ width: `${pct}%` }} />
+                        <i style={{ transform: `scaleX(${pct / 100})` }} />
                       </div>
                       <div className="meta">
                         {formatSize(t.completed)} / {formatSize(t.total)} · {pct.toFixed(1)}%
@@ -1756,6 +1797,36 @@ export default function App() {
 
                     <div className="actions">
                       <span className={`status-pill ${t.status}`}>{STATUS_TEXT[t.status]}</span>
+                      {(t.status === 'waiting' || t.status === 'paused') && (
+                        <button
+                          className="ghost tiny"
+                          title="插队"
+                          disabled={jumping === t.gid}
+                          onClick={async () => {
+                            setJumping(t.gid)
+                            setHint({ kind: '', msg: `正在把「${t.name}」排到最前…` })
+                            try {
+                              const r = await api.jumpTask(t.gid)
+                              setHint(
+                                r.ok
+                                  ? {
+                                      kind: 'ok',
+                                      msg: r.paused?.length
+                                        ? `已插队；「${r.paused.join('」「')}」暂停让位，稍后自动继续`
+                                        : `「${t.name}」已排到最前`,
+                                    }
+                                  : { kind: 'err', msg: r.message || '插队失败' },
+                              )
+                              setTasks((await api.listDownloads()) || [])
+                            } catch (e) {
+                              setHint({ kind: 'err', msg: `插队失败：${String((e as Error)?.message || e)}` })
+                            }
+                            setJumping(null)
+                          }}
+                        >
+                          {jumping === t.gid ? '…' : '⬆'}
+                        </button>
+                      )}
                       {t.status === 'active' && (
                         <button className="ghost tiny" title="暂停" onClick={() => api.pauseTask(t.gid)}>
                           ⏸
@@ -1844,7 +1915,9 @@ export default function App() {
       />
       )}
 
-      {showTrash && <TrashModal onClose={() => setShowTrash(false)} />}
+      {showTrash && (
+        <TrashModal retentionDays={settings?.trashRetentionDays ?? 30} onClose={() => setShowTrash(false)} />
+      )}
     </div>
   )
 }

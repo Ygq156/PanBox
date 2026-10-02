@@ -22,11 +22,23 @@ function safeUrl(u) {
   }
 }
 
+/** 把 IPv4-mapped IPv6（::ffff:127.0.0.1 / ::ffff:7f00:1 两种写法）折算回 IPv4 */
+function unmapV4(h) {
+  const s = String(h || '').toLowerCase()
+  const m = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(s)
+  if (m) return m[1]
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(s)
+  if (!hex) return ''
+  const n = (parseInt(hex[1], 16) << 16) | parseInt(hex[2], 16)
+  return `${(n >>> 24) & 255}.${(n >>> 16) & 255}.${(n >>> 8) & 255}.${n & 255}`
+}
+
 /** 这个 host 是不是「本机或局域网」的字面量地址 */
 function isPrivateHost(host) {
-  const h = String(host || '')
+  const raw = String(host || '')
     .replace(/^\[|\]$/g, '')
     .toLowerCase()
+  const h = unmapV4(raw) || raw
   if (!h) return true
   if (h === 'localhost' || h.endsWith('.localhost')) return true
   if (h === '::1' || h === '::') return true
@@ -286,10 +298,6 @@ function extractPassword(text) {
   return ''
 }
 
-function stripTags(html) {
-  return String(html || '').replace(/<[^>]*>/g, '').trim()
-}
-
 function decodeEntities(s) {
   return String(s || '')
     .replace(/&nbsp;/g, ' ')
@@ -335,16 +343,6 @@ const UA_QUARK =
 const UA_MOBILE_ANDROID =
   'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Mobile Safari/537.36'
 
-/** 带 Referer 的简单 JSON 头（夸克/UC/123 用） */
-function apiHeaders({ ua = UA_PC_CHROME, referer, extra = {} } = {}) {
-  const h = { Accept: 'application/json, text/plain, */*', 'User-Agent': ua, ...extra }
-  if (referer) {
-    h.Referer = referer
-    h.Origin = new URL(referer).origin
-  }
-  return h
-}
-
 function form(data) {
   return Object.entries(data)
     .filter(([, v]) => v !== undefined && v !== null)
@@ -357,7 +355,6 @@ module.exports = {
   UA_PC_CHROME,
   UA_QUARK,
   UA_MOBILE_ANDROID,
-  apiHeaders,
   form,
   Jar,
   req,
@@ -368,7 +365,6 @@ module.exports = {
   detectNetdisk,
   extractUrls,
   extractPassword,
-  stripTags,
   decodeEntities,
   humanSizeToBytes,
   deepFind,

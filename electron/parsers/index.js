@@ -16,7 +16,6 @@ const custom = require('./custom')
 const PARSERS = {
   direct,
   lanzou,
-  'lanzou-xy': ilanzou,
   ilanzou,
   quark,
   uc,

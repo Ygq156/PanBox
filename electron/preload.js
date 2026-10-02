@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld('panbox', {
   addDownloads: (p) => invoke('downloads:add', p),
   pauseTask: (gid) => invoke('downloads:pause', gid),
   resumeTask: (gid) => invoke('downloads:resume', gid),
+  /* 插队：把这条任务顶到最前（队满时暂停一条正在下载的给它腾位置，稍后自动恢复） */
+  jumpTask: (gid) => invoke('downloads:jumpTop', gid),
   refreshTask: (gid) => invoke('downloads:refresh', gid),
   removeTask: (gid) => invoke('downloads:remove', gid),
   /* 删掉已下完的文件：文件进回收站，任务同时从队列移除 */

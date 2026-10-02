@@ -495,4 +495,4 @@ async function open(url, ctx = {}) {
   return { ...one, title: one.title || title }
 }
 
-module.exports = { open, matchShare, acwScV2 }
+module.exports = { open, acwScV2 }

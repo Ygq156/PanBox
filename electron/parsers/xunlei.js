@@ -22,6 +22,7 @@
  *                                 APP_PACKAGE_NAME + deviceId + timestampMs , CAPTCHA_SALTS )
  *   device_sign  = "div101." + deviceId + md5( sha1( deviceId + PACKAGE_NAME + APPID + APP_KEY ) )
  *   （md5^10 表示按顺序 `h = md5(h + salt[i])` 迭代 10 次，小写 hex）
+ *   注：pan 接口不校验 device_sign（只发 X-Device-Id 即可），所以 device_sign 没有实现。
  *
  * ── 凭证 ─────────────────────────────────────────────────────────────
  *   迅雷的 pan 接口用 **Bearer token**，不是 cookie。token 存在浏览器 **localStorage**
@@ -38,8 +39,6 @@ const PAN_BASE = 'https://api-pan.xunlei.com'
 const APP_CLIENT_ID = 'Xp6vsxz_7IYVw2BB'
 const APP_CLIENT_VERSION = '8.31.0.9726'
 const APP_PACKAGE_NAME = 'com.xunlei.downloadprovider'
-const APPID = '40'
-const APP_KEY = '34a062aaa22f906fca4fefe9fb3a3021'
 
 /** 10 个 salt，顺序敏感（JieXi `XunleiConstants.kt:27-38`，与 alist thunder 驱动一致） */
 const CAPTCHA_SALTS = [
@@ -72,11 +71,6 @@ const SHARE_RE = /pan\.xunlei\.com\/s\/([A-Za-z0-9_-]+)/i
 const PWD_RE = /[?&](?:pwd|password|pass_code)=([A-Za-z0-9]+)/i
 
 const md5 = (s) => crypto.createHash('md5').update(s, 'utf8').digest('hex')
-const sha1 = (s) => crypto.createHash('sha1').update(s, 'utf8').digest('hex')
-
-function buildDeviceSign(deviceId) {
-  return 'div101.' + deviceId + md5(sha1(deviceId + APP_PACKAGE_NAME + APPID + APP_KEY))
-}
 
 function buildCaptchaSign(deviceId, timestampMs, clientId) {
   let h = (clientId || APP_CLIENT_ID) + APP_CLIENT_VERSION + APP_PACKAGE_NAME + deviceId + String(timestampMs)
@@ -539,4 +533,4 @@ async function removeTransferred(items) {
   return true
 }
 
-module.exports = { open, removeTransferred, buildCaptchaSign, buildDeviceSign, CAPTCHA_SALTS, APP_CLIENT_ID, APP_CLIENT_VERSION, APP_PACKAGE_NAME }
+module.exports = { open, removeTransferred }

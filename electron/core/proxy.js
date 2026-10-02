@@ -111,7 +111,6 @@ module.exports = {
   effective,
   shouldBypass,
   NO_PROXY,
-  WININET,
   clearCache: () => {
     cache = { at: 0, value: null }
   },

@@ -33,6 +33,17 @@ body {
   user-select: none;
 }
 
+/* 外壳必须锁在窗口高度里。
+   之前 .app 没有任何样式，于是它按内容长高：实测 60 条任务时 .body 是 3409px，
+   而窗口只有 704px，里面那个 overflow-y:auto 的 .scroll 永远没有可滚的高度
+   （scrollHeight === clientHeight、滚动条宽度 0）——队列底部的任务点不到。 */
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 /* ---------- 通用小工具 ---------- */
 .grow {
   flex: 1;
@@ -479,11 +490,16 @@ input[type='checkbox'] {
 
 .task {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 190px 110px 138px;
+  grid-template-columns: minmax(0, 1fr) 190px 110px 164px;
   gap: 10px;
   align-items: center;
   padding: 9px 16px;
   border-bottom: 1px solid #1c2029;
+  /* 队列长起来以后，屏幕外那些行不必参与布局与绘制。
+     实测 50 条任务会让渲染进程涨 31MB（JS 堆只有 9.5MB，其余全是 Chromium 的排版/绘制缓存），
+     这里让滚动区外的行跳过渲染；auto 会记住渲染过的真实高度，滚动条不会跳。 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 55px;
 }
 
 .task:hover {
@@ -519,8 +535,12 @@ input[type='checkbox'] {
 .bar > i {
   display: block;
   height: 100%;
+  width: 100%;
+  transform-origin: left center;
   background: linear-gradient(90deg, var(--accent), #7bb0ff);
-  transition: width 0.3s ease;
+  /* 进度用 scaleX 表示：transform 走合成器，不触发布局与重绘。
+     （用 width 动画时，每 800ms 一次的状态推送都会让进度条重排 300ms，实测渲染进程要吃掉 4.87% 单核） */
+  transition: transform 0.3s ease;
 }
 
 .bar.done > i {
@@ -618,13 +638,6 @@ input[type='checkbox'] {
   flex: 0 0 auto;
 }
 
-.modal .content {
-  padding: 4px 18px 14px;
-  overflow-y: auto;
-  flex: 1;
-  min-height: 0;
-}
-
 /* 分组：原来几十个字段平铺成一条，很难找 */
 .sec {
   margin-top: 16px;
@@ -657,12 +670,6 @@ input[type='checkbox'] {
   display: flex;
   gap: 8px;
   align-items: center;
-}
-
-.grid2 {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
 }
 
 .modal .footer {
