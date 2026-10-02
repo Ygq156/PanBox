@@ -90,7 +90,38 @@ async function assertOutbound(url, { allowLocal = false } = {}) {
   }
 }
 
-/** 带上限的响应体读取：被控/被黑的服务器塞一个超大响应不能把主进程读爆 */
+/* 只认「确实是网页/文本」的类型；空类型也按网页处理（老站点常常不写 content-type）。
+ * 明确是二进制（文件本体、安装包、压缩包、影音、字体、PDF…）的一律不读正文。 */
+const TEXTUAL_TYPE =
+  /^(?:text\/|application\/(?:xhtml\+xml|json|[a-z0-9.+-]*\+?json|javascript|ecmascript|xml|x-www-form-urlencoded))/i
+/** 类型没写、只给了大小的情况：超过这个大小也不读了 */
+const HUGE_BODY = 32 * 1024 * 1024
+
+/**
+ * 这个响应是不是「二进制本体」——安装包、压缩包、影音、字体之类。
+ * 这类响应读正文没有任何意义（正文里不会有网页结构），只会：
+ *   ① 把几十 MB 甚至几 GB 读进主进程；
+ *   ② 撞上 8MB 上限，报出「响应体过大」这种用户看不懂的错。
+ * 所以判定为二进制时**直接丢弃**：不读字节，也不因为大小报错。
+ */
+function isBinaryBody(headers, size) {
+  const ct = String((headers && headers.get && headers.get('content-type')) || '').trim()
+  if (ct) return !TEXTUAL_TYPE.test(ct)
+  const n = Number(size || 0)
+  return Number.isFinite(n) && n > HUGE_BODY
+}
+
+/** 把响应体丢掉、连接回收。调用过一次之后这个响应就不能再读了。 */
+async function dropBody(res) {
+  try {
+    await res?.body?.cancel()
+  } catch {
+    /* 已经断了就算了 */
+  }
+}
+
+/** 带上限的响应体读取：被控/被黑的服务器塞一个超大响应不能把主进程读爆。
+ *  二进制本体（见 isBinaryBody）不进这里 —— 调用方应先判定并丢弃。 */
 async function readTextCapped(res, limit, what) {
   const buf = Buffer.from(await readAll(res.body, limit, what))
   return buf.toString('utf8')
@@ -175,11 +206,8 @@ async function req(url, opts = {}) {
      * 接口或直链指向内网时，才由调用方显式放开。 */
     allowLocal = false,
     /* 只要响应头，正文交给调用方自己决定读不读。
-     * 有些站点（蓝奏的下载域就是）会**直接把文件本体回给你**（实测用户那条 CDN
-     * 链接：200 + application/octet-stream + 38MB）。一律缓冲到 8MB 上限的话，
-     * 大文件只会得到「响应体过大（超过 8MB），已中止」这种看不懂的错；打开这个
-     * 开关后，调用方可以先用响应头判定「这不是网页」，把连接一丢就走。
-     * 返回的 `body` 就是原始流，读它请用 readTextCapped(res, MAX_RESP_SIZE)。 */
+     * 少数探测型调用方（只看 Location / 类型，不看正文）用它省一次读取；
+     * 打开后返回值里的 `body` 就是原始流，读取请用 readTextCapped(res, MAX_RESP_SIZE)。 */
     noBody = false,
   } = opts
 
@@ -221,16 +249,23 @@ async function req(url, opts = {}) {
     /* 超限时把「哪个地址、什么类型」写进错误里：页面类请求拿到超大响应时，
      * 光一句「响应体过大」看不出是链接过期、被反爬拦了，还是服务端直接回了文件。 */
     const respWhat = `${safeUrl(current)} 返回 HTTP ${res.status} ${res.headers.get('content-type') || '未知类型'}`
-    const text = noBody ? '' : await readTextCapped(res, MAX_RESP_SIZE, respWhat)
+    const size = Number(res.headers.get('content-length') || 0)
+    /* 二进制本体一律不读正文（它不可能是网页）。这是**全局兜底**：任何解析器、
+     * 任何一步请求到「文件本体」时都不会再撞 8MB 上限、也不会白读几十 MB。 */
+    const binary = !noBody && isBinaryBody(res.headers, size)
+    if (binary) await dropBody(res)
+    const text = noBody || binary ? '' : await readTextCapped(res, MAX_RESP_SIZE, respWhat)
     return {
       status: res.status,
       headers: res.headers,
       location: res.headers.get('location') || '',
-      size: Number(res.headers.get('content-length') || 0),
+      size,
       text,
       url: res.url || current,
       /* noBody 时正文还没读，原样交给调用方（判定出不是网页就直接丢掉） */
       body: res.body,
+      /* 与服务端返回的文件本体同名的那条地址：调用方可以直接把它当直链 */
+      isBinary: binary,
       /* 超限/超时那类错误文案里用的那句「哪个地址、什么类型」 */
       what: respWhat,
     }
@@ -382,6 +417,8 @@ module.exports = {
   reqJson,
   readTextCapped,
   MAX_RESP_SIZE,
+  isBinaryBody,
+  dropBody,
   assertOutbound,
   isPrivateHost,
   safeUrl,

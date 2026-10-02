@@ -20,6 +20,70 @@ const BADGE_MS = 2500
 const cfg = { port: DEFAULT_PORT, token: '', intercept: true, panel: true }
 
 /* ------------------------------------------------------------------ */
+/* 抓到的记录要熬过 service worker 休眠                                 */
+/* ------------------------------------------------------------------ */
+
+/* MV3 的 background 是个会被浏览器随时回收的 service worker：用户点开下载页、
+ * 等浏览器把文件下完、再回头点面板 —— 中间那段时间它就被回收了，内存里记下的
+ * 「这一页请求过哪些文件」全没了，面板于是空空如也。
+ *
+ * ⚠️ 这是实测踩出来的（不是理论）：拿 Edge 加载本插件、让页面去请求一个
+ * `Content-Disposition: attachment` 的地址，事件确实到了、也记下了，但两秒后
+ * 再问面板就是空数组 —— 因为 worker 在这中间被回收了。
+ *
+ * 所以抓到的记录同时写一份到 `chrome.storage.session`：它只存在内存里、关掉
+ * 浏览器就没了（地址里的签名本来就短命），不落盘、不进设置。启动时再读回来。 */
+const CAP_KEY = 'captured'
+const CAP_MAX = 120
+
+async function loadCaptured() {
+  try {
+    const got = await chrome.storage.session.get({ [CAP_KEY]: null })
+    const arr = Array.isArray(got[CAP_KEY]) ? got[CAP_KEY] : []
+    const now = Date.now()
+    for (const r of arr) {
+      if (!r || !r.url || now - (r.t || 0) > MEDIA_TTL) continue
+      const m = mediaByTab.get(r.tabId)
+      if (m) m.set(r.url, { t: r.t, kind: r.kind, ct: r.ct || '', size: r.size || 0, name: r.name || '', attach: !!r.attach })
+      else {
+        const nm = new Map()
+        nm.set(r.url, { t: r.t, kind: r.kind, ct: r.ct || '', size: r.size || 0, name: r.name || '', attach: !!r.attach })
+        mediaByTab.set(r.tabId, nm)
+      }
+    }
+  } catch {
+    /* 没有 session 存储权限/环境不支持时就当没有 —— 功能本身照旧 */
+  }
+}
+
+async function saveCaptured() {
+  try {
+    const now = Date.now()
+    const out = []
+    for (const [tabId, m] of mediaByTab) {
+      for (const [url, v] of m) {
+        if (now - v.t > MEDIA_TTL) continue
+        out.push({ tabId, url, t: v.t, kind: v.kind, ct: v.ct || '', size: v.size || 0, name: v.name || '', attach: !!v.attach })
+        if (out.length >= CAP_MAX) break
+      }
+      if (out.length >= CAP_MAX) break
+    }
+    await chrome.storage.session.set({ [CAP_KEY]: out })
+  } catch {
+    /* 同上，存不下就算了 */
+  }
+}
+
+/* worker 每次被唤醒都跑一遍：把还在有效期内的记录读回来 */
+if (chrome.storage && chrome.storage.session) {
+  try {
+    chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
+  } catch {
+    /* 老版本浏览器没有这个方法 */
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* 与 PanBox 的通道                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -417,12 +481,31 @@ const MEDIA_CT_RE = /^(video\/|audio\/|application\/(x-mpegurl|vnd\.apple\.mpegu
 /* 有些 CDN 拿 octet-stream 发 mp4 —— 只在请求类型确实是媒体时才认，
  * 免得把 .exe / .zip 这种也收进来。 */
 const OCTET_RE = /^application\/octet-stream/i
+/* `Content-Disposition: attachment` = 服务器明说「这是让人下载的文件」。
+ * 这是**最可靠**的一条线索：蓝奏的下载域（exe2.webgetstore.com 这类 CDN）
+ * 地址里既没有 .exe 也没有 video/，只有这个头能认出来。 */
+const ATTACH_RE = /^\s*attachment\b/i
 
 const MEDIA_TTL = 3 * 60 * 1000 /* 换视频后旧地址会失效；3 分钟足够，也顺便自动淘汰上一个视频 */
 const MEDIA_MAX = 240
 
-const mediaByTab = new Map() /* tabId -> Map<url, {t, kind, ct, size}> */
+const mediaByTab = new Map() /* tabId -> Map<url, {t, kind, ct, size, name, attach}> */
 const frameItems = new Map() /* tabId -> Map<frameId, items[]> */
+
+/** `Content-Disposition: attachment; filename="xxx.exe"` → xxx.exe */
+function nameFromDisposition(cd) {
+  const s = String(cd || '')
+  let m = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/i.exec(s)
+  if (m) {
+    try {
+      return decodeURIComponent(m[1].trim().replace(/^"|"$/g, '')).slice(0, 200)
+    } catch {
+      /* 编码坏了就用原样 */
+    }
+  }
+  m = /filename\s*=\s*"?([^";]+)"?/i.exec(s)
+  return m ? m[1].trim().slice(0, 200) : ''
+}
 
 function kindOfUrl(url, ct) {
   const c = String(ct || '')
@@ -434,7 +517,7 @@ function kindOfUrl(url, ct) {
   return 'file'
 }
 
-function rememberMedia(tabId, url, ct, size) {
+function rememberMedia(tabId, url, ct, size, name, attach) {
   let m = mediaByTab.get(tabId)
   if (!m) {
     m = new Map()
@@ -442,22 +525,74 @@ function rememberMedia(tabId, url, ct, size) {
   }
   const old = m.get(url)
   const c = ct || (old && old.ct) || ''
+  const nm = name || (old && old.name) || ''
   m.set(url, {
     t: Date.now(),
-    kind: kindOfUrl(url, c),
+    /* 服务器明说这是下载文件时，类型就按「文件」算，别被 .mp4 后缀带偏 */
+    kind: attach ? 'file' : kindOfUrl(url, c),
     ct: c,
     size: Math.max(Number(size) || 0, (old && old.size) || 0),
+    name: nm,
+    attach: !!(attach || (old && old.attach)),
   })
   if (m.size > MEDIA_MAX) {
     const now = Date.now()
     for (const [k, v] of m) if (now - v.t > MEDIA_TTL) m.delete(k)
     while (m.size > MEDIA_MAX) m.delete(m.keys().next().value)
   }
+  /* 只有「服务器明说可下载」的才值得写进 session 存储（量小、价值最高） */
+  if (attach) saveCaptured()
 }
 
 function dropTab(tabId) {
   mediaByTab.delete(tabId)
   frameItems.delete(tabId)
+}
+
+/* 面板看到的那份列表：这一页浏览器真的请求过的（媒体 + 文件）。
+ * 抽成函数是为了能被测试直接调用 —— 扩展自己发的 runtime 消息不会回到自己的
+ * onMessage，面板那条路径在自动化里没法靠消息自问自答。 */
+function mediaListView(tabId) {
+  const out = []
+  const have = new Set()
+  const now = Date.now()
+  const m = tabId >= 0 ? mediaByTab.get(tabId) : null
+  if (m) {
+    for (const [url, v] of m) {
+      if (now - v.t > MEDIA_TTL) continue
+      if (have.has(url)) continue
+      have.add(url)
+      out.push({ url, kind: v.kind, ct: v.ct || '', size: v.size || 0, name: v.name || '', attach: !!v.attach })
+    }
+  }
+  const f = tabId >= 0 ? frameItems.get(tabId) : null
+  if (f) {
+    for (const list of f.values()) {
+      for (const it of list) {
+        if (!it || !it.url || have.has(it.url)) continue
+        have.add(it.url)
+        out.push({ url: it.url, kind: it.kind || 'file', ct: '', size: 0 })
+      }
+    }
+  }
+  /* 能直接下的整段视频排最前，其次播放列表，再是分片，最后才是页面文件链接。
+   * 同类型按体积从大到小 —— 抖音一页能抓到几十个 3KB 的 MSE 分片，
+   * 真正要下的是那个几百 KB 起步的 video/mp4。 */
+  const rank = { media: 0, stream: 1, segment: 2, file: 3 }
+  out.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || (b.size || 0) - (a.size || 0))
+  return out.slice(0, 200)
+}
+
+/** 这一页里「服务器明说可以下载」的地址（新的在前），交给 PanBox 当备选直链 */
+function attachUrlsOf(tabId) {
+  const m = tabId != null && tabId >= 0 ? mediaByTab.get(tabId) : null
+  if (!m) return []
+  const now = Date.now()
+  return [...m]
+    .filter(([, v]) => v.attach && now - v.t <= MEDIA_TTL)
+    .sort((a, b) => b[1].t - a[1].t)
+    .slice(0, 20)
+    .map(([url, v]) => ({ url, name: v.name || '', size: v.size || 0 }))
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => dropTab(tabId))
@@ -477,25 +612,33 @@ chrome.webRequest.onBeforeRequest.addListener(
   { urls: ['http://*/*', 'https://*/*'] },
 )
 
-/* 收网的那一个：按响应 Content-Type 认媒体（抖音视频只有这一步能抓到） */
+/* 收网的那一个：按响应 Content-Type 认媒体（抖音视频只有这一步能抓到），
+ * 并按 `Content-Disposition: attachment` 认「这就是个可下载文件」 */
 chrome.webRequest.onHeadersReceived.addListener(
   (d) => {
     if (d.tabId == null || d.tabId < 0) return
     if (!/^https?:/i.test(d.url)) return
     let ct = ''
+    let cd = ''
     let len = 0
     for (const h of d.responseHeaders || []) {
       const n = String(h.name || '').toLowerCase()
       if (n === 'content-type') ct = String(h.value || '')
+      else if (n === 'content-disposition') cd = String(h.value || '')
       else if (n === 'content-length') len = Math.max(len, Number(h.value) || 0)
       else if (n === 'content-range') {
         const m = /\/(\d+)\s*$/.exec(String(h.value || ''))
         if (m) len = Math.max(len, Number(m[1]) || 0)
       }
     }
+    if (ATTACH_RE.test(cd)) {
+      /* 服务器明说要下载：不管什么类型都记下来 —— 这是「插件抓到真实下载
+       * 链接」的主力，蓝奏/123 这类 CDN 地址里没有任何后缀可认。 */
+      rememberMedia(d.tabId, d.url, ct, len, nameFromDisposition(cd), true)
+      return
+    }
     const media =
-      MEDIA_CT_RE.test(ct) ||
-      (OCTET_RE.test(ct) && (d.type === 'media' || d.type === 'xmlhttprequest' || d.type === 'other'))
+      MEDIA_CT_RE.test(ct) || (OCTET_RE.test(ct) && (d.type === 'media' || d.type === 'xmlhttprequest' || d.type === 'other'))
     if (!media) return
     rememberMedia(d.tabId, d.url, ct, len)
   },
@@ -628,34 +771,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     }
     if (msg.type === 'mediaList') {
       const tabId = _sender && _sender.tab ? _sender.tab.id : -1
-      const out = []
-      const have = new Set()
-      const now = Date.now()
-      const m = tabId >= 0 ? mediaByTab.get(tabId) : null
-      if (m) {
-        for (const [url, v] of m) {
-          if (now - v.t > MEDIA_TTL) continue
-          if (have.has(url)) continue
-          have.add(url)
-          out.push({ url, kind: v.kind, ct: v.ct || '', size: v.size || 0 })
-        }
-      }
-      const f = tabId >= 0 ? frameItems.get(tabId) : null
-      if (f) {
-        for (const list of f.values()) {
-          for (const it of list) {
-            if (!it || !it.url || have.has(it.url)) continue
-            have.add(it.url)
-            out.push({ url: it.url, kind: it.kind || 'file', ct: '', size: 0 })
-          }
-        }
-      }
-      /* 能直接下的整段视频排最前，其次播放列表，再是分片，最后才是页面文件链接。
-       * 同类型按体积从大到小 —— 抖音一页能抓到几十个 3KB 的 MSE 分片，
-       * 真正要下的是那个几百 KB 起步的 video/mp4。 */
-      const rank = { media: 0, stream: 1, segment: 2, file: 3 }
-      out.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || (b.size || 0) - (a.size || 0))
-      return reply({ ok: true, items: out.slice(0, 200) })
+      return reply({ ok: true, items: mediaListView(tabId) })
     }
     if (msg.type === 'sendUrls') {
       const items = (Array.isArray(msg.items) ? msg.items : [])
@@ -723,6 +839,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
         userAgent: rh.ua || ctx.ua || navigator.userAgent,
         requestHeaders: rh.headers,
         cookies,
+        /* 这一页浏览器**真的请求到过**的文件地址（Content-Disposition 认出来的
+         * 那些）。解析器推不出来的、一次性签名的下载地址就在这里面 —— PanBox
+         * 按自己那套推出来的地址拿不到直链时，会拿这些当备选。 */
+        urls: attachUrlsOf(tabId),
         via: 'page',
       })
       if (r && r.ok) badge('✓', '#34c759')
@@ -732,3 +852,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   })()
   return true /* 异步回复 */
 })
+
+/* 把上一轮（worker 被回收之前）抓到的记录读回来。放在文件最后：此时
+ * MEDIA_TTL / mediaByTab 都已经建好了。 */
+loadCaptured()
