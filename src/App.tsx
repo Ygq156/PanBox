@@ -1493,6 +1493,9 @@ export default function App() {
   /** 程序版本（标题栏常驻）：报障时一眼能说清装的是哪一版 */
   const [ver, setVer] = useState('')
 
+  /** 插件刚交过来、等着自动解析的地址（见下面 prefill 与那个 effect） */
+  const wantParse = useRef('')
+
   useEffect(() => {
     api.appInfo?.().then((i) => setVer(i?.version || '')).catch(() => {})
     api.getSettings().then(setSettings).catch(() => {})
@@ -1503,6 +1506,13 @@ export default function App() {
      * 而是把链接送到这里填进输入框，让用户自己勾选。 */
     const offPre = api.onBridgePrefill?.((d) => {
       setText(d.url)
+      /* 插件交过来的若是**下载入口**（蓝奏那条 `/fn?TOKEN`），到这一步就齐了：
+       * 分享页那一步会被站点风控挡住，而这条入口页不会 —— 直接替用户点「解析」，
+       * 少一步手动操作，也就少一次「点了没反应」的误会。
+       * 分享链接本身仍然只预填：里面有什么文件、要不要提取码，得由用户看着决定。 */
+      if (/^https?:\/\/[^/?#]+\/fn\?/i.test(d.url)) {
+        wantParse.current = d.url
+      }
       setHint({
         kind: 'ok',
         msg: d.message || `浏览器插件送来一个${label(d.netdisk)}分享链接，点「解析」看看里面有什么`,
@@ -1593,6 +1603,16 @@ export default function App() {
       setParsing(false)
     }
   }, [text, pwd, dropSessionsOf])
+
+  /* 插件交了「下载入口」过来时替用户点一次「解析」。放在这里而不是 prefill 回调里：
+   * 那个回调跑的时候 text 还是旧值，doParse 读的是 state。 */
+  useEffect(() => {
+    const want = wantParse.current
+    if (!want || text.trim() !== want) return
+    wantParse.current = ''
+    doParse()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [text])
 
   const doDownload = useCallback(async (r: ParseResult, ids: string[]) => {
     if (!r.sessionId) return

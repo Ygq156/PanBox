@@ -86,6 +86,8 @@ const mapped = list
   }
   /* 插件如果一起交来了「这一页浏览器真的请求过的文件地址」，也记下来当备选 */
   if (payload && payload.urls) noteUrls(payload.urls)
+  /* 以及**下载入口页**（蓝奏 `/fn?TOKEN`）—— 它让解析器绕开挂挑战的分享页 */
+  if (payload && payload.fn) noteFn(payload)
   return n
 }
 
@@ -94,8 +96,82 @@ function gc() {
   for (const [h, v] of store) if (now - v.at > TTL) store.delete(h)
 }
 
+/* ------------------------------------------------------------------ */
+/* 浏览器里的下载入口（蓝奏 `/fn?TOKEN`）                               */
+/* ------------------------------------------------------------------ */
+
+/* 蓝奏分享页里的下载入口是一条 `/fn?TOKEN` iframe。分享页本身挂着 ESA 挑战，
+ * 纯 Node 取会被回 400；但这条 `/fn` 页**没有挑战**，纯 Node 带上浏览器的
+ * UA / Referer 就能取到整页文件信息，一路走到 CDN 直链。
+ * 插件在页面里看得到它（`onBeforeSendHeaders` 里那个 sub_frame 请求），交过来即可。
+ *
+ * 与 cookie 一样的规矩：只存内存、按主机取用、过一会儿就扔（token 有时效）。 */
+const FN_TTL = 12 * 60 * 1000
+const FN_MAX_HOSTS = 40
+const MAX_FN = 8
+/** pageHost -> [{ url, at }] */
+const fnStore = new Map()
+
+/* 只认下载入口那一种形态：蓝奏各家域名 + `/fn?` 开头。别的地址一律不记 ——
+ * 免得把浏览器的浏览记录顺手攒下来。 */
+const FN_RE =
+  /^https?:\/\/(?:[a-zA-Z\d-]+\.)?(?:(?:lanzou[bcefghijklmopqtuvwxy]|lanzn|lanzv|lanosso|lanpv|lanwp|bakstotre|ulanzou|woozooo|dmpdmp|lanrar|webgetstore)\.com|t-is\.cn)\/fn\?/i
+
+function fnGc() {
+  const now = Date.now()
+  for (const [h, list] of fnStore) {
+    const keep = list.filter((it) => now - it.at <= FN_TTL)
+    if (keep.length) fnStore.set(h, keep)
+    else fnStore.delete(h)
+  }
+}
+
+/** 记下「浏览器在这一页里请求过的下载入口」。返回记下来的条数。 */
+function noteFn(payload) {
+  const pageUrl = String((payload && payload.url) || '')
+  const pageHost = normHost(pageUrl)
+  if (!pageHost) return 0
+  const raw = Array.isArray(payload && payload.fn) ? payload.fn : payload && payload.fn ? [payload.fn] : []
+  const now = Date.now()
+  let list = fnStore.get(pageHost)
+  if (!list) list = []
+  let n = 0
+  for (const it of raw) {
+    const u = String((it && it.url) || it || '').trim()
+    if (!FN_RE.test(u) || u.length > 2048) continue
+    /* 入口页与分享页同一家站点（同一批域名）才认：不然就是拿别人的凭据去取别人的文件 */
+    if (!sameSite(normHost(u), pageHost)) continue
+    if (list.some((x) => x.url === u)) continue
+    list.unshift({ url: u, at: now })
+    n += 1
+  }
+  if (!n && !list.length) return 0
+  list = list.filter((it) => now - it.at <= FN_TTL).slice(0, MAX_FN)
+  fnStore.set(pageHost, list)
+  fnGc()
+  if (fnStore.size > FN_MAX_HOSTS) {
+    const byAge = [...fnStore].sort((a, b) => (b[1][0]?.at || 0) - (a[1][0]?.at || 0))
+    for (const [h] of byAge.slice(FN_MAX_HOSTS)) fnStore.delete(h)
+  }
+  return n
+}
+
+/** 这个分享页有没有浏览器交过来的下载入口（新的在前）；没有就返回 null */
+function fnFor(url) {
+  fnGc()
+  const host = normHost(url)
+  if (!host) return null
+  for (const [h, list] of fnStore) {
+    if (!sameSite(host, h)) continue
+    const alive = list.filter((it) => Date.now() - it.at <= FN_TTL)
+    if (alive.length) return { url: alive[0].url, at: alive[0].at }
+  }
+  return null
+}
+
 function clear() {
   store.clear()
+  fnStore.clear()
 }
 
 /** 请求 url 时该用哪份现场：自己主机优先，其次同站点的主机（分享页与其 iframe 常见的组合） */
@@ -304,7 +380,10 @@ module.exports = {
   gc,
   noteUrls,
   fileUrlsFor,
+  noteFn,
+  fnFor,
   _store: store,
+  _fn: fnStore,
 }
 
 /* 便于调试：只报「有几个主机、什么时间」，绝不吐凭据本身 */

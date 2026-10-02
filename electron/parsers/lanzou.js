@@ -18,6 +18,12 @@ const SHARE_RE =
   /^https?:\/\/(?:[a-zA-Z\d-]+\.)?(?:(?:lanzou[bcefghijklmopqtuvwxy]|lanzn|lanzv|lanosso|lanpv|lanwp|bakstotre|ulanzou|woozooo|dmpdmp|lanrar|webgetstore)\.com|t-is\.cn)\/(.+)$/i
 
 const IFRAME_FN = /src\s*=\s*["'](\/fn\?[^"'\s>]+)["']/i
+/* 分享页里的下载入口是 `/fn?TOKEN` 这一条 iframe。**它自己没有反爬**：实测纯 Node
+ * 带上浏览器的 UA / Referer 去取，200 就把整个文件信息页（ajaxfile.php 的参数）
+ * 给全了，一路能走到 CDN 直链。真正过不去的是**分享页本身**（`/iXXXX`、`/file/?TOKEN`，
+ * 挂 ESA 挑战，纯 Node 自算 cookie 会被回 400）。
+ * 所以只要能从浏览器那儿知道 `/fn?TOKEN`（插件在页面里看得到），整条链路就活了。 */
+const P_FN_URL = /^https?:\/\/[^/?#]+\/fn\?[^#\s]+$/i
 const P_WP_SIGN = /wp_sign\s*=\s*'([^']+)'/
 const P_AJAXDATA = /ajaxdata\s*=\s*'([^']+)'/
 const P_WEBSIGN = /'websign'\s*:\s*'([^']*)'/
@@ -161,6 +167,81 @@ function matchShare(url) {
   const m = SHARE_RE.exec(String(url || '').trim())
   if (!m) return null
   return { key: m[1].replace(/[?#].*$/, ''), url: String(url).trim() }
+}
+
+/**
+ * 这个地址是不是蓝奏分享页里的那个下载入口（`/fn?TOKEN`）。
+ * 用户在浏览器里能直接看到这条地址（iframe 的 src），把它粘进 PanBox 也该能用 ——
+ * 它比分享页好取：没有反爬挑战。
+ */
+function isFnUrl(url) {
+  return P_FN_URL.test(String(url || '').trim())
+}
+
+/** `/fn?TOKEN` → `{ origin, url }`；不是这种地址就返回 null */
+function parseFnUrl(url) {
+  const s = String(url || '').trim()
+  if (!P_FN_URL.test(s)) return null
+  try {
+    return { origin: new URL(s).origin, url: s }
+  } catch {
+    return null
+  }
+}
+
+/** `/fn` 页认得出的标志：文件信息页里一定有下载参数或文件名 */
+const IFRAME_OR_INFO = /ajax(?:m|file)\.php|downprocess|down_p|'file'\s*:|文件大小/i
+
+/**
+ * 下载域对文件本体的自我介绍：`Content-Disposition` 里的文件名 + `Content-Length` 的体积。
+ * `/fn` 那条路绕过了分享页，也就绕过了分享页上印的文件名/大小 —— 但下载域自己会说：
+ * 实测 `content-disposition: inline; filename="modplus_install_6220.exe"`、
+ * `content-length: 38137856`。拿不到就返回空，不影响下载。
+ */
+async function probeFileMeta(url, ref) {
+  const out = { name: '', size: 0 }
+  try {
+    /* 只要响应头：正文一个字节都不读。这些一次性签名的地址再取一次是白花站点
+     * 的资源，能少一次就少一次。 */
+    const r = await req(url, {
+      headers: cdnHeaders(url, ref),
+      redirect: 'manual',
+      timeout: 25000,
+      allowLocal: ALLOW_LOCAL,
+      noBody: true,
+    })
+    const cd = String(r.headers.get('content-disposition') || '')
+    const m = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/i.exec(cd) || /filename\s*=\s*"?([^";]+)"?/i.exec(cd)
+    if (m) {
+      try {
+        out.name = decodeURIComponent(m[1].trim().replace(/^"|"$/g, '')).slice(0, 200)
+      } catch {
+        out.name = m[1].trim().replace(/^"|"$/g, '').slice(0, 200)
+      }
+    }
+    out.size = Number(r.headers.get('content-length') || 0) || 0
+  } catch {
+    /* 拿不到就算了：名字退回 `/fn` 页算出来的那个 */
+  }
+  return out
+}
+
+/** 下载地址里那个 `?fn=` 就是文件名（蓝奏直链一直这么带），白捡的，不用再问站点一次 */
+function nameFromUrl(url) {
+  try {
+    const fn = new URL(url).searchParams.get('fn')
+    if (!fn) return ''
+    return decodeURIComponent(fn).replace(/[\\/:*?"<>|]/g, '_').slice(0, 200)
+  } catch {
+    return ''
+  }
+}
+
+/* 分享页 HTML 里既没有下载入口、也不是密码页时该说什么。
+ * 站点上了挑战时纯 Node 取到的是挑战页，用户看到「分享已失效」会以为自己链接错了 ——
+ * 所以这里给一条**他能动手做**的路：从浏览器里那一页交过来。 */
+function entryMissingMsg() {
+  return '没读到下载入口：站点这轮风控把页面挡了。请在浏览器里打开这个分享页，点插件悬浮面板上的「全部交给 PanBox」，再回来点「解析」'
 }
 
 function isFolderShare(key, html) {
@@ -520,29 +601,37 @@ async function openFolderChild(jar, origin, fileId, pwd) {
 /* 单文件分享                                                           */
 /* ------------------------------------------------------------------ */
 
-async function openFileHtml(jar, shareUrl, html, pwd) {
+async function openFileHtml(jar, shareUrl, html, pwd, filePage) {
   const origin = new URL(shareUrl).origin
   let infoHtml = html
   let infoBase = shareUrl
+  let ifr = null
 
-  const ifr = IFRAME_FN.exec(html)
-  if (ifr) {
-    const iframeUrl = new URL(ifr[1], origin + '/').href
-    const r = await fetchPage(jar, iframeUrl, shareUrl)
-    infoHtml = r.text
-    infoBase = iframeUrl
-  } else if (/down_p|id=["']pwd["']/.test(html)) {
-    if (!pwd) {
-      const e = new Error('该分享需要提取码')
-      e.needPassword = true
-      throw e
-    }
+  if (filePage && filePage.html) {
+    /* 调用方已经拿到下载入口页了（浏览器里那条 `/fn?TOKEN`，或者用户直接粘的它）：
+     * 就不用再去分享页里找 iframe —— 分享页恰恰是最容易被反爬拦住的那一步。 */
+    infoBase = filePage.base || shareUrl
+    infoHtml = filePage.html
   } else {
-    const off = P_OFF_MSG.exec(html)
-    throw new Error(off ? off[1].trim() : '未找到下载入口，可能分享已失效或被风控拦截')
+    ifr = IFRAME_FN.exec(html)
+    if (ifr) {
+      const iframeUrl = new URL(ifr[1], origin + '/').href
+      const r = await fetchPage(jar, iframeUrl, shareUrl)
+      infoHtml = r.text
+      infoBase = iframeUrl
+    } else if (/down_p|id=["']pwd["']/.test(html)) {
+      if (!pwd) {
+        const e = new Error('该分享需要提取码')
+        e.needPassword = true
+        throw e
+      }
+    } else {
+      const off = P_OFF_MSG.exec(html)
+      throw new Error(off ? off[1].trim() : entryMissingMsg())
+    }
   }
 
-  const call = extractAjaxFromHtml(infoHtml, ifr ? null : pwd)
+  const call = extractAjaxFromHtml(infoHtml, filePage ? null : ifr ? null : pwd)
   if (!call) throw new Error(pwd ? '密码错误或分享已失效' : '页面里未找到下载参数')
 
   const json = await postAjax(jar, infoBase, call, shareUrl)
@@ -553,17 +642,32 @@ async function openFileHtml(jar, shareUrl, html, pwd) {
   const name = String(json.inf || computeName(html) || '蓝奏云文件')
   const size = computeSize(html)
 
+  const entry = { id: '0', name, size, isDir: false, dir: '' }
+
   return {
     shareId: matchShare(shareUrl)?.key || '',
     title: name || computeName(html),
-    files: [{ id: '0', name, size, isDir: false, dir: '' }],
+    files: [entry],
     resolve: async () => {
       /* 脚本里那次「点下载」是从分享页点出去的，插件抓到的备选地址也一样按
        * 这个 Referer 重放 —— CDN 认的是分享页，不是下载域自己。 */
       const cdn = await followFileUrl(jar, downUrl, false, origin + '/')
+      /* 走过 `/fn` 那条路时没有分享页可看，文件名/体积得自己想办法。先看下载地址
+       * 里那个 `?fn=`（蓝奏直链一直带着，等于白捡）；只有这样还认不出名字时，
+       * 才多问站点一次响应头 —— 这些地址是一整套一次性签名，能不重问就不重问。 */
+      if (!entry.name || !/\.[a-z0-9]{2,5}$/i.test(entry.name)) {
+        const fromUrl = nameFromUrl(cdn)
+        if (fromUrl) entry.name = fromUrl
+      }
+      if (!entry.name) {
+        const meta = await probeFileMeta(cdn, origin + '/')
+        if (meta.name) entry.name = meta.name
+        if (meta.size) entry.size = meta.size
+      }
       return {
         url: cdn,
         headers: cdnHeaders(cdn, origin + '/'),
+        name: entry.name,
       }
     },
   }
@@ -582,6 +686,37 @@ async function open(url, ctx = {}) {
   const jar = browserCtx.jarFor(url, ctx.cookie)
 
   const shareUrl = hit.url
+
+  /* 入口页（`/fn?TOKEN`）不走 fetchPage：它没有挑战，用不着 esa 那套重试，
+   * 而且真出问题时要让调用方**安静地**回退去分享页，别抛「反爬校验未通过」。 */
+  const fetchEntry = (u, ref) =>
+    req(u, { headers: pageHeaders(ref, u), jar, timeout: 25000, allowLocal: ALLOW_LOCAL })
+
+  /* ① 地址本身就是下载入口（`/fn?TOKEN`：用户在浏览器里直接粘过来的那条） */
+  const direct = parseFnUrl(url)
+  if (direct) {
+    const r = await fetchEntry(url, direct.origin + '/')
+    const one = await openFileHtml(jar, direct.origin + '/', '', pwd, { html: r.text, base: url })
+    return { ...one, title: one.title || hit.key }
+  }
+
+  /* ② 插件把浏览器里那条 `/fn?TOKEN` 交过来了：直接用，**不再去取分享页**。
+   * 分享页挂着 ESA 挑战，纯 Node 取它会被回 400（用户看到的就是「解析失败」）；
+   * 而 `/fn` 页没有这道关，拿到它整条链路就能走到底。 */
+  const hint = browserCtx.fnFor(shareUrl)
+  if (hint) {
+    try {
+      const hOrigin = parseFnUrl(hint.url)?.origin || new URL(shareUrl).origin
+      const r = await fetchEntry(hint.url, hOrigin + '/')
+      if (r.status === 200 && IFRAME_OR_INFO.test(r.text)) {
+        const one = await openFileHtml(jar, shareUrl, '', pwd, { html: r.text, base: hint.url })
+        return { ...one, title: one.title || hit.key }
+      }
+    } catch {
+      /* 浏览器那条入口页不认了（token 过期之类）→ 老实回去走分享页 */
+    }
+  }
+
   const origin = new URL(shareUrl).origin
   const page = await fetchPage(jar, shareUrl, origin + '/')
   const html = page.text

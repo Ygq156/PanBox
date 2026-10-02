@@ -190,7 +190,7 @@
     return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB'
   }
 
-  const KIND_LABEL = { stream: '播放列表', segment: '分片', media: '视频/音频', file: '文件' }
+  const KIND_LABEL = { stream: '播放列表', segment: '分片', media: '视频/音频', file: '文件', entry: '下载入口' }
 
   /* ------------------------------------------------------------------ */
   /* 采集（DOM 侧）                                                       */

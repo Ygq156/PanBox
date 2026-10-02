@@ -238,6 +238,12 @@ async function resolveFiles({ sessionId, ids }) {
   for (const m of wanted) {
     if (done.has(String(m.id))) continue
     const r = await s.resolve(String(m.id))
+    /* 解析器换直链时可能**顺手认出了真文件名**（蓝奏那条 `/fn` 路绕过了分享页，
+     * 名字只能问下载域要）。这时以它为准：下载队列存的是这个名字。 */
+    if (r && r.name && r.name !== m.name) {
+      m.name = r.name
+      if (r.size) m.size = r.size
+    }
     out.push({
       id: String(m.id),
       name: m.name,
