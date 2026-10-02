@@ -122,6 +122,16 @@ body {
   font-size: 12px;
 }
 
+/* 标题栏上的版本号：只作标识，不抢视线 */
+.header .ver {
+  color: var(--text-dim);
+  font-size: 11px;
+  opacity: 0.65;
+  margin-left: 8px;
+  -webkit-app-region: no-drag;
+  user-select: text;
+}
+
 /* ---------- 按钮 ---------- */
 button {
   -webkit-app-region: no-drag;

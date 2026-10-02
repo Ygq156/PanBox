@@ -1490,8 +1490,11 @@ export default function App() {
   const [aria2, setAria2] = useState<Aria2Status>({ running: false })
   /** 启动时自动检查发现的新版本（只提示 + 打开下载页，不静默安装） */
   const [newVer, setNewVer] = useState<{ latest: string; current: string; url: string; name?: string } | null>(null)
+  /** 程序版本（标题栏常驻）：报障时一眼能说清装的是哪一版 */
+  const [ver, setVer] = useState('')
 
   useEffect(() => {
+    api.appInfo?.().then((i) => setVer(i?.version || '')).catch(() => {})
     api.getSettings().then(setSettings).catch(() => {})
     api.aria2Status().then(setAria2).catch(() => {})
     api.listDownloads().then(setTasks).catch(() => {})
@@ -1672,6 +1675,8 @@ export default function App() {
           {aria2.running ? `aria2 已就绪 ${aria2.version ?? ''}` : 'aria2 未连接'}
           {stats.activeCount > 0 ? ` · ${stats.activeCount} 个任务下载中 · ${formatSpeed(stats.speed)}` : ''}
         </div>
+        {/* 版本号常驻标题栏：报障时一眼能说清装的是哪一版，不用再猜 */}
+        {ver ? <div className="ver" title="程序版本">v{ver}</div> : null}
         {!aria2.running && (
           <button
             className="ghost tiny"
