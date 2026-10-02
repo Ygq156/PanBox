@@ -202,7 +202,9 @@ async function callOne(ep, url, ctx) {
   if (method === 'POST') {
     body = fill(ep.body || 'url={url}&pwd={pwd}', vars, false)
     const hasCt = Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')
-    if (!hasCt) headers['Content-Type'] = ep.contentType || 'application/x-www-form-urlencoded'
+    /* 默认是按表单发（多数自建解析接口这么收）。要发 JSON 的用户在
+     * 「请求内容类型」里写 application/json，或者直接在请求头里写 Content-Type。 */
+    if (!hasCt) headers['Content-Type'] = String(ep.contentType || '').trim() || 'application/x-www-form-urlencoded'
   }
 
   const r = await req(target, {

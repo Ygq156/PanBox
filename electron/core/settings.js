@@ -306,30 +306,42 @@ function load() {
   return cache
 }
 
+/**
+ * 写配置。**写盘失败要如实回报**（`ok:false` + 原因），不能默默吞掉：
+ * 磁盘满、杀软锁住文件、目录没有权限时，界面拿到成功之后用户下次启动会发现
+ * 设置和登录凭证全回去了 —— 那种「保存了但没保存」比报错难查得多。
+ *
+ * 内存里的值仍然更新（程序继续按用户刚改的跑），但调用方得把 `ok:false` 说出去。
+ *
+ * @returns {{ok:boolean, message?:string, cfg:object}} cfg 是写入后的完整配置（调用方接着用）
+ */
 function save(partial) {
   const cur = load()
   const next = { ...cur, ...(partial || {}) }
   if (partial && partial.cookies) next.cookies = { ...cur.cookies, ...partial.cookies }
   if (partial && partial.segConnections) next.segConnections = { ...cur.segConnections, ...partial.segConnections }
   cache = next
+  let out = { ok: true, cfg: next }
   try {
     fs.mkdirSync(path.dirname(FILE()), { recursive: true })
     fs.writeFileSync(FILE(), JSON.stringify(next, null, 2), 'utf8')
-  } catch {
-    /* 配置写不进去也不该让程序崩掉 */
+  } catch (e) {
+    out = { ok: false, message: '配置没能写进磁盘：' + ((e && e.message) || String(e)), cfg: next }
   }
   try {
     fs.mkdirSync(next.downloadDir, { recursive: true })
   } catch {
     /* ignore */
   }
-  return next
+  return out
 }
 
 /**
  * 「恢复默认设置」用：把可重置项换回默认值。
  * 刻意保留三样东西 —— 登录凭证（cookies）、用户自备的解析接口、以及那条用户承诺，
  * 否则点一下红按钮就得把四个网盘重新登一遍，这种「恢复默认」没人敢按。
+ *
+ * 返回值同 save()：`{ok, message?, cfg}`。
  */
 function resetDefaults() {
   const cur = load()

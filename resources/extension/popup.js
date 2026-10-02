@@ -18,15 +18,17 @@ async function activeTab() {
 }
 
 async function refresh() {
-  const s = await ask({ type: 'status' })
+  /* 通道可能在「没回话」的情况下关闭（service worker 出错、扩展刚被重载），
+   * 这时回调参数是 undefined —— 不给默认值，下面读 s.port 会抛，整个弹窗白屏。 */
+  const s = (await ask({ type: 'status' })) || {}
   const dot = $('dot')
-  dot.className = 'dot ' + (s && s.alive ? 'on' : 'off')
-  if (s && s.alive) {
+  dot.className = 'dot ' + (s.alive ? 'on' : 'off')
+  if (s.alive) {
     $('state').textContent = `已连接 PanBox · 127.0.0.1:${s.port}` + (s.paired ? '' : ' · 未配对')
   } else {
     $('state').textContent = '未连接：请先打开 PanBox（设置 → 浏览器插件 里能看到端口）'
   }
-  $('port').value = s.port
+  if (s.port) $('port').value = s.port
   $('intercept').checked = !!(s && s.intercept)
   $('panel').checked = !!(s && s.panel)
   $('sendPage').textContent = s && s.panel ? '把本页媒体 / 文件链接交给 PanBox' : '把本页文件链接交给 PanBox'

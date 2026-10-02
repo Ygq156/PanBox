@@ -161,22 +161,37 @@ class Aria2 {
   }
 
   async stop() {
-    if (this.proc) {
-      try {
-        await this.rpc('aria2.shutdown', [], 3000)
-      } catch {
-        /* ignore */
+    const proc = this.proc
+    if (!proc) return
+    /* 把「等它真的退出」这件事做扎实：shutdown RPC 只是请它退出，之后必须
+     * 等到 exit 事件，否则调用方（退出流程）会以为收干净了 —— 留下一个占着
+     * RPC 端口的孤儿进程，下次启动就报「aria2 启动失败」。 */
+    const exited = new Promise((resolve) => {
+      let done = false
+      const finish = () => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        resolve()
       }
-      await new Promise((r) => setTimeout(r, 400))
-      if (this.proc) {
+      const timer = setTimeout(() => {
         try {
-          this.proc.kill()
+          proc.kill()
         } catch {
           /* ignore */
         }
-      }
-      this.proc = null
+        finish()
+      }, 2500)
+      proc.once('exit', finish)
+      proc.once('error', finish)
+    })
+    try {
+      await this.rpc('aria2.shutdown', [], 3000)
+    } catch {
+      /* ignore */
     }
+    await exited
+    if (this.proc === proc) this.proc = null
   }
 
   /** 加入下载。options 支持 header / out / dir 等 aria2 原生选项 */

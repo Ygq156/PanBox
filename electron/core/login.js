@@ -199,11 +199,18 @@ async function openLogin(netdisk, parent) {
     let settled = false
     let win = null
     let timer = null
+    let giveUp = null
 
     const finish = (payload) => {
       if (settled) return
       settled = true
+      /* 两个计时器都要清：只清轮询的话，那个 5 分钟的兜底定时器会一直挂着，
+       * 闭包里还攥着窗口与 finish，登录成功十秒后它才醒 —— 白占一份内存，
+       * 也让「登录窗口关了没有」这类判断变得不好推理。 */
       if (timer) clearInterval(timer)
+      if (giveUp) clearTimeout(giveUp)
+      timer = null
+      giveUp = null
       try {
         if (win && !win.isDestroyed()) win.destroy()
       } catch {
@@ -260,18 +267,24 @@ async function openLogin(netdisk, parent) {
     })
 
     // 兜底：5 分钟没有任何结果就放弃，避免计时器常驻
-    setTimeout(() => {
+    giveUp = setTimeout(() => {
       if (!settled) finish({ ok: false, message: '登录超时（5 分钟）' })
     }, 5 * 60 * 1000)
   })
 }
 
-/** 清掉某个网盘的登录分区（退出登录） */
+/** 清掉某个网盘的登录分区（退出登录）
+ *
+ * 「退出登录」必须两处一起清：浏览器分区（persist:login-*）和 settings.json 里
+ * 那份 Cookie。只清前者的话，解析与下载照样能拿着旧 Cookie 成功 —— 用户会觉得
+ * 这个按钮没用。本次运行内预热过的标记也一并忘掉。
+ */
 async function clearLogin(netdisk) {
   const site = SITES[netdisk]
   if (!site) return false
   const ses = session.fromPartition(`persist:login-${netdisk}`)
   await ses.clearStorageData({ storages: ['cookies', 'localstorage'] })
+  warmedAt.delete(netdisk)
   return true
 }
 

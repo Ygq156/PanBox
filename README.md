@@ -177,9 +177,10 @@ npm run pack                           # 打包 NSIS + portable
 electron/                  主进程（CommonJS）
   main.js                  BrowserWindow + 全部 IPC + 转存副本回收
   preload.js               contextBridge → window.panbox
-  core/  aria2.js  segmentDownloader.js  taskManager.js  settings.js  login.js  bridge.js  proxy.js
-  parsers/  index.js  lanzou.js  ilanzou.js  clouddrive.js(夸克+UC)  pan123.js  baidu.js
-            xunlei.js  direct.js  custom.js  util.js  esa.js
+  core/  aria2.js  segmentDownloader.js  taskManager.js  settings.js  login.js  bridge.js  proxy.js  trash.js
+  parsers/  index.js  util.js  esa.js  esaSolve.js  browserCtx.js  lanzou.js  ilanzou.js
+            clouddrive.js(夸克+UC)  quark.js  uc.js  pan123.js  baidu.js  xunlei.js
+            direct.js  custom.js
 src/                       渲染层（React + TS）
 resources/extension/       浏览器插件（MV3）
 resources/aria2/           aria2c.exe（自行下载，不入库）

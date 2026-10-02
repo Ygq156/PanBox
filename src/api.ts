@@ -102,8 +102,8 @@ export interface PanboxAPI {
   dropParseSession(sessionId: string): Promise<boolean>
   listDownloads(): Promise<DownloadTask[]>
   addDownloads(p: AddPayload): Promise<{ ok: boolean; added: string[]; errors: string[] }>
-  pauseTask(gid: string): Promise<boolean>
-  resumeTask(gid: string): Promise<boolean>
+  pauseTask(gid: string): Promise<{ ok: boolean; message?: string }>
+  resumeTask(gid: string): Promise<{ ok: boolean; message?: string }>
   /** 插队：把任务顶到最前；队满时主进程会暂停一条正在下载的让它先跑（结束后自动恢复） */
   jumpTask(gid: string): Promise<{ ok: boolean; status?: string; paused?: string[]; message?: string }>
   refreshTask(gid: string): Promise<{ ok: boolean; gid?: string; message?: string }>
@@ -116,7 +116,7 @@ export interface PanboxAPI {
   trashRestore(id: string): Promise<{ ok: boolean; name?: string; path?: string; message?: string }>
   trashDelete(id: string): Promise<boolean>
   trashEmpty(): Promise<number>
-  trashOpenDir(): Promise<string>
+  trashOpenDir(): Promise<{ dir: string; ok: boolean; message?: string }>
   getSettings(): Promise<Settings>
   setSettings(s: Partial<Settings>): Promise<Settings>
   /** 恢复默认设置（登录凭证与自备解析接口保留），返回恢复后的设置 */

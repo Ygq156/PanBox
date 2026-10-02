@@ -19,6 +19,10 @@ const BADGE_MS = 2500
 
 const cfg = { port: DEFAULT_PORT, token: '', intercept: true, panel: true }
 
+/* 已经「还给浏览器」的下载地址：投递失败时我们把它放回去，而放回去又会触发
+ * downloads.onCreated。见监听器里那道闸。 */
+const handedBack = new Set()
+
 /* ------------------------------------------------------------------ */
 /* 抓到的记录要熬过 service worker 休眠                                 */
 /* ------------------------------------------------------------------ */
@@ -42,6 +46,8 @@ async function loadCaptured() {
     const arr = Array.isArray(got[CAP_KEY]) ? got[CAP_KEY] : []
     const now = Date.now()
     for (const r of arr) {
+      /* 尺寸/名字等字段逐项回填；tabId 在浏览器重启后会变，但 worker 被回收
+       * 与 tabId 无关，所以同一会话里它还是对的。 */
       if (!r || !r.url || now - (r.t || 0) > MEDIA_TTL) continue
       const m = mediaByTab.get(r.tabId)
       if (m) m.set(r.url, { t: r.t, kind: r.kind, ct: r.ct || '', size: r.size || 0, name: r.name || '', attach: !!r.attach })
@@ -56,7 +62,30 @@ async function loadCaptured() {
   }
 }
 
+/* 批量页（蓝奏、123 那种一页几十个文件）会连着触发几十次 ——
+ * 每次都全量重写一遍 session 存储既没必要，几次并发写还会互相覆盖。
+ * 攒 600ms 写一次；service worker 若正好在这窗口里被回收，丢的也只是最后几条
+ * （记录本来就有 3 分钟有效期，代价可以接受）。 */
+let saveTimer = null
+let saveRunning = false
+let saveDirty = false
+
+function scheduleSaveCaptured() {
+  saveDirty = true
+  if (saveTimer) return
+  saveTimer = setTimeout(() => {
+    saveTimer = null
+    saveCaptured()
+  }, 600)
+}
+
 async function saveCaptured() {
+  if (saveRunning) {
+    saveDirty = true
+    return
+  }
+  saveRunning = true
+  saveDirty = false
   try {
     const now = Date.now()
     const out = []
@@ -71,16 +100,25 @@ async function saveCaptured() {
     await chrome.storage.session.set({ [CAP_KEY]: out })
   } catch {
     /* 同上，存不下就算了 */
+  } finally {
+    saveRunning = false
+    if (saveDirty) scheduleSaveCaptured()
   }
 }
 
-/* worker 每次被唤醒都跑一遍：把还在有效期内的记录读回来 */
-if (chrome.storage && chrome.storage.session) {
-  try {
-    chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
-  } catch {
-    /* 老版本浏览器没有这个方法 */
+/* 读回来这件事要等 mediaByTab / MEDIA_TTL 都定义好（见文件末尾的 capturedReady），
+ * 在这里先把两件事办了：session 存储对扩展自己可见（默认就是，显式声明一次），
+ * 以及把「读回来」变成一个可以被等的 Promise —— 回收后第一条 mediaList 消息
+ * 来的时候，记录还没读完就会回一个空列表，用户看到的仍然是 0 个。 */
+let capturedReady = Promise.resolve()
+try {
+  if (chrome.storage && chrome.storage.session && chrome.storage.session.setAccessLevel) {
+    chrome.storage.session
+      .setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
+      .catch(() => {})
   }
+} catch {
+  /* 老版本浏览器没有这个方法 */
 }
 
 /* ------------------------------------------------------------------ */
@@ -149,6 +187,14 @@ async function ping() {
 }
 
 /**
+ * 连不上 PanBox 时对用户说的同一句话（不同入口口径要一致：
+ * 说清「连的是哪个端口」和「下一步做什么」）。
+ */
+function offlineMsg() {
+  return `连不上 PanBox：127.0.0.1:${cfg.port} 上的服务没有回应。先确认 PanBox 已经打开；还不行就在「设置 → 浏览器插件」里看看端口是不是这个数。`
+}
+
+/**
  * 投递一条任务。403 时自动重新配对再试一次（用户重装/重置 PanBox 后 token 会变）。
  */
 async function send(payload) {
@@ -169,14 +215,14 @@ async function post(path, payload) {
   /* 没令牌就先配对；配不上说明 7799 上的不是 PanBox（或被别的程序占着），
    * 这时**不要**继续投递 —— 免得把页面地址与该域 Cookie 送给一个陌生进程。 */
   if (!cfg.token && !(await pair())) {
-    return { ok: false, message: `连不上 PanBox：127.0.0.1:${cfg.port} 上的服务没有回应配对（端口被占用或 PanBox 版本过旧）` }
+    return { ok: false, message: offlineMsg() }
   }
   const body = JSON.stringify({ ...payload, token: cfg.token, via: payload.via || 'extension' })
   let r
   try {
     r = await raw(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body })
   } catch (e) {
-    return { ok: false, message: '连不上 PanBox（它没在运行？）' }
+    return { ok: false, message: offlineMsg() }
   }
   if (r.status === 403 && (await pair())) {
     const body2 = JSON.stringify({ ...payload, token: cfg.token, via: payload.via || 'extension' })
@@ -233,7 +279,7 @@ async function badge(text, color) {
 /** 页面里那些「一看就是文件」的链接 */
 function collectFileLinks() {
   const exts =
-    /\.(zip|rar|7z|tar|gz|bz2|xz|iso|img|exe|msi|apk|dmg|pkg|deb|rpm|pdf|epub|mobi|azw3|mp4|mkv|avi|mov|wmv|flv|webm|mp3|flac|wav|ape|m4a|torrent|bin|jar|crx|whl|onnx|safetensors|gguf|part[0-9]*)$/i
+    /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|iso|img|exe|msi|apk|ipa|dmg|pkg|deb|rpm|pdf|epub|mobi|azw3|mp4|mkv|avi|mov|wmv|flv|webm|mp3|flac|wav|ape|m4a|torrent|bin|jar|crx|whl|onnx|safetensors|gguf|part[0-9]*)$/i
   const out = []
   const seen = new Set()
   for (const a of document.querySelectorAll('a[href]')) {
@@ -605,7 +651,7 @@ function rememberMedia(tabId, url, ct, size, name, attach) {
     while (m.size > MEDIA_MAX) m.delete(m.keys().next().value)
   }
   /* 只有「服务器明说可下载」的才值得写进 session 存储（量小、价值最高） */
-  if (attach) saveCaptured()
+  if (attach) scheduleSaveCaptured()
 }
 
 function dropTab(tabId) {
@@ -616,6 +662,13 @@ function dropTab(tabId) {
 /* 面板看到的那份列表：这一页浏览器真的请求过的（媒体 + 文件）。
  * 抽成函数是为了能被测试直接调用 —— 扩展自己发的 runtime 消息不会回到自己的
  * onMessage，面板那条路径在自动化里没法靠消息自问自答。 */
+/* 面板与投递都先等「上次唤醒写下的记录」读回来。
+ * 不等的话，service worker 刚被回收过一次时，第一条 mediaList 会回空列表 ——
+ * 用户看到的仍然是「扫描完成：0 个」。 */
+async function waitCaptured() {
+  await capturedReady
+}
+
 function mediaListView(tabId) {
   const out = []
   const have = new Set()
@@ -757,6 +810,10 @@ chrome.downloads.onCreated.addListener(async (item) => {
   if (!cfg.intercept) return
   /* blob:/data: 这种是页面自己生成的，交给 PanBox 没有意义 */
   if (!/^https?:/i.test(item.url || '')) return
+  /* PanBox 没开时我们把下载「放回去」，而放回去本身又会触发这个监听器 ——
+   * 没有这道闸就是个死循环：cancel → 投递失败 → 放回 → 又 cancel。
+   * 放回去过的地址记一笔，第二次见到直接放过，让浏览器自己下完。 */
+  if (handedBack.has(item.url)) return
   const hint = seen.get(item.url) || {}
   /* 先把浏览器这次下载按住，等 PanBox 明确收下了才真的丢掉它；
    * 要是 PanBox 没开，再把它放回去 —— 绝不能让用户的下载凭空消失。 */
@@ -787,6 +844,8 @@ chrome.downloads.onCreated.addListener(async (item) => {
   } else {
     badge('!', '#ff5b5b')
     if (cancelled) {
+      handedBack.add(item.url)
+      if (handedBack.size > 200) handedBack.delete(handedBack.values().next().value)
       try {
         await chrome.downloads.download({ url: item.url, filename: fromPath || undefined })
       } catch {
@@ -848,6 +907,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     }
     if (msg.type === 'mediaList') {
       const tabId = _sender && _sender.tab ? _sender.tab.id : -1
+      await waitCaptured()
       return reply({ ok: true, items: mediaListView(tabId) })
     }
     if (msg.type === 'sendUrls') {
@@ -895,7 +955,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       return reply(await deliverPageContext(tabId, msg.url || (sTab && sTab.url) || '', msg.title || (sTab && sTab.title) || ''))
     }
     return reply({ ok: false, message: '未知消息类型 ' + msg.type })
-  })()
+  })().catch((e) => {
+    /* 这里兜一手：任何 await 意外 reject（最现实的是标签页已经关掉、
+     * chrome.scripting 在受限页上失败）都必须回一句话 —— 不回的话，
+     * 监听器已经 return true 把通道挂着了，面板会永远停在「正在交给 PanBox…」。 */
+    try {
+      reply({ ok: false, message: '插件内部出错：' + ((e && e.message) || String(e)) })
+    } catch {
+      /* 通道已经关了 */
+    }
+  })
   return true /* 异步回复 */
 })
 
@@ -905,6 +974,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
  * 而那条 `/fn?TOKEN` 入口页浏览器自己请求过，没有挑战。
  * 面板投递文件时也走它 —— 否则 PanBox 手上只有一条地址，什么都过不去。 */
 async function deliverPageContext(tabId, rawUrl, title) {
+  /* 回收后刚被唤醒时，抓到的文件地址还没从 session 里读回来 ——
+   * 不等这一步，投递出去的「备选地址」会是空的。 */
+  await waitCaptured()
   /* 以浏览器里真实的页面地址为准（popup 传来的可能是 Referer） */
   let url = stripHash(rawUrl || '')
   if (!/^https?:/i.test(url)) {
@@ -954,3 +1026,7 @@ async function deliverPageContext(tabId, rawUrl, title) {
   if (r && r.ok) badge('✓', '#34c759')
   return r
 }
+
+/* worker 每次被唤醒都跑一遍：把还在有效期内的记录读回来。
+ * 必须放在这里 —— mediaByTab 与 MEDIA_TTL 都在上面才定义好，放前面会拿到 undefined。 */
+capturedReady = loadCaptured().catch(() => {})
