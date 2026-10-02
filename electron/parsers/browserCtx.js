@@ -50,14 +50,23 @@ function set(payload) {
   const referer = String((payload && payload.referer) || '')
   const userAgent = String((payload && payload.userAgent) || '').slice(0, 400)
   const list = Array.isArray(payload && payload.cookies) ? payload.cookies : []
-  const mapped = list
-    .map((c) => ({
-      host: String((c && c.host) || host).toLowerCase(),
-      cookie: String((c && c.cookie) || '').slice(0, MAX_COOKIE),
-    }))
-    .filter((c) => c.host && c.cookie && (sameSite(c.host, host) || true))
+  /* 插件交过来的每一条 cookie 都按它自己声明的主机存下。分享页常常把文件放在
+ * **完全另一家公司**的下载域上（蓝奏：分享页 lanrar.com、下载域 webgetstore.com），
+ * 曾经这里要求 cookie 主机必须与页面主机「同站点」，于是这类下载域的现场被整条丢掉 ——
+ * 表现就是「插件明明抓到了，PanBox 却像没看见」。 */
+const mapped = list
+  .map((c) => ({
+    host: String((c && c.host) || host).toLowerCase(),
+    cookie: String((c && c.cookie) || '').slice(0, MAX_COOKIE),
+  }))
+  .filter((c) => c.host && c.cookie)
+  /* 一条 cookie 都没有时，只要这次还带来了「浏览器此刻的身份」（UA / Referer /
+ * 请求头），也按本主机存一条空 cookie 的现场：下载域就是靠它才认得出「是同一个人」。 */
   if (!mapped.length && payload && payload.cookie) {
     mapped.push({ host, cookie: String(payload.cookie).slice(0, MAX_COOKIE) })
+  }
+  if (!mapped.length && (userAgent || referer || Object.keys(pickHeaders(payload && payload.requestHeaders)).length)) {
+    mapped.push({ host, cookie: '' })
   }
 
   const at = Date.now()
@@ -98,6 +107,25 @@ function lookup(url) {
   if (exact) return exact
   for (const [h, v] of store) if (sameSite(host, h)) return v
   return null
+}
+
+/**
+ * 拿一份「不管哪台主机」的浏览器身份，只用来填 UA。
+ * 下载域常和分享页**完全不同域**（蓝奏：分享页 lanrar.com、文件在 webgetstore.com），
+ * 同站点规则永远匹配不上，但 CDN 已经见过这个 UA 换了条链接出来 —— 换了个人来取它就拒。
+ * cookie / Referer 绝不走这条：那是会串门的东西。
+ */
+function anyUserAgent() {
+  gc()
+  let best = ''
+  let at = 0
+  for (const [, v] of store) {
+    if (v.userAgent && v.at >= at) {
+      at = v.at
+      best = v.userAgent
+    }
+  }
+  return best
 }
 
 /**
@@ -174,12 +202,18 @@ function headersFor(headers, url, fallbackReferer) {
     Object.assign(out, mergeHeaders(out, v.headers))
   }
   if (v && own) {
-    if (v.userAgent) out['User-Agent'] = v.userAgent
     /* 只在这个主机就是分享页主机时沿用浏览器的 Referer —— 跨主机（例如
      * 分享页在 lanzoub.com、ajax 在 apifile.woozooo.com）照原样带过去，
      * 会把「一个站点的页面地址」泄露给另一个站点，而且反爬也未必认。 */
     if (v.referer && (!pageHost || sameSite(host, pageHost))) out.Referer = v.referer
   }
+  /* UA：谁在现场就用谁的；现场是个空壳（例如只记了「浏览器下过的文件地址」，
+   * 没有 UA）时，借最近一次见到的浏览器真身。
+   * 下载域常常是「浏览器没导航过去、但链接是浏览器身份换出来的」那种主机：这时
+   * 调用方给的是写死的 Chrome UA，而 CDN 已经见过另一副面孔换了条链接出来 ——
+   * 换了个人来取它就拒。用户看到的就是「浏览器和 NDM 能下，PanBox 下不了」。 */
+  const ua = (v && own && v.userAgent) || anyUserAgent()
+  if (ua) out['User-Agent'] = ua
   if (!out.Referer && fallbackReferer) out.Referer = fallbackReferer
   return out
 }
@@ -219,6 +253,9 @@ function pickHeaders(h) {
  * 或明确的二进制类型）时，把那条地址交过来，解析器可以拿它当备选。
  *
  * 与 cookie 同规矩：**只存内存**、**按主机取用**，不给别的主机用。
+ * 但「文件在另一家公司域名上」（蓝奏：分享页 lanrar.com、文件在 webgetstore.com）
+ * 这种最常见的情形里，下载域自己不会有现场条目 —— 这时也得把它记下来，否则
+ * 插件明明抓到了、程序这边却一条备选都问不出来。
  */
 function noteUrls(list) {
   const now = Date.now()
@@ -229,9 +266,11 @@ function noteUrls(list) {
     if (!/^https?:\/\//i.test(url) || url.length > 2048) continue
     const host = normHost(url)
     if (!host) continue
-    const v = store.get(host)
-    /* 只有这个主机本来就有现场时才记（现场是插件投递的那一页带出来的） */
-    if (!v) continue
+    let v = store.get(host)
+    if (!v) {
+      v = { cookie: '', referer: '', userAgent: '', headers: {}, at: now, urls: [] }
+      store.set(host, v)
+    }
     if (!v.urls) v.urls = []
     if (v.urls.some((u) => u.url === url)) continue
     v.urls.unshift({ url, name: String((it && it.name) || '').slice(0, 200), at: now })
