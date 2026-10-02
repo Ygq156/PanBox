@@ -10,7 +10,7 @@
  *      才能换到真正的 CDN 直链；过早提交只会得到 `url=?SignError`
  */
 
-const { req, form, sleep, decodeEntities, humanSizeToBytes, Jar, UA_PC_CHROME, UA_MOBILE_ANDROID } = require('./util')
+const { req, form, sleep, decodeEntities, humanSizeToBytes, Jar, UA_PC_CHROME, UA_MOBILE_ANDROID, readTextCapped, MAX_RESP_SIZE } = require('./util')
 const { withArg1Retry, hasChallenge, extractArg1, acwScV2 } = require('./esa')
 const browserCtx = require('./browserCtx')
 
@@ -34,6 +34,21 @@ const P_FI_SIZE =
   />文件大小：<\/span>(.*?)<br>|"n_filesize">大小：(.*?)<\/div>|文件大小：<\/div><div class="fileinforight">(.*?)<\/div>/
 const P_TITLE = /<title>([\s\S]*?)<\/title>/i
 const P_FILEMORE = /url\s*:\s*'(\/filemoreajax\.php\?file=\d+)'[\s\S]*?data\s*:\s*\{([^}]+)\}/
+
+/* 下载域可以直接把文件本体回给你（实测用户那条 CDN 链接就是：200 +
+ * `application/octet-stream` + 38MB 正文）。凡是「正文明显不是网页」，就当直链
+ * 收下：立刻把连接丢掉、**绝不读正文** —— 以前会把它当页面读，几十 MB 正文撞上
+ * 8MB 上限，报出「响应体过大（超过 8MB），已中止」这种用户看不懂的错。
+ * 反过来，下载域那两种**真页面**（验证页 `down_r` + ajax.php、反爬挑战页）是
+ * text/html，照旧要读出来，所以这里只按类型放行、不能一律不读。 */
+const PAGE_TYPES = /^(?:text\/|application\/(?:xhtml\+xml|json|javascript|xml))/i
+function isFileResponse(r) {
+  if (!r) return false
+  const cd = String(r.headers.get('content-disposition') || '')
+  if (/attachment/i.test(cd)) return true
+  const ct = String(r.headers.get('content-type') || '')
+  return !!ct && !PAGE_TYPES.test(ct)
+}
 
 const AJAX_FALLBACK_ORIGINS = [
   'https://apifile.woozooo.com',
@@ -337,17 +352,27 @@ async function verifyAjax(jar, downUrl, origin, html, attempt) {
 
   if (attempt < 1) {
     // SignError / 请求失败都必须重新拉验证页换新 sign，复用旧 sign 必然再失败
-    const fresh = await req(downUrl, { headers: pageHeaders(origin + '/', downUrl), jar, redirect: 'manual', allowLocal: ALLOW_LOCAL })
+    const fresh = await req(downUrl, { headers: pageHeaders(origin + '/', downUrl), jar, redirect: 'manual', allowLocal: ALLOW_LOCAL, noBody: true })
     if (isDirectLink(fresh.location)) return fresh.location
-    if (hasChallenge(fresh.text)) {
-      const a = extractArg1(fresh.text)
+    /* 同 followFileUrl：这一跳也可能直接被回文件本体，那就没得重试了 */
+    if (fresh.status === 200 && isFileResponse(fresh)) {
+      try {
+        await fresh.body?.cancel()
+      } catch {
+        /* 已经断了就算了 */
+      }
+      return downUrl
+    }
+    const freshHtml = await readTextCapped(fresh, MAX_RESP_SIZE, fresh.what)
+    if (hasChallenge(freshHtml)) {
+      const a = extractArg1(freshHtml)
       if (a) {
         jar.set('acw_sc__v2', acwScV2(a))
         return followFileUrl(jar, downUrl, true)
       }
     }
-    if (fresh.text && fresh.text.includes('down_r')) {
-      return verifyAjax(jar, downUrl, origin, fresh.text, attempt + 1)
+    if (freshHtml && freshHtml.includes('down_r')) {
+      return verifyAjax(jar, downUrl, origin, freshHtml, attempt + 1)
     }
   }
   throw new Error('蓝奏二次验证未拿到直链（分享可能已过期或触发风控）')
@@ -363,11 +388,23 @@ async function followFileUrl(jar, downUrl, retried = false) {
     redirect: 'manual',
     timeout: 25000,
     allowLocal: ALLOW_LOCAL,
+    /* 先只要响应头：这一跳可能直接被回文件本体，不能先缓冲一遍（8MB 上限会炸） */
+    noBody: true,
   })
 
   if (isDirectLink(r.location)) return r.location
-
-  const html = r.text || ''
+  /* 没有 Location，返回的又不是网页 —— 这个地址本身就是直链。
+   * 几十 MB 的正文一个字都不用看，把连接丢掉（服务端也就停止推了）。 */
+  if (r.status === 200 && isFileResponse(r)) {
+    try {
+      await r.body?.cancel()
+    } catch {
+      /* 已经断了就算了 */
+    }
+    return downUrl
+  }
+  /* 其余情况（验证页 / 挑战页）确实是网页，才是要读的正文 */
+  const html = await readTextCapped(r, MAX_RESP_SIZE, r.what)
   if (hasChallenge(html)) {
     if (retried) throw new Error('蓝奏下载域反爬校验失败，请稍后重试')
     const a = extractArg1(html)

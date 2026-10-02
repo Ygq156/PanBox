@@ -174,6 +174,13 @@ async function req(url, opts = {}) {
      * 带去内网（见下面 assertOutbound 的注释）。只有用户**自己**在设置里把解析
      * 接口或直链指向内网时，才由调用方显式放开。 */
     allowLocal = false,
+    /* 只要响应头，正文交给调用方自己决定读不读。
+     * 有些站点（蓝奏的下载域就是）会**直接把文件本体回给你**（实测用户那条 CDN
+     * 链接：200 + application/octet-stream + 38MB）。一律缓冲到 8MB 上限的话，
+     * 大文件只会得到「响应体过大（超过 8MB），已中止」这种看不懂的错；打开这个
+     * 开关后，调用方可以先用响应头判定「这不是网页」，把连接一丢就走。
+     * 返回的 `body` 就是原始流，读它请用 readTextCapped(res, MAX_RESP_SIZE)。 */
+    noBody = false,
   } = opts
 
   const h = { 'User-Agent': DEFAULT_UA, ...headers }
@@ -214,13 +221,18 @@ async function req(url, opts = {}) {
     /* 超限时把「哪个地址、什么类型」写进错误里：页面类请求拿到超大响应时，
      * 光一句「响应体过大」看不出是链接过期、被反爬拦了，还是服务端直接回了文件。 */
     const respWhat = `${safeUrl(current)} 返回 HTTP ${res.status} ${res.headers.get('content-type') || '未知类型'}`
-    const text = await readTextCapped(res, MAX_RESP_SIZE, respWhat)
+    const text = noBody ? '' : await readTextCapped(res, MAX_RESP_SIZE, respWhat)
     return {
       status: res.status,
       headers: res.headers,
       location: res.headers.get('location') || '',
+      size: Number(res.headers.get('content-length') || 0),
       text,
       url: res.url || current,
+      /* noBody 时正文还没读，原样交给调用方（判定出不是网页就直接丢掉） */
+      body: res.body,
+      /* 超限/超时那类错误文案里用的那句「哪个地址、什么类型」 */
+      what: respWhat,
     }
   } catch (e) {
     const msg = e && e.name === 'AbortError' ? `请求超时：${safeUrl(current)}` : `${e && e.message ? e.message : e}`
@@ -368,6 +380,8 @@ module.exports = {
   Jar,
   req,
   reqJson,
+  readTextCapped,
+  MAX_RESP_SIZE,
   assertOutbound,
   isPrivateHost,
   safeUrl,
