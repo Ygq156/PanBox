@@ -568,7 +568,9 @@ class SegmentDownloader extends EventEmitter {
       out: t.out,
       done: [...t.done],
     }
-    await fsp.writeFile(t.sidecarPath, JSON.stringify(body), 'utf8').catch(() => {})
+    /* 断点写不下去就让它抛出去：这一片不算下好，任务如实报错。
+     * 吞掉的话磁盘满了会一路「成功」到最后才炸。 */
+    await fsp.writeFile(t.sidecarPath, JSON.stringify(body), 'utf8')
   }
 
   /* ------------------------------------------------------------------ */
@@ -749,7 +751,7 @@ class SegmentDownloader extends EventEmitter {
       let written = 0
       try {
         written = await this._fetchChunk(t, idx)
-        this._commitChunk(t, idx, written)
+        await this._commitChunk(t, idx, written)
         t.errorCode = 0
         t.errorMessage = ''
       } catch (e) {
@@ -770,13 +772,19 @@ class SegmentDownloader extends EventEmitter {
     }
   }
 
-  /** 一片下完：计入进度、写断点 */
-  _commitChunk(t, idx, written) {
+  /** 一片下完：先把这片字节刷到盘，再计入进度、写断点。
+ *
+ * 顺序不能反：断点里记着「这片下好了」，下次续传就会跳过它。要是字节还在系统
+ * 缓存里没落盘就断电，续传会把一片空洞当成功，最后产出一个看着下完、其实坏了
+ * 的文件。fsync 成功之后才允许它进 done。
+ */
+  async _commitChunk(t, idx, written) {
     t.inflight.delete(idx)
     t.liveBytes = Math.max(0, t.liveBytes - written)
+    if (t.fh && t.status === 'active') await t.fh.sync()
     t.done.add(idx)
     t.completed += this._chunkLen(t, idx)
-    this._persist(t).catch(() => {})
+    await this._persist(t)
   }
 
   /** 取下一个待下分片（轮转扫描，避免所有 worker 都从 0 开始抢） */

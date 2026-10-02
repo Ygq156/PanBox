@@ -727,7 +727,7 @@ async function bridgePage(p) {
 /** 拿（必要时生成）桥的配置。令牌只存在本机 settings.json 里。 */
 function bridgeCfg() {
   const cfg = settings.load()
-  if (!cfg.bridgeToken) cfg.bridgeToken = settings.save({ bridgeToken: bridge.ensureToken('') }).bridgeToken
+  if (!cfg.bridgeToken) cfg.bridgeToken = settings.save({ bridgeToken: bridge.ensureToken('') }).cfg.bridgeToken
   return cfg
 }
 
@@ -807,7 +807,8 @@ function registerIpc() {
     const patch = checked.value
     /* cookies 单独合并：打码串（用户没动那一格）保留旧值，空串清除，其它为新值 */
     if (patch.cookies) patch.cookies = settings.mergeCookies(patch.cookies, before.cookies)
-    const after = settings.save(patch || {})
+    const saved = settings.save(patch || {})
+    const after = saved.cfg
     try {
       fs.mkdirSync(after.downloadDir, { recursive: true })
     } catch {
@@ -816,6 +817,10 @@ function registerIpc() {
     /* 代理是 aria2 的**命令行参数**，改不了运行时（changeGlobalOption 不支持 all-proxy），
      * 所以只要代理设置变了就得重启 aria2 子进程。 */
     await applyRuntimeSettings(before, after)
+    if (!saved.ok) {
+      /* 内存里已经按新值跑了，但下次启动会回到旧值。要说出去，不能让用户以为存住了。 */
+      throw new Error(saved.message || '设置没能写进磁盘')
+    }
     /* 回给渲染层的一律是脱敏副本：settings:get 早就这么做了，这里漏掉的话
      * 「保存」之后界面手里就攥着一份凭证原文，等于白脱敏。 */
     return settings.forRenderer(after)
@@ -825,9 +830,9 @@ function registerIpc() {
   ipcMain.handle('app:setAutoStart', async (_e, on) => {
     const checked = settings.sanitizePatch({ autoStart: !!on })
     if (!checked.ok) throw new Error(checked.message)
-    settings.save(checked.value)
+    const saved = settings.save(checked.value)
     applyAutoStart(settings.load())
-    return { ok: true, autoStart: !!settings.load().autoStart }
+    return { ok: true, autoStart: !!settings.load().autoStart, message: saved.ok ? '' : saved.message }
   })
 
   ipcMain.handle('app:info', () => ({
@@ -843,9 +848,11 @@ function registerIpc() {
    * 登录凭证与用户自备的解析接口会被保留，其余回默认值。 */
   ipcMain.handle('settings:reset', async () => {
     const before = settings.load()
-    const after = settings.resetDefaults()
-    boot('settings-reset', 'restore defaults')
+    const saved = settings.resetDefaults()
+    const after = saved.cfg
+    boot('settings-reset', 'restore defaults', saved.ok ? 'ok' : 'save failed')
     await applyRuntimeSettings(before, after)
+    if (!saved.ok) throw new Error(saved.message || '设置没能写进磁盘')
     return settings.forRenderer(after)
   })
 
@@ -927,8 +934,9 @@ function registerIpc() {
   })
 
   ipcMain.handle('bridge:newToken', async () => {
-    settings.save({ bridgeToken: bridge.ensureToken('') })
+    const saved = settings.save({ bridgeToken: bridge.ensureToken('') })
     await startBridge()
+    if (!saved.ok) boot('bridge-token', 'save failed: ' + saved.message)
     return bridgeInfo()
   })
 
@@ -993,13 +1001,35 @@ function registerIpc() {
  */
   ipcMain.handle('login:open', async (_e, netdisk) => {
     const r = await login.openLogin(netdisk, win)
+    let saveErr = ''
     if (r && r.ok && r.cookie) {
-      settings.save({ cookies: { [String(netdisk)]: r.cookie } })
-      boot('login', String(netdisk), 'saved len=' + String(r.cookie).length)
+      const w = settings.save({ cookies: { [String(netdisk)]: r.cookie } })
+      if (!w.ok) saveErr = w.message
+      boot('login', String(netdisk), 'saved len=' + String(r.cookie).length, w.ok ? 'ok' : 'save failed')
     }
-    return { ok: !!(r && r.ok), loggedIn: !!(r && r.loggedIn), count: r && r.count, message: r && r.message }
+    return {
+      ok: !!(r && r.ok),
+      loggedIn: !!(r && r.loggedIn),
+      count: r && r.count,
+      /* 登录成了但凭证没落盘 → 必须说出来，否则用户重启就得再登一次 */
+      message: saveErr || (r && r.message),
+    }
   })
-  ipcMain.handle('login:clear', async (_e, netdisk) => login.clearLogin(netdisk))
+  ipcMain.handle('login:clear', async (_e, netdisk) => {
+    const nd = String(netdisk || '')
+    const ok = await login.clearLogin(nd)
+    if (ok) {
+      /* 只清浏览器分区是不够的：解析器用的是 settings.json 里那份 Cookie，
+       * 不清掉的话「退出登录」之后照样能解析、能下载。 */
+      const jar = { ...(settings.load().cookies || {}) }
+      if (jar[nd]) {
+        delete jar[nd]
+        const w = settings.save({ cookies: jar })
+        boot('login-clear', nd, w && w.ok === false ? 'save failed: ' + w.message : 'cleared')
+      }
+    }
+    return ok
+  })
 
   /**
    * 夸克 / UC 的 CDN 需要网页 JS 现场生成的短效令牌（`__puus`）：夸克不带它一律 412
@@ -1049,7 +1079,10 @@ function registerIpc() {
         boot('warm-fail', nd, e && e.message ? e.message : String(e))
       }
     }
-    if (changed) settings.save({ cookies: jar })
+    if (changed) {
+      const w = settings.save({ cookies: jar })
+      if (!w.ok) boot('warm-save', 'save failed: ' + w.message)
+    }
   }
 
   ipcMain.handle('parse:share', async (_e, payload) => {
@@ -1104,22 +1137,25 @@ function registerIpc() {
     if (sessionId) parsers.dropSession(String(sessionId))
     return true
   })
-  ipcMain.handle('downloads:pause', (_e, gid) =>
-    (isSegTask(gid) ? seg.pause(gid) : aria2.pause(gid))
-      .then(() => {
-        tasks.kick()
-        return true
-      })
-      .catch(() => false),
-  )
-  ipcMain.handle('downloads:resume', (_e, gid) =>
-    (isSegTask(gid) ? seg.unpause(gid) : aria2.unpause(gid))
-      .then(() => {
-        tasks.kick()
-        return true
-      })
-      .catch(() => false),
-  )
+  ipcMain.handle('downloads:pause', async (_e, gid) => {
+    try {
+      await (isSegTask(gid) ? seg.pause(gid) : aria2.pause(gid))
+      tasks.kick()
+      return { ok: true }
+    } catch (e) {
+      /* 原来吞成 false，界面拿到就什么也不做 —— 用户点了暂停没反应也不知道为什么 */
+      return { ok: false, message: '暂停失败：' + ((e && e.message) || String(e)) }
+    }
+  })
+  ipcMain.handle('downloads:resume', async (_e, gid) => {
+    try {
+      await (isSegTask(gid) ? seg.unpause(gid) : aria2.unpause(gid))
+      tasks.kick()
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, message: '继续失败：' + ((e && e.message) || String(e)) }
+    }
+  })
 
   /* 插队 ⬆：把这条任务顶到最前面，必要时暂停一条正在下载的给它腾位置。
    * - 排队中的任务：aria2 用 changePosition(gid, 0, 0) 挪到队首；分段引擎有自己的队列，用 seg.jumpTop()。
@@ -1366,8 +1402,10 @@ function registerIpc() {
     } catch {
       /* ignore */
     }
-    await shell.openPath(dir).catch(() => {})
-    return dir
+    /* openPath 不抛异常，它**返回**错误串（打不开就回一句人看得懂的原因） */
+    const err = await shell.openPath(dir).catch((e) => (e && e.message) || String(e))
+    if (err) boot('trash-openDir', dir, err)
+    return { dir, ok: !err, message: err || '' }
   })
 
   ipcMain.handle('downloads:pauseAll', () =>
@@ -1431,8 +1469,11 @@ async function applyRuntimeSettings(before, after) {
     if (proxyChanged) proxy.clearCache()
     await startAria2()
   } else {
-    await aria2
-      .changeGlobalOption({
+    /* 这里失败不能吞：界面上的并发数、分片大小、下载目录、UA 都是靠这一条推给
+     * aria2 的，吞掉就是「用户改了、界面也是新值、实际还是老参数」。
+     * 分段引擎那份在下面 setLimit / 按任务给，不受影响。 */
+    try {
+      await aria2.changeGlobalOption({
         'max-concurrent-downloads': String(after.maxConcurrent),
         split: String(after.split),
         'max-connection-per-server': String(after.maxConnectionPerServer),
@@ -1440,7 +1481,9 @@ async function applyRuntimeSettings(before, after) {
         dir: after.downloadDir,
         'user-agent': after.userAgent,
       })
-      .catch(() => {})
+    } catch (e) {
+      throw new Error('设置已经存下来，但没能推给 aria2：' + ((e && e.message) || String(e)))
+    }
   }
   /* 插件通道的开关/端口/令牌变了就重开监听（端口占用等问题会反映在 bridge.status().error 里） */
   if (
@@ -1741,7 +1784,15 @@ if (!gotLock) {
       boot('complete', String(t.name))
       recycleTransferCopy(t.name, 'complete')
       if (settings.load().openFolderWhenDone && win && !win.isDestroyed()) {
-        shell.openPath(t.dir || settings.load().downloadDir).catch(() => {})
+        const dir = t.dir || settings.load().downloadDir
+        /* openPath 不抛异常，失败时返回原因 —— 吞掉的话「下完自动打开目录」这个
+         * 开关坏掉了也没人知道（日志里留一条，界面不再打扰用户） */
+        shell
+          .openPath(dir)
+          .then((err) => {
+            if (err) boot('open-folder-fail', dir, err)
+          })
+          .catch((e) => boot('open-folder-fail', dir, (e && e.message) || String(e)))
       }
     })
 
@@ -1774,6 +1825,11 @@ if (!gotLock) {
    * 免得用户关得快就留下一份垃圾。**只收已 complete 的**：
    * 没下完的任务还需要那份转存文件来续传，绝不能删。 */
   let cleanupDone = false
+  /* 分段引擎落断点、桥停监听、aria2 收子进程都是异步的，而 Electron 不等
+   * async 事件监听器 —— 不挡一下，进程可能在 shutdown 发出去之前就没了，
+   * 留下一个占着端口的 aria2c，下次启动就报「aria2 启动失败」。
+   * 挡两次：回收站那次（本来就有），以及最后这轮收尾。 */
+  let shutdownDone = false
   app.on('before-quit', async (e) => {
     /* 先立旗：窗口的 close 处理看到它才会真的关窗，而不是收进托盘 */
     isQuitting = true
@@ -1795,10 +1851,15 @@ if (!gotLock) {
         return
       }
     }
+    if (shutdownDone) return
+    e.preventDefault()
+    shutdownDone = true
     tasks.stop()
     /* 分段引擎要把断点信息落盘、关掉文件句柄，下次启动才能接着下 */
     await seg.flush().catch(() => {})
     await bridge.stop().catch(() => {})
-    await aria2.stop()
+    await aria2.stop().catch(() => {})
+    boot('quit', 'cleanup done')
+    app.quit()
   })
 }

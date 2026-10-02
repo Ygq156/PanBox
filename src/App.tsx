@@ -135,6 +135,7 @@ function EndpointSection({
         url: '',
         method: 'GET',
         body: '',
+        contentType: '',
         field: '',
         headers: '',
         dlHeaders: '',
@@ -198,12 +199,20 @@ function EndpointSection({
           />
 
           {ep.method === 'POST' && (
-            <textarea
-              rows={2}
-              placeholder={'请求体模板，如 url={url}&pwd={pwd}'}
-              value={ep.body || ''}
-              onChange={(e) => upd(ep.id, { body: e.target.value })}
-            />
+            <div className="row">
+              <textarea
+                rows={2}
+                placeholder={'请求体模板，如 url={url}&pwd={pwd}'}
+                value={ep.body || ''}
+                onChange={(e) => upd(ep.id, { body: e.target.value })}
+              />
+              <input
+                type="text"
+                placeholder="请求内容类型，留空用 application/x-www-form-urlencoded"
+                value={ep.contentType || ''}
+                onChange={(e) => upd(ep.id, { contentType: e.target.value })}
+              />
+            </div>
           )}
 
           <div className="row">
@@ -1452,7 +1461,18 @@ function TrashModal({ retentionDays, onClose }: { retentionDays: number; onClose
           <span className="trash-count">{retentionDays > 0 ? `超过 ${retentionDays} 天自动清理` : '不自动清理'}</span>
           {msg && <span className="trash-warn">{msg}</span>}
           <span className="grow" />
-          <button className="tiny" disabled={busy} onClick={() => run(async () => `已打开 ${await api.trashOpenDir()}`)}>
+          <button
+            className="tiny"
+            disabled={busy}
+            onClick={() =>
+              run(async () => {
+                const r = await api.trashOpenDir()
+                /* 打不开就如实说（比如目录被删了、系统没有关联程序），别假装打开了 */
+                if (!r.ok) throw new Error(r.message || '没能打开目录')
+                return `已打开 ${r.dir}`
+              })
+            }
+          >
             打开目录
           </button>
           <button
@@ -1495,10 +1515,15 @@ export default function App() {
 
   /** 插件刚交过来、等着自动解析的地址（见下面 prefill 与那个 effect） */
   const wantParse = useRef('')
+  /** 主进程没回话时的原因：不给出来的话，界面会永远停在「正在启动…」 */
+  const [bootErr, setBootErr] = useState('')
 
   useEffect(() => {
     api.appInfo?.().then((i) => setVer(i?.version || '')).catch(() => {})
-    api.getSettings().then(setSettings).catch(() => {})
+    api
+      .getSettings()
+      .then(setSettings)
+      .catch((e) => setBootErr((e && e.message) || String(e || '未知错误')))
     api.aria2Status().then(setAria2).catch(() => {})
     api.listDownloads().then(setTasks).catch(() => {})
     const off = api.onDownloadsUpdate(setTasks)
@@ -1679,7 +1704,17 @@ export default function App() {
   if (!settings) {
     return (
       <div className="app">
-        <div className="empty">正在启动…</div>
+        {bootErr ? (
+          <>
+            <div className="empty">启动失败：{bootErr}</div>
+            <div className="empty small">
+              多半是主进程没起来或界面与主进程版本不一致。重启 PanBox 再试；装的是
+              安装版的话，先确认没有同时开着便携版。
+            </div>
+          </>
+        ) : (
+          <div className="empty">正在启动…</div>
+        )}
       </div>
     )
   }
@@ -1775,7 +1810,15 @@ export default function App() {
             <button className="tiny" onClick={() => api.resumeAll()}>
               全部继续
             </button>
-            <button className="tiny" onClick={() => api.openPath(settings.downloadDir)}>
+            <button
+              className="tiny"
+              onClick={async () => {
+                /* openPath 打不开时**返回**原因（不抛异常），以前这里不看返回值，
+                 * 用户点了没动静也不知道为什么 */
+                const err = await api.openPath(settings.downloadDir)
+                if (err) setHint({ kind: 'err', msg: `没能打开目录：${err}` })
+              }}
+            >
               打开目录
             </button>
             <button className="tiny" onClick={() => setShowTrash(true)}>
@@ -1856,12 +1899,28 @@ export default function App() {
                         </button>
                       )}
                       {t.status === 'active' && (
-                        <button className="ghost tiny" title="暂停" onClick={() => api.pauseTask(t.gid)}>
+                        <button
+                          className="ghost tiny"
+                          title="暂停"
+                          onClick={async () => {
+                            /* 失败要说出来：原来主进程吞成 false、界面也不看返回值，
+                             * 结果就是点了没反应，用户以为程序卡了 */
+                            const r = await api.pauseTask(t.gid)
+                            if (!r.ok) setHint({ kind: 'err', msg: r.message || '暂停失败' })
+                          }}
+                        >
                           ⏸
                         </button>
                       )}
                       {(t.status === 'paused' || t.status === 'waiting') && (
-                        <button className="ghost tiny" title="继续" onClick={() => api.resumeTask(t.gid)}>
+                        <button
+                          className="ghost tiny"
+                          title="继续"
+                          onClick={async () => {
+                            const r = await api.resumeTask(t.gid)
+                            if (!r.ok) setHint({ kind: 'err', msg: r.message || '继续失败' })
+                          }}
+                        >
                           ▶
                         </button>
                       )}

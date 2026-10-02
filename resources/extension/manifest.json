@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PanBox 下载助手",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "description": "把浏览器里的下载链接交给本机 PanBox 多线程下载，自动带上 Referer / Cookie / User-Agent；页面角落还会浮出一个「N 个文件」面板，按响应类型抓出正在播放的视频、文件与网盘下载入口。",
   "minimum_chrome_version": "102",
   "permissions": [
@@ -12,10 +12,9 @@
     "webRequest",
     "webNavigation",
     "scripting",
-    "activeTab",
     "tabs"
   ],
-  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*", "<all_urls>"],
+  "host_permissions": ["http://127.0.0.1/*", "<all_urls>"],
   "background": {
     "service_worker": "background.js"
   },
