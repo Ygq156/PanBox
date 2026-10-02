@@ -91,20 +91,23 @@ async function assertOutbound(url, { allowLocal = false } = {}) {
 }
 
 /** 带上限的响应体读取：被控/被黑的服务器塞一个超大响应不能把主进程读爆 */
-async function readTextCapped(res, limit) {
-  const buf = Buffer.from(await readAll(res.body, limit))
+async function readTextCapped(res, limit, what) {
+  const buf = Buffer.from(await readAll(res.body, limit, what))
   return buf.toString('utf8')
 }
 
-/** 把 Web ReadableStream 读成 Buffer，超过 limit 直接抛错（不静默截断） */
-async function readAll(readable, limit) {
+/** 把 Web ReadableStream 读成 Buffer，超过 limit 直接抛错（不静默截断）。
+ *  what 只用于把「是哪个地址、拿到了什么」补进错误文案，不改判定。 */
+async function readAll(readable, limit, what) {
   const chunks = []
   let n = 0
   if (!readable) return Buffer.alloc(0)
   for await (const chunk of readable) {
     const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     n += b.length
-    if (n > limit) throw new Error(`响应体过大（超过 ${Math.round(limit / 1024 / 1024)}MB），已中止`)
+    if (n > limit) {
+      throw new Error(`响应体过大（超过 ${Math.round(limit / 1024 / 1024)}MB），已中止${what ? `：${what}` : ''}`)
+    }
     chunks.push(b)
   }
   return Buffer.concat(chunks)
@@ -124,6 +127,9 @@ class Jar {
   }
   get(k) {
     return this.c.get(k)
+  }
+  del(k) {
+    this.c.delete(String(k))
   }
   setFromString(s) {
     for (const part of String(s || '').split(';')) {
@@ -205,7 +211,10 @@ async function req(url, opts = {}) {
       break
     }
     if (jar) jar.absorb(res.headers)
-    const text = await readTextCapped(res, MAX_RESP_SIZE)
+    /* 超限时把「哪个地址、什么类型」写进错误里：页面类请求拿到超大响应时，
+     * 光一句「响应体过大」看不出是链接过期、被反爬拦了，还是服务端直接回了文件。 */
+    const respWhat = `${safeUrl(current)} 返回 HTTP ${res.status} ${res.headers.get('content-type') || '未知类型'}`
+    const text = await readTextCapped(res, MAX_RESP_SIZE, respWhat)
     return {
       status: res.status,
       headers: res.headers,

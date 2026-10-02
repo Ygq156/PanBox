@@ -12,6 +12,7 @@
 
 const { req, form, sleep, decodeEntities, humanSizeToBytes, Jar, UA_PC_CHROME, UA_MOBILE_ANDROID } = require('./util')
 const { withArg1Retry, hasChallenge, extractArg1, acwScV2 } = require('./esa')
+const browserCtx = require('./browserCtx')
 
 const SHARE_RE =
   /^https?:\/\/(?:[a-zA-Z\d-]+\.)?(?:(?:lanzou[bcefghijklmopqtuvwxy]|lanzn|lanzv|lanosso|lanpv|lanwp|bakstotre|ulanzou|woozooo|dmpdmp|lanrar|webgetstore)\.com|t-is\.cn)\/(.+)$/i
@@ -35,17 +36,24 @@ const P_TITLE = /<title>([\s\S]*?)<\/title>/i
 const P_FILEMORE = /url\s*:\s*'(\/filemoreajax\.php\?file=\d+)'[\s\S]*?data\s*:\s*\{([^}]+)\}/
 
 const AJAX_FALLBACK_ORIGINS = [
+  'https://apifile.woozooo.com',
   'https://apifile.lanzouw.com',
   'https://w1.lanzn.com',
   'https://www.lanzoux.com',
   'https://wwww.lanzoux.com',
 ]
 
+/* 只给 test/ 下的假站点用（本地 HTTP）。产品路径永远是 false —— 解析接口不许打内网。 */
+let ALLOW_LOCAL = false
+
 /* ------------------------------------------------------------------ */
 /* 请求头                                                              */
 /* ------------------------------------------------------------------ */
 
-function pageHeaders(referer) {
+/* 下面三个 h() 都多接一个 url：挂了浏览器现场时（用户在插件里点了「把本页交给
+ * PanBox」），把「真 UA / 真 Referer / 真 Accept 那一组」换进去 —— 反爬站点认的
+ * 就是这个。没现场时完全按原样，行为与以前一致。 */
+function pageHeaders(referer, url) {
   const h = {
     Accept:
       'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -64,10 +72,10 @@ function pageHeaders(referer) {
     'User-Agent': UA_PC_CHROME,
   }
   if (referer) h.Referer = referer
-  return h
+  return url ? browserCtx.headersFor(h, url, referer) : h
 }
 
-function jsonAjaxHeaders(referer, origin) {
+function jsonAjaxHeaders(referer, origin, url) {
   const h = {
     Accept: 'application/json, text/javascript, */*; q=0.01',
     'Accept-Encoding': 'identity',
@@ -80,17 +88,19 @@ function jsonAjaxHeaders(referer, origin) {
     'Sec-CH-UA-Platform': '"Windows"',
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin',
+    /* 接口常换到另一台主机（apifile.woozooo.com），那时浏览器填的是 cross-site
+     * 而不是 same-origin —— 写死了反而和真实请求不一样。 */
+    'Sec-Fetch-Site': referer && origin && safeOrigin(referer) === origin ? 'same-origin' : 'cross-site',
     'User-Agent': UA_PC_CHROME,
     'X-Requested-With': 'XMLHttpRequest',
   }
   if (referer) h.Referer = referer
   if (origin) h.Origin = origin
-  return h
+  return url ? browserCtx.headersFor(h, url, referer) : h
 }
 
-function folderHeaders(referer) {
-  return {
+function folderHeaders(referer, url) {
+  const h = {
     Accept: 'application/json, text/javascript, */*; q=0.01',
     'Accept-Encoding': 'identity',
     'Accept-Language': 'zh-CN,zh;q=0.9',
@@ -101,6 +111,13 @@ function folderHeaders(referer) {
     'X-Requested-With': 'XMLHttpRequest',
     Referer: referer,
   }
+  return url ? browserCtx.headersFor(h, url, referer) : h
+}
+
+/* 下直链时用的头：优先用浏览器现场那份 UA / Referer（CDN 有时也认这个） */
+function cdnHeaders(url, fallbackReferer) {
+  const h = { 'User-Agent': UA_PC_CHROME, Referer: fallbackReferer }
+  return browserCtx.headersFor(h, url, fallbackReferer)
 }
 
 /* ------------------------------------------------------------------ */
@@ -143,12 +160,25 @@ function computeName(html) {
   return decodeEntities(raw.replace(/<[^>]*>/g, '').trim())
 }
 
+/** 取地址的源（用来判断「这次请求是不是打回分享页自己那台主机」） */
+function safeOrigin(u) {
+  try {
+    return new URL(String(u)).origin
+  } catch {
+    return ''
+  }
+}
+
 function computeSize(html) {
   return humanSizeToBytes(decodeEntities(firstGroup(P_FI_SIZE, html).trim()))
 }
 
 async function fetchPage(jar, url, referer) {
-  return withArg1Retry(() => req(url, { headers: pageHeaders(referer), jar, timeout: 25000 }), jar)
+  return withArg1Retry(
+    () => req(url, { headers: pageHeaders(referer, url), jar, timeout: 25000, allowLocal: ALLOW_LOCAL }),
+    jar,
+    { url, cookieFromContext: browserCtx.owns(url) },
+  )
 }
 
 /* ------------------------------------------------------------------ */
@@ -238,16 +268,24 @@ async function postAjax(jar, pageUrl, call, referer) {
   let lastErr = null
   for (const origin of origins) {
     let r
+    const target = origin + call.path
+    /* 接口主机与分享页同主机时直接用原来的罐；换到别的主机（如 apifile.woozooo.com）
+     * 就换成那台主机自己的罐 —— 分享页的 cookie 不该跟着请求跑到第三方域去。 */
+    const sameHost = origin === safeOrigin(pageUrl)
+    const tJar = sameHost ? jar : browserCtx.jarFor(target, browserCtx.cookieFor(target))
+    const tReferer = sameHost ? referer || pageUrl : pageUrl
     try {
       r = await withArg1Retry(
         () =>
-          req(origin + call.path, {
+          req(target, {
             method: 'POST',
-            headers: jsonAjaxHeaders(referer || pageUrl, origin),
+            headers: jsonAjaxHeaders(tReferer, origin, target),
             body: form(call.data),
-            jar,
+            jar: tJar,
+            allowLocal: ALLOW_LOCAL,
           }),
-        jar,
+        tJar,
+        { url: target, cookieFromContext: !sameHost && browserCtx.owns(target) },
       )
     } catch (e) {
       lastErr = e
@@ -282,10 +320,11 @@ async function verifyAjax(jar, downUrl, origin, html, attempt) {
   await sleep(attempt === 0 ? 2200 : 2000)
   const r = await req(origin + '/file/ajax.php', {
     method: 'POST',
-    headers: jsonAjaxHeaders(downUrl, origin),
+    headers: jsonAjaxHeaders(downUrl, origin, origin + '/file/ajax.php'),
     body: form({ file, el: '2', sign }),
     jar,
     timeout: 25000,
+    allowLocal: ALLOW_LOCAL,
   })
   let json = null
   try {
@@ -298,7 +337,7 @@ async function verifyAjax(jar, downUrl, origin, html, attempt) {
 
   if (attempt < 1) {
     // SignError / 请求失败都必须重新拉验证页换新 sign，复用旧 sign 必然再失败
-    const fresh = await req(downUrl, { headers: pageHeaders(origin + '/'), jar, redirect: 'manual' })
+    const fresh = await req(downUrl, { headers: pageHeaders(origin + '/', downUrl), jar, redirect: 'manual', allowLocal: ALLOW_LOCAL })
     if (isDirectLink(fresh.location)) return fresh.location
     if (hasChallenge(fresh.text)) {
       const a = extractArg1(fresh.text)
@@ -319,10 +358,11 @@ async function followFileUrl(jar, downUrl, retried = false) {
   jar.set('down_ip', '1')
 
   const r = await req(downUrl, {
-    headers: pageHeaders(origin + '/'),
+    headers: pageHeaders(origin + '/', downUrl),
     jar,
     redirect: 'manual',
     timeout: 25000,
+    allowLocal: ALLOW_LOCAL,
   })
 
   if (isDirectLink(r.location)) return r.location
@@ -380,9 +420,10 @@ async function listFolder(jar, shareUrl, html, pwd) {
 
   const r = await req(origin + block[1], {
     method: 'POST',
-    headers: folderHeaders(shareUrl),
+    headers: folderHeaders(shareUrl, origin + block[1]),
     body: form(data),
     jar,
+    allowLocal: ALLOW_LOCAL,
   })
   let json
   try {
@@ -456,7 +497,7 @@ async function openFileHtml(jar, shareUrl, html, pwd) {
       const cdn = await followFileUrl(jar, downUrl)
       return {
         url: cdn,
-        headers: { 'User-Agent': UA_PC_CHROME, Referer: origin + '/' },
+        headers: cdnHeaders(cdn, origin + '/'),
       }
     },
   }
@@ -470,7 +511,9 @@ async function open(url, ctx = {}) {
   const hit = matchShare(url)
   if (!hit) throw new Error('不是有效的蓝奏云分享链接')
   const pwd = String(ctx.password || '').trim()
-  const jar = new Jar(ctx.cookie)
+  /* 插件交过来过「浏览器现场」时，用浏览器此刻真的在用的那份 cookie —— 站点
+   * 的反爬认的就是它（挑战页自算的 cookie 会时灵时不灵）。 */
+  const jar = browserCtx.jarFor(url, ctx.cookie)
 
   const shareUrl = hit.url
   const origin = new URL(shareUrl).origin
@@ -495,4 +538,10 @@ async function open(url, ctx = {}) {
   return { ...one, title: one.title || title }
 }
 
-module.exports = { open, acwScV2 }
+/* `_internals` 只给 test/ 下的定点测试用（假站点带端口，进不了 SHARE_RE，没法走 open()；
+ * `allowLocal` 也是给假站点用的，产品路径永远不开）。产品代码一律只用 open()。 */
+module.exports = {
+  open,
+  acwScV2,
+  _internals: { fetchPage, openFileHtml, followFileUrl, cdnHeaders, listFolder, setAllowLocal: (v) => { ALLOW_LOCAL = !!v } },
+}

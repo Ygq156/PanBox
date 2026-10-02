@@ -1500,7 +1500,10 @@ export default function App() {
      * 而是把链接送到这里填进输入框，让用户自己勾选。 */
     const offPre = api.onBridgePrefill?.((d) => {
       setText(d.url)
-      setHint({ kind: 'ok', msg: `浏览器插件送来一个${label(d.netdisk)}分享链接，点「解析」看看里面有什么` })
+      setHint({
+        kind: 'ok',
+        msg: d.message || `浏览器插件送来一个${label(d.netdisk)}分享链接，点「解析」看看里面有什么`,
+      })
     })
     /* 主进程启动 4 秒后自己查一次更新，有新版本就推过来（设置里可以关掉自动检查） */
     const offUpd = api.onUpdateAvailable?.((d) => setNewVer(d))
