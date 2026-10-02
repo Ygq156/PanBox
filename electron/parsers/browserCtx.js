@@ -19,6 +19,8 @@ const { Jar } = require('./util')
 const TTL = 10 * 60 * 1000 /* 10 分钟：够用户点完「交给 PanBox」再看结果 */
 const MAX_HOSTS = 40
 const MAX_COOKIE = 64 * 1024
+/* 每个主机最多记住多少条「浏览器真的请求过的文件地址」 */
+const MAX_URLS = 40
 
 /** host -> { cookie, referer, userAgent, headers, at } */
 const store = new Map()
@@ -73,6 +75,8 @@ function set(payload) {
     const byAge = [...store].sort((a, b) => a[1].at - b[1].at)
     for (const [h] of byAge.slice(0, store.size - MAX_HOSTS)) store.delete(h)
   }
+  /* 插件如果一起交来了「这一页浏览器真的请求过的文件地址」，也记下来当备选 */
+  if (payload && payload.urls) noteUrls(payload.urls)
   return n
 }
 
@@ -204,7 +208,65 @@ function pickHeaders(h) {
   return Object.keys(out).length ? out : null
 }
 
-module.exports = { set, clear, lookup, cookieFor, jarFor, owns, headersFor, mergeHeaders, gc, _store: store }
+/* ------------------------------------------------------------------ */
+/* 浏览器真的请求过的「文件地址」                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 有些站点的下载地址**只有浏览器自己点出来那一条能用**：一次性签名、
+ * 会话里现算的 token……程序按页面推出来的那条可能过期、可能根本不是同一个。
+ * 插件在浏览器里看到「响应是文件本体」（`Content-Disposition: attachment`
+ * 或明确的二进制类型）时，把那条地址交过来，解析器可以拿它当备选。
+ *
+ * 与 cookie 同规矩：**只存内存**、**按主机取用**，不给别的主机用。
+ */
+function noteUrls(list) {
+  const now = Date.now()
+  const arr = Array.isArray(list) ? list : []
+  let n = 0
+  for (const it of arr) {
+    const url = String((it && it.url) || it || '')
+    if (!/^https?:\/\//i.test(url) || url.length > 2048) continue
+    const host = normHost(url)
+    if (!host) continue
+    const v = store.get(host)
+    /* 只有这个主机本来就有现场时才记（现场是插件投递的那一页带出来的） */
+    if (!v) continue
+    if (!v.urls) v.urls = []
+    if (v.urls.some((u) => u.url === url)) continue
+    v.urls.unshift({ url, name: String((it && it.name) || '').slice(0, 200), at: now })
+    if (v.urls.length > MAX_URLS) v.urls.length = MAX_URLS
+    n += 1
+  }
+  return n
+}
+
+/** 这个主机上浏览器请求过的文件地址（新的在前）；没有就返回空数组 */
+function fileUrlsFor(url) {
+  const host = normHost(url)
+  if (!host) return []
+  for (const [h, v] of store) {
+    if (!sameSite(host, h)) continue
+    const list = (v.urls || []).filter((u) => Date.now() - u.at <= TTL)
+    if (list.length) return list.map((u) => u.url)
+  }
+  return []
+}
+
+module.exports = {
+  set,
+  clear,
+  lookup,
+  cookieFor,
+  jarFor,
+  owns,
+  headersFor,
+  mergeHeaders,
+  gc,
+  noteUrls,
+  fileUrlsFor,
+  _store: store,
+}
 
 /* 便于调试：只报「有几个主机、什么时间」，绝不吐凭据本身 */
 module.exports.info = () => [...store].map(([host, v]) => ({ host, at: v.at, cookieLen: (v.cookie || '').length }))

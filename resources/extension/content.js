@@ -627,7 +627,8 @@
           const kind = it.kind || kindOf(it.url, it.ct)
           merged.push({
             url: it.url,
-            name: nameOf(it.url, '', kind, it.ct),
+            /* 服务器在 Content-Disposition 里给的文件名最准，其次才是地址里猜的 */
+            name: it.name || nameOf(it.url, '', kind, it.ct),
             kind,
             host: hostOf(it.url),
             size: Number(it.size) || 0,
