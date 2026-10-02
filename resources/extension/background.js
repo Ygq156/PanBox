@@ -351,10 +351,40 @@ function trimSeen() {
   while (seen.size > MAX_SEEN) seen.delete(seen.keys().next().value)
 }
 
+/* 分享页里的「下载入口」——蓝奏云是 `/fn?TOKEN` 那条 iframe。
+ * 这是**整条链路里最值钱的一条地址**：分享页本身挂着阿里云 ESA 挑战，程序那边
+ * 自算 cookie 去取会被回 400（它没浏览器那副指纹）；而这条 `/fn` 页没有挑战，
+ * 交过去之后程序就能自己一路走到 CDN 直链。
+ * 每次投递都附最近 3 条，按标签页存，过 10 分钟自动扔（token 有时效）。 */
+const FN_TTL = 10 * 60 * 1000
+const FN_MAX = 6
+const fnByTab = new Map() /* tabId -> [{url,t}] */
+
+function looksLikeEntry(u) {
+  return /^https?:\/\/[^/?#]+\/fn\?[^#\s]{4,}/i.test(String(u || '')) && String(u).length <= 2048
+}
+
+function noteFnUrl(tabId, url) {
+  if (tabId == null || tabId < 0 || !looksLikeEntry(url)) return
+  let list = fnByTab.get(tabId)
+  if (!list) list = []
+  if (list.some((x) => x.url === url)) return
+  list.unshift({ url, t: Date.now() })
+  fnByTab.set(tabId, list.slice(0, FN_MAX))
+}
+
+function entryUrlsOf(tabId) {
+  const now = Date.now()
+  return (fnByTab.get(tabId) || [])
+    .filter((x) => now - x.t <= FN_TTL)
+    .map((x) => ({ url: x.url }))
+}
+
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (d) => {
     if (!/^https?:/i.test(d.url)) return
     if (!['main_frame', 'sub_frame', 'xmlhttprequest', 'media', 'object', 'other'].includes(d.type)) return
+    noteFnUrl(d.tabId, d.url)
     const h = {}
     for (const x of d.requestHeaders || []) h[String(x.name || '').toLowerCase()] = x.value
     /* 浏览器此刻的真身：下载域记录里要照着填，不能拿写死的 Chrome UA 去凑 */
@@ -590,6 +620,13 @@ function mediaListView(tabId) {
   const out = []
   const have = new Set()
   const now = Date.now()
+  /* 下载入口排最前：蓝奏这类站点的文件真正藏在那条 `/fn?TOKEN` 页里，
+   * 它是**唯一能绕开分享页反爬**的东西 —— 交过去，程序就能一路走到直链。 */
+  for (const it of entryUrlsOf(tabId)) {
+    if (have.has(it.url)) continue
+    have.add(it.url)
+    out.push({ url: it.url, kind: 'entry', ct: '', size: 0, name: '' })
+  }
   const m = tabId >= 0 ? mediaByTab.get(tabId) : null
   if (m) {
     for (const [url, v] of m) {
@@ -612,7 +649,7 @@ function mediaListView(tabId) {
   /* 能直接下的整段视频排最前，其次播放列表，再是分片，最后才是页面文件链接。
    * 同类型按体积从大到小 —— 抖音一页能抓到几十个 3KB 的 MSE 分片，
    * 真正要下的是那个几百 KB 起步的 video/mp4。 */
-  const rank = { media: 0, stream: 1, segment: 2, file: 3 }
+  const rank = { entry: -1, media: 0, stream: 1, segment: 2, file: 3 }
   out.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || (b.size || 0) - (a.size || 0))
   return out.slice(0, 200)
 }
@@ -814,15 +851,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       return reply({ ok: true, items: mediaListView(tabId) })
     }
     if (msg.type === 'sendUrls') {
+      const tabId = _sender && _sender.tab ? _sender.tab.id : -1
       const items = (Array.isArray(msg.items) ? msg.items : [])
         .filter((x) => x && /^https?:/i.test(x.url || ''))
         .slice(0, 80)
       if (!items.length) return reply({ ok: false, count: 0, message: '没有可投递的地址' })
+      /* 先把这一页的现场交过去（cookie / 真 UA / 下载入口），再投地址：
+       * 只给一条地址的话，PanBox 手里没有能过反爬的东西，只能报「未找到下载入口」。 */
+      const ctxR = await deliverPageContext(tabId, msg.referer || '', msg.title || '')
       const r = await handOver(items, { pageUrl: msg.referer || '', pageTitle: msg.title || '' })
       return reply({
         ok: r.okCount > 0,
         count: r.okCount,
         last: r.last,
+        context: !!(ctxR && ctxR.ok),
         message: r.okCount ? '' : '投递失败：确认 PanBox 正在运行',
       })
     }
@@ -831,6 +873,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       return reply({ ok, paired: !!cfg.token })
     }
     if (msg.type === 'sendUrl') {
+      const sTab = _sender && _sender.tab ? _sender.tab : null
+      const tabId = msg.tabId != null ? msg.tabId : sTab ? sTab.id : -1
+      await deliverPageContext(tabId, msg.referer || (sTab && sTab.url) || '', msg.title || '')
       const r = await handOver([{ url: msg.url, name: baseName(msg.url) }], { pageUrl: msg.referer || '', pageTitle: msg.title || '' })
       return reply({ ok: r.okCount > 0, count: r.okCount, last: r.last })
     }
@@ -847,52 +892,65 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     if (msg.type === 'pageContext') {
       const sTab = _sender && _sender.tab ? _sender.tab : null
       const tabId = msg.tabId != null ? msg.tabId : sTab ? sTab.id : -1
-      /* 以浏览器里真实的页面地址为准（popup 传来的可能是 Referer） */
-      let url = stripHash(msg.url || (sTab && sTab.url) || '')
-      if (!/^https?:/i.test(url)) {
-        const [t] = await chrome.tabs.query({ active: true, currentWindow: true })
-        url = stripHash((t && t.url) || '')
-      }
-      if (!/^https?:/i.test(url)) return reply({ ok: false, message: '只能投递 http(s) 页面' })
-
-      /* 这一页访问过的所有主机都带上 cookie（分享页、ajax 域、下载域常常三家） */
-      const cookies = []
-      for (const [host, v] of cookieMapForTab(tabId, null)) cookies.push({ host, cookie: v.cookie })
-      let pageHost = ''
-      try {
-        pageHost = new URL(url).hostname
-      } catch {
-        /* ignore */
-      }
-      const hostSet = new Set(cookies.map((c) => c.host))
-      /* 页面自己的主机一定有：现场没抓到（比如刚打开就点）就用 cookies API 补一份 */
-      if (pageHost && !hostSet.has(pageHost)) {
-        const c = await cookieHeader(url)
-        if (c) cookies.push({ host: pageHost, cookie: c })
-      }
-      const ctx = contextFor(url, tabId)
-      const rh = await pageRequestHeaders(url, tabId)
-      const r = await sendPageContext({
-        url,
-        title: String(msg.title || (sTab && sTab.title) || ''),
-        referer: ctx.referer || rh.referer || '',
-        userAgent: rh.ua || ctx.ua || navigator.userAgent,
-        requestHeaders: rh.headers,
-        cookies,
-        /* 这一页浏览器**真的请求到过**的文件地址（Content-Disposition 认出来的
-         * 那些）。解析器推不出来的、一次性签名的下载地址就在这里面 —— PanBox
-         * 按自己那套推出来的地址拿不到直链时，会拿这些当备选。 */
-        urls: attachUrlsOf(tabId),
-        via: 'page',
-      })
-      if (r && r.ok) badge('✓', '#34c759')
-      return reply(r)
+      return reply(await deliverPageContext(tabId, msg.url || (sTab && sTab.url) || '', msg.title || (sTab && sTab.title) || ''))
     }
     return reply({ ok: false, message: '未知消息类型 ' + msg.type })
   })()
   return true /* 异步回复 */
 })
 
-/* 把上一轮（worker 被回收之前）抓到的记录读回来。放在文件最后：此时
- * MEDIA_TTL / mediaByTab 都已经建好了。 */
-loadCaptured()
+/* 把这一页的现场交给 PanBox：地址 + 该域（含子框架域）浏览器正在用的
+ * User-Agent / Referer / Cookie，外加这一页浏览器真的请求到过的文件地址与
+ * 下载入口。蓝奏云这类上了反爬的分享页，只有浏览器自己那套凭据取得到页面；
+ * 而那条 `/fn?TOKEN` 入口页浏览器自己请求过，没有挑战。
+ * 面板投递文件时也走它 —— 否则 PanBox 手上只有一条地址，什么都过不去。 */
+async function deliverPageContext(tabId, rawUrl, title) {
+  /* 以浏览器里真实的页面地址为准（popup 传来的可能是 Referer） */
+  let url = stripHash(rawUrl || '')
+  if (!/^https?:/i.test(url)) {
+    const [t] = await chrome.tabs.query({ active: true, currentWindow: true })
+    url = stripHash((t && t.url) || '')
+  }
+  if (!/^https?:/i.test(url)) return { ok: false, message: '只能投递 http(s) 页面' }
+  if (tabId == null || tabId < 0) {
+    const [t] = await chrome.tabs.query({ active: true, currentWindow: true })
+    tabId = t && t.id != null ? t.id : -1
+  }
+
+  /* 这一页访问过的所有主机都带上 cookie（分享页、ajax 域、下载域常常三家） */
+  const cookies = []
+  for (const [host, v] of cookieMapForTab(tabId, null)) cookies.push({ host, cookie: v.cookie })
+  let pageHost = ''
+  try {
+    pageHost = new URL(url).hostname
+  } catch {
+    /* ignore */
+  }
+  const hostSet = new Set(cookies.map((c) => c.host))
+  /* 页面自己的主机一定有：现场没抓到（比如刚打开就点）就用 cookies API 补一份 */
+  if (pageHost && !hostSet.has(pageHost)) {
+    const c = await cookieHeader(url)
+    if (c) cookies.push({ host: pageHost, cookie: c })
+  }
+  const ctx = contextFor(url, tabId)
+  const rh = await pageRequestHeaders(url, tabId)
+  const r = await sendPageContext({
+    url,
+    title: String(title || ''),
+    referer: ctx.referer || rh.referer || '',
+    userAgent: rh.ua || ctx.ua || navigator.userAgent,
+    requestHeaders: rh.headers,
+    cookies,
+    /* 这一页浏览器**真的请求到过**的文件地址（Content-Disposition 认出来的
+     * 那些）。解析器推不出来的、一次性签名的下载地址就在这里面 —— PanBox
+     * 按自己那套推出来的地址拿不到直链时，会拿这些当备选。 */
+    urls: attachUrlsOf(tabId),
+    /* 这一页的**下载入口**（蓝奏 `/fn?TOKEN` 那条 iframe）。分享页反爬过不去时，
+     * 程序拿这条入口页就能自己走完剩下的路 —— 它是浏览器自己 requested 过的，
+     * 没有挑战。 */
+    fn: entryUrlsOf(tabId),
+    via: 'page',
+  })
+  if (r && r.ok) badge('✓', '#34c759')
+  return r
+}

@@ -303,6 +303,9 @@ const MATCHERS = [
   { netdisk: 'baidu', re: /(pan\.baidu\.com|yun\.baidu\.com|eyun\.baidu\.com)/i },
   { netdisk: 'xunlei', re: /(pan\.xunlei\.com|pan-thunder\.com|(^|\/\/)xunlei\.com\/s\/)/i },
   { netdisk: 'ilanzou', re: /(www\.)?ilanzou\.com/i },
+  /* 蓝奏分享页里的**下载入口**（`/fn?TOKEN` 那条 iframe 的地址）。用户从浏览器里
+   * 把它粘过来时也得认成蓝奏云，而不是掉进「兜底当直链」——它不是文件本体，是一条页。 */
+  { netdisk: 'lanzou', re: /^https?:\/\/[^/?#]+\/fn\?/i },
   { netdisk: 'quark', re: /(pan\.quark\.cn|drive-pc\.quark\.cn|quark\.cn)/i },
   { netdisk: 'uc', re: /((fast|drive|pc-api)\.uc\.cn|\buc\.cn\/s\/)/i },
   { netdisk: 'aliyun', re: /(aliyundrive\.com|alipan\.com)/i },
