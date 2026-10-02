@@ -88,6 +88,19 @@ async function ping() {
  * 投递一条任务。403 时自动重新配对再试一次（用户重装/重置 PanBox 后 token 会变）。
  */
 async function send(payload) {
+  return post('/add', payload)
+}
+
+/**
+ * 把「这一页的现场」交给 PanBox：地址、标题，以及浏览器此刻在这个域上用的
+ * Referer / User-Agent / Cookie。有些站点（蓝奏云这类上了反爬的）只认浏览器
+ * 自己那套凭据，PanBox 拿它去取页就能过。
+ */
+async function sendPageContext(payload) {
+  return post('/page', payload)
+}
+
+async function post(path, payload) {
   await loadCfg()
   /* 没令牌就先配对；配不上说明 7799 上的不是 PanBox（或被别的程序占着），
    * 这时**不要**继续投递 —— 免得把页面地址与该域 Cookie 送给一个陌生进程。 */
@@ -97,13 +110,13 @@ async function send(payload) {
   const body = JSON.stringify({ ...payload, token: cfg.token, via: payload.via || 'extension' })
   let r
   try {
-    r = await raw('/add', { method: 'POST', headers: { 'content-type': 'application/json' }, body })
+    r = await raw(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body })
   } catch (e) {
     return { ok: false, message: '连不上 PanBox（它没在运行？）' }
   }
   if (r.status === 403 && (await pair())) {
     const body2 = JSON.stringify({ ...payload, token: cfg.token, via: payload.via || 'extension' })
-    r = await raw('/add', { method: 'POST', headers: { 'content-type': 'application/json' }, body: body2 })
+    r = await raw(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: body2 })
   }
   if (r.json) return r.json
   return { ok: false, message: r.text || `HTTP ${r.status}` }
@@ -189,8 +202,8 @@ async function handOver(items, info) {
       name,
       referer,
       pageTitle: title,
-      cookie: await cookieHeader(it.url),
-      userAgent: navigator.userAgent,
+      cookie: await cookieFor(it.url, seen.get(it.url)),
+      userAgent: (seen.get(it.url) || {}).ua || navigator.userAgent,
       headers: referer ? { Referer: referer } : {},
     })
     if (last && last.ok) okCount += 1
@@ -254,27 +267,131 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 /* 接管浏览器下载                                                      */
 /* ------------------------------------------------------------------ */
 
-/* 浏览器已经为某个请求准备好的请求头（尤其是 Referer 和一些站点自带的 token），
- * 在转交时把它们带上，成功率比插件自己拼要高得多。只留最近 300 条、5 分钟。 */
+/* 浏览器已经为某个请求准备好的请求头（Referer、Cookie、User-Agent，
+ * 以及站点自己塞的 token 头），在转交时把它们带上，成功率比插件自己拼高得多。
+ * 只留最近 300 条、5 分钟。
+ *
+ * Cookie 也从这里取：这是浏览器**此刻真的在发**的那一份（含 HttpOnly），
+ * 比事后用 chrome.cookies 拼更贴近现场，反爬站点认的就是它。 */
 const TTL = 5 * 60 * 1000
+const MAX_SEEN = 300
 const seen = new Map()
+
+function trimSeen() {
+  if (seen.size <= MAX_SEEN) return
+  const now = Date.now()
+  for (const [k, v] of seen) if (now - v.t > TTL) seen.delete(k)
+  while (seen.size > MAX_SEEN) seen.delete(seen.keys().next().value)
+}
 
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (d) => {
     if (!/^https?:/i.test(d.url)) return
     if (!['main_frame', 'sub_frame', 'xmlhttprequest', 'media', 'object', 'other'].includes(d.type)) return
     const h = {}
-    for (const x of d.requestHeaders || []) h[x.name.toLowerCase()] = x.value
-    seen.set(d.url, { t: Date.now(), referer: h.referer || h.origin || '', ua: h['user-agent'] || '' })
-    if (seen.size > 300) {
-      const now = Date.now()
-      for (const [k, v] of seen) if (now - v.t > TTL) seen.delete(k)
-      while (seen.size > 300) seen.delete(seen.keys().next().value)
+    for (const x of d.requestHeaders || []) h[String(x.name || '').toLowerCase()] = x.value
+    /* 除 Cookie 外**一个都不丢**：反爬站点常看 Sec-Fetch-* / Sec-CH-UA / Accept 这一组，
+     * 少一个就和「真浏览器」对不上。只掐掉长度异常的头，免得一条巨大 header 撑爆投递体。 */
+    const keep = {}
+    for (const [k, v] of Object.entries(h)) {
+      if (k === 'cookie') continue
+      const s = String(v == null ? '' : v)
+      if (!s || s.length > 1024) continue
+      keep[k] = s
+      if (Object.keys(keep).length >= 40) break
     }
+    seen.set(d.url, {
+      t: Date.now(),
+      tabId: d.tabId,
+      referer: h.referer || h.origin || '',
+      ua: h['user-agent'] || '',
+      cookie: h.cookie || '',
+      headers: keep,
+    })
+    trimSeen()
   },
   { urls: ['http://*/*', 'https://*/*'] },
   ['requestHeaders', 'extraHeaders'],
 )
+
+/**
+ * 取「浏览器此刻在这个域上用的 Cookie」。
+ * 先看 webRequest 现场抓到的（最真实，含 HttpOnly），没有再用 cookies API 拼。
+ */
+async function cookieFor(url, hint) {
+  if (hint && hint.cookie) return hint.cookie
+  for (const [u, v] of seen) {
+    if (v.cookie && u === url) return v.cookie
+  }
+  return cookieHeader(url)
+}
+
+/** 这一页（含子框架）上，浏览器在各主机上用过的 Cookie，按主机去重后返回 */
+function cookieMapForTab(tabId, hosts) {
+  const out = new Map()
+  if (tabId == null || tabId < 0) return out
+  const now = Date.now()
+  for (const [u, v] of seen) {
+    if (v.tabId !== tabId || !v.cookie || now - v.t > TTL) continue
+    let host = ''
+    try {
+      host = new URL(u).hostname
+    } catch {
+      continue
+    }
+    if (hosts && hosts.size && !hosts.has(host)) continue
+    if (!out.has(host) || out.get(host).u !== u) out.set(host, { u, cookie: v.cookie })
+  }
+  return out
+}
+
+/** 去掉 #fragment：分享页的锚点不是真实地址，带着它去取页会被站点当成另一个页面 */
+function stripHash(u) {
+  const s = String(u || '')
+  const i = s.indexOf('#')
+  return i >= 0 ? s.slice(0, i) : s
+}
+
+/** 把某个地址的现场（Referer / UA / Cookie）整理出来 */
+function contextFor(url, tabId) {
+  const hint = seen.get(url) || {}
+  return { referer: hint.referer || '', ua: hint.ua || '', cookie: hint.cookie || '', tabId: tabId != null ? tabId : hint.tabId }
+}
+
+/**
+ * 这一页在浏览器里「作为导航请求」用过的那套请求头。
+ * 优先精确命中页面地址；没有就取这个标签页里同主机的第一条，
+ * 再没有就现造一套最小的（UA / Accept / Accept-Language）。
+ */
+async function pageRequestHeaders(url, tabId) {
+  let host = ''
+  try {
+    host = new URL(url).hostname
+  } catch {
+    /* ignore */
+  }
+  let hit = null
+  const now = Date.now()
+  for (const [u, v] of seen) {
+    if (!/^https?:/i.test(u) || now - v.t > TTL) continue
+    let h = ''
+    try {
+      h = new URL(u).hostname
+    } catch {
+      continue
+    }
+    if (h !== host) continue
+    if (u === url) {
+      hit = v
+      break
+    }
+    if (!hit && (tabId == null || tabId < 0 || v.tabId === tabId)) hit = v
+  }
+  const headers = { ...((hit && hit.headers) || {}) }
+  if (!headers['accept-language']) headers['accept-language'] = 'zh-CN,zh;q=0.9,en;q=0.8'
+  if (!headers.accept) headers.accept = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+  return { ua: (hit && hit.ua) || headers['user-agent'] || '', referer: (hit && hit.referer) || '', headers }
+}
 
 /* ------------------------------------------------------------------ */
 /* 页面悬浮面板要用的素材：这一页浏览器真的请求过哪些媒体               */
@@ -437,7 +554,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
     name: fromPath || baseName(item.url) || 'download.bin',
     referer: item.referrer || hint.referer || '',
     pageTitle: '',
-    cookie: await cookieHeader(item.url),
+    cookie: await cookieFor(item.url, hint),
     userAgent: hint.ua || navigator.userAgent,
     size: item.totalBytes || 0,
     mime: item.mime || '',
@@ -567,6 +684,49 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       if (!links.length) return reply({ ok: false, count: 0, message: '这一页没找到文件链接' })
       const r = await handOver(links, { pageUrl: msg.referer || '', pageTitle: msg.title || '' })
       return reply({ ok: r.okCount > 0, count: r.okCount, last: r.last })
+    }
+    /* 把这一页的现场交给 PanBox：地址 + 该域（含子框架域）浏览器正在用的
+     * User-Agent / Referer / Cookie。蓝奏云这类上了反爬的分享页，只有浏览器
+     * 自己那套凭据取得到页面。 */
+    if (msg.type === 'pageContext') {
+      const sTab = _sender && _sender.tab ? _sender.tab : null
+      const tabId = msg.tabId != null ? msg.tabId : sTab ? sTab.id : -1
+      /* 以浏览器里真实的页面地址为准（popup 传来的可能是 Referer） */
+      let url = stripHash(msg.url || (sTab && sTab.url) || '')
+      if (!/^https?:/i.test(url)) {
+        const [t] = await chrome.tabs.query({ active: true, currentWindow: true })
+        url = stripHash((t && t.url) || '')
+      }
+      if (!/^https?:/i.test(url)) return reply({ ok: false, message: '只能投递 http(s) 页面' })
+
+      /* 这一页访问过的所有主机都带上 cookie（分享页、ajax 域、下载域常常三家） */
+      const cookies = []
+      for (const [host, v] of cookieMapForTab(tabId, null)) cookies.push({ host, cookie: v.cookie })
+      let pageHost = ''
+      try {
+        pageHost = new URL(url).hostname
+      } catch {
+        /* ignore */
+      }
+      const hostSet = new Set(cookies.map((c) => c.host))
+      /* 页面自己的主机一定有：现场没抓到（比如刚打开就点）就用 cookies API 补一份 */
+      if (pageHost && !hostSet.has(pageHost)) {
+        const c = await cookieHeader(url)
+        if (c) cookies.push({ host: pageHost, cookie: c })
+      }
+      const ctx = contextFor(url, tabId)
+      const rh = await pageRequestHeaders(url, tabId)
+      const r = await sendPageContext({
+        url,
+        title: String(msg.title || (sTab && sTab.title) || ''),
+        referer: ctx.referer || rh.referer || '',
+        userAgent: rh.ua || ctx.ua || navigator.userAgent,
+        requestHeaders: rh.headers,
+        cookies,
+        via: 'page',
+      })
+      if (r && r.ok) badge('✓', '#34c759')
+      return reply(r)
     }
     return reply({ ok: false, message: '未知消息类型 ' + msg.type })
   })()

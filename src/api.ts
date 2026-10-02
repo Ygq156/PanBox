@@ -141,7 +141,7 @@ export interface PanboxAPI {
   updateDownload(): Promise<{ ok: boolean; message?: string }>
   updateInstall(): Promise<{ ok: boolean; message?: string }>
   onDownloadsUpdate(cb: (tasks: DownloadTask[]) => void): () => void
-  onBridgePrefill(cb: (data: { url: string; netdisk: string }) => void): () => void
+  onBridgePrefill(cb: (data: { url: string; netdisk: string; message?: string }) => void): () => void
   onUpdateAvailable(cb: (data: { latest: string; current: string; url: string; name?: string; publishedAt?: string }) => void): () => void
   onUpdateState(cb: (data: UpdateState) => void): () => void
 }

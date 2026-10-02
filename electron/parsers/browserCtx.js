@@ -1,0 +1,210 @@
+'use strict'
+
+/**
+ * 「浏览器现场」——插件把用户此刻在浏览器里那一页的凭据（该域正在用的
+ * Cookie / User-Agent / Referer）交给主进程，解析分享页时当成自己的请求头。
+ *
+ * 为什么需要它：蓝奏云这类站点挂了阿里云 ESA 反爬。挑战脚本算出来的 cookie
+ * 在纯 Node 里时灵时不灵，而**浏览器自己那套 cookie 一定有效**（页面就是它打开的）。
+ * 插件不需要替站点做任何事，只要把浏览器已经在用的东西转交过来即可。
+ *
+ * 两条铁律：
+ *   1. **只存内存**，绝不写盘、绝不进日志/设置/UI。用户关掉 PanBox 就没了。
+ *   2. **按主机取用**：给 A 主机的 cookie 只会在请求 A 主机（或其子域）时带上，
+ *      绝不会跟着请求跑到 B 主机去。
+ */
+
+const { Jar } = require('./util')
+
+const TTL = 10 * 60 * 1000 /* 10 分钟：够用户点完「交给 PanBox」再看结果 */
+const MAX_HOSTS = 40
+const MAX_COOKIE = 64 * 1024
+
+/** host -> { cookie, referer, userAgent, headers, at } */
+const store = new Map()
+
+function normHost(u) {
+  try {
+    return new URL(String(u)).hostname.toLowerCase()
+  } catch {
+    return ''
+  }
+}
+
+/** 某个主机是不是另一个主机的同一站点（www.a.com 之于 a.com） */
+function sameSite(host, other) {
+  if (!host || !other) return false
+  return host === other || host.endsWith('.' + other) || other.endsWith('.' + host)
+}
+
+/**
+ * 存一条浏览器现场。cookies 是 [{ host, cookie }]（省略 host 时按 url 的主机算）。
+ * 返回真正存下来的主机数。
+ */
+function set(payload) {
+  const url = String((payload && payload.url) || '')
+  const host = normHost(url)
+  if (!host) return 0
+  const referer = String((payload && payload.referer) || '')
+  const userAgent = String((payload && payload.userAgent) || '').slice(0, 400)
+  const list = Array.isArray(payload && payload.cookies) ? payload.cookies : []
+  const mapped = list
+    .map((c) => ({
+      host: String((c && c.host) || host).toLowerCase(),
+      cookie: String((c && c.cookie) || '').slice(0, MAX_COOKIE),
+    }))
+    .filter((c) => c.host && c.cookie && (sameSite(c.host, host) || true))
+  if (!mapped.length && payload && payload.cookie) {
+    mapped.push({ host, cookie: String(payload.cookie).slice(0, MAX_COOKIE) })
+  }
+
+  const at = Date.now()
+  /* 浏览器此刻真的在用的那套头（Accept / Sec-Fetch-* / Sec-CH-UA 这一组）。
+   * 反爬看的就是它，所以插件会一起交过来；只留白名单之外的，长度也压住。 */
+  const headers = pickHeaders(payload && payload.requestHeaders)
+  let n = 0
+  for (const c of mapped) {
+    store.set(c.host, { cookie: c.cookie, referer, userAgent, headers, at })
+    n += 1
+  }
+  /* 顺手清过期的，再按时间淘汰，避免长期运行攒一堆凭据 */
+  gc()
+  if (store.size > MAX_HOSTS) {
+    const byAge = [...store].sort((a, b) => a[1].at - b[1].at)
+    for (const [h] of byAge.slice(0, store.size - MAX_HOSTS)) store.delete(h)
+  }
+  return n
+}
+
+function gc() {
+  const now = Date.now()
+  for (const [h, v] of store) if (now - v.at > TTL) store.delete(h)
+}
+
+function clear() {
+  store.clear()
+}
+
+/** 请求 url 时该用哪份现场：自己主机优先，其次同站点的主机（分享页与其 iframe 常见的组合） */
+function lookup(url) {
+  gc()
+  const host = normHost(url)
+  if (!host) return null
+  const exact = store.get(host)
+  if (exact) return exact
+  for (const [h, v] of store) if (sameSite(host, h)) return v
+  return null
+}
+
+/**
+ * 给某个地址挑出**属于它这个主机**的 cookie（绝不复用别家的：分享页在
+ * wwbdm.lanzoub.com、ajax 在 apifile.woozooo.com 时，前者的 cookie 不能带去后者）。
+ * 没有就返回空，调用方保持原样。
+ */
+function cookieFor(url) {
+  gc()
+  const host = normHost(url)
+  if (!host) return ''
+  /* 同站点（www.a.com 与 a.com）算同一台主机，其余一律不带 */
+  for (const [h, v] of store) if (sameSite(host, h)) return v.cookie || ''
+  return ''
+}
+
+/** 这份现场是不是就属于这个主机（用于决定要不要带上它的 Referer / UA）。
+ *  与 cookieFor 同一套判定：同一站点的兄弟主机（www.a.com 与 a.com）算一台。 */
+function owns(url) {
+  const host = normHost(url)
+  if (!host) return false
+  if (store.has(host)) return true
+  for (const h of store.keys()) if (sameSite(host, h)) return true
+  return false
+}
+
+/**
+ * 建一个请求用的 cookie 罐：浏览器现场（她此刻真的在用的那份）在前，
+ * 用户手动配的 cookie 在后合并，站点新发的 Set-Cookie 会在请求过程中叠加上去。
+ */
+function jarFor(url, extraCookie) {
+  const j = new Jar()
+  const b = cookieFor(url)
+  if (b) j.setFromString(b)
+  if (extraCookie) j.setFromString(extraCookie)
+  return j
+}
+
+/* ------------------------------------------------------------------ */
+/* 请求头                                                              */
+/* ------------------------------------------------------------------ */
+
+/* 这些由调用方按请求语义决定，浏览器现场不覆盖：Cookie 走 jar、
+ * 长度/编码/连接类交给 fetch 自己算。 */
+const SKIP_HEADERS = new Set([
+  'cookie',
+  'content-length',
+  'host',
+  'connection',
+  'accept-encoding',
+  'origin',
+  'referer',
+  'user-agent',
+])
+
+/**
+ * 把一个起点请求头补成「浏览器现场」的样子：站点自带的 x- token 头、
+ * 真的 User-Agent、以及该主机自己的 Referer。
+ *
+ * @param {object} headers 调用方已备好的头（不会被修改）
+ * @param {string} url     这次请求的目标地址
+ * @param {string} fallbackReferer 没有现场时用的 Referer
+ */
+function headersFor(headers, url, fallbackReferer) {
+  const out = { ...(headers || {}) }
+  const v = lookup(url)
+  const own = owns(url)
+  const host = normHost(url)
+  const pageHost = v ? normHost(v.referer) : ''
+  if (v && own && host && pageHost && host === pageHost) {
+    /* 浏览器那次导航请求真的在用的一套头：Accept / Accept-Language / Sec-Fetch-*
+     * / Sec-CH-UA 这些，反爬会看。只在**同一台主机**上并 —— 别的主机上浏览器
+     * 用的是另一套（Sec-Fetch-Site 都不一样），照搬过去反而露馅。 */
+    Object.assign(out, mergeHeaders(out, v.headers))
+  }
+  if (v && own) {
+    if (v.userAgent) out['User-Agent'] = v.userAgent
+    /* 只在这个主机就是分享页主机时沿用浏览器的 Referer —— 跨主机（例如
+     * 分享页在 lanzoub.com、ajax 在 apifile.woozooo.com）照原样带过去，
+     * 会把「一个站点的页面地址」泄露给另一个站点，而且反爬也未必认。 */
+    if (v.referer && (!pageHost || sameSite(host, pageHost))) out.Referer = v.referer
+  }
+  if (!out.Referer && fallbackReferer) out.Referer = fallbackReferer
+  return out
+}
+
+/**
+ * 把浏览器现场里除 Cookie 外的头并进来（扩展侧抓到的那些 x- 头）。
+ * 只并白名单外的东西，避免把 fetch 自己管的头写坏。
+ */
+function mergeHeaders(headers, extra) {
+  const out = { ...(headers || {}) }
+  for (const [k, val] of Object.entries(extra || {})) {
+    const key = String(k).toLowerCase()
+    if (SKIP_HEADERS.has(key)) continue
+    if (val === undefined || val === null || val === '') continue
+    out[String(k)] = String(val).slice(0, 2048)
+  }
+  return out
+}
+
+/** 插件交过来的请求头：只留 fetch / jar 不管的那些，条数与长度都压住 */
+function pickHeaders(h) {
+  if (!h || typeof h !== 'object') return null
+  const out = mergeHeaders({}, h)
+  const keys = Object.keys(out)
+  if (keys.length > 40) for (const k of keys.slice(40)) delete out[k]
+  return Object.keys(out).length ? out : null
+}
+
+module.exports = { set, clear, lookup, cookieFor, jarFor, owns, headersFor, mergeHeaders, gc, _store: store }
+
+/* 便于调试：只报「有几个主机、什么时间」，绝不吐凭据本身 */
+module.exports.info = () => [...store].map(([host, v]) => ({ host, at: v.at, cookieLen: (v.cookie || '').length }))

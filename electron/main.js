@@ -15,6 +15,7 @@ const login = require('./core/login')
 const bridge = require('./core/bridge')
 const proxy = require('./core/proxy')
 const { detectNetdisk } = require('./parsers/util')
+const browserCtx = require('./parsers/browserCtx')
 
 /* 安装版可以就地更新：electron-updater 走 NSIS，安装器会静默跑旧卸载器
  * （`/S /KEEP_APP_DATA --updated`，见 app-builder-lib 的 installUtil.nsh），
@@ -679,6 +680,50 @@ async function bridgeAdd(p) {
   return { ok: true, kind: 'direct', name, gid: r.added[0], message: `已加入下载队列：${name}` }
 }
 
+/**
+ * 插件「把这一页交给 PanBox」。
+ *
+ * 站点上了反爬（蓝奏云这类挂 ESA 的）时，纯程序算出来的 cookie 可能被打回，
+ * 而浏览器自己那份一定有效 —— 页面就是它打开的。这里只做两件事：把浏览器
+ * 此刻在这一页用的身份记进**内存**，然后把窗口叫出来、把地址填好等用户点解析。
+ * 不落盘、不进日志、不替用户决定下什么。
+ */
+async function bridgePage(p) {
+  const raw = String((p && p.url) || '')
+  let url = raw
+  try {
+    const u = new URL(raw)
+    u.hash = ''
+    url = u.toString()
+  } catch {
+    return { ok: false, message: '只接受 http(s) 页面地址' }
+  }
+  if (!/^https?:\/\//i.test(url)) return { ok: false, message: '只接受 http(s) 页面地址' }
+
+  const n = browserCtx.set({ ...p, url })
+  boot('bridge-page', 'hosts=' + n, 'url=' + url.slice(0, 80))
+
+  const nd = detectNetdisk(url)
+  const isShare = !!(nd && nd !== 'direct' && nd !== 'unknown')
+  if (win && !win.isDestroyed()) {
+    if (win.isMinimized()) win.restore()
+    win.show()
+    win.focus()
+    win.webContents.send('bridge:prefill', {
+      url,
+      netdisk: isShare ? nd : '',
+      message: isShare
+        ? '已收到这一页的浏览器身份，点「解析」看看里面有什么'
+        : '已收到这一页的浏览器身份，把要解析的分享链接粘进来再点「解析」',
+    })
+  }
+  return {
+    ok: true,
+    kind: isShare ? 'share' : 'page',
+    message: isShare ? '已交给 PanBox，点「解析」看看里面有什么' : '已收到这一页的浏览器身份，把分享链接粘进来即可',
+  }
+}
+
 /** 拿（必要时生成）桥的配置。令牌只存在本机 settings.json 里。 */
 function bridgeCfg() {
   const cfg = settings.load()
@@ -692,7 +737,7 @@ async function startBridge() {
     await bridge.stop().catch(() => {})
     return bridge.status()
   }
-  const st = await bridge.start({ port: cfg.bridgePort, token: cfg.bridgeToken }, bridgeAdd)
+  const st = await bridge.start({ port: cfg.bridgePort, token: cfg.bridgeToken }, bridgeAdd, bridgePage)
   boot('bridge', 'running=' + st.running, 'port=' + st.port, st.error || '')
   return st
 }

@@ -14,6 +14,10 @@
  *   POST /add    -> 需要 token，body 是 JSON：
  *        { url, name?, referer?, cookie?, userAgent?, headers?, pageTitle?, title? }
  *                    -> { ok, kind, message, name, size }
+ *   POST /page   -> 需要 token，「把这一页的现场交给 PanBox」：
+ *        { url, title?, referer?, userAgent?, cookies?: [{host, cookie}], requestHeaders? }
+ *                    -> { ok, message }
+ *                    凭据只进内存、不落盘、不进日志；用于取那些只认浏览器的分享页。
  *   OPTIONS *    -> CORS 预检
  *
  * 为什么要有 token：CORS 拦不住「网页把请求发出去」这件事（只拦读响应），
@@ -83,10 +87,11 @@ class Bridge {
    * @param {{port?:number, token:string}} cfg
    * @param {(payload:object)=>Promise<object>} onAdd 由 main.js 提供，负责真正建任务
    */
-  async start(cfg, onAdd) {
+  async start(cfg, onAdd, onPage) {
     const port = Number((cfg && cfg.port) || DEFAULT_PORT)
     this.token = ensureToken(cfg && cfg.token)
     this.onAdd = onAdd
+    this.onPage = onPage
     if (this.running && this.port === port) return this.status()
     await this.stop()
 
@@ -267,6 +272,42 @@ class Bridge {
       } else if (out && out.message) {
         this.lastError = out.message
       }
+      this._json(res, out && out.ok ? 200 : 400, out || { ok: false })
+      return
+    }
+
+    /* 「把这一页交给 PanBox」：插件把浏览器此刻在这一页用的身份（Cookie / UA / 请求头）
+     * 交过来，解析那些只认浏览器的分享页时就能直接复用。凭据只进内存，不落盘。 */
+    if (p === '/page') {
+      if (req.method !== 'POST') {
+        this._json(res, 405, { ok: false, message: '请用 POST' })
+        return
+      }
+      const raw = await this._readBody(req)
+      let body
+      try {
+        body = JSON.parse(raw || '{}')
+      } catch {
+        this._json(res, 400, { ok: false, message: 'body 不是合法 JSON' })
+        return
+      }
+      const sent = body.token || req.headers['x-panbox-token']
+      if (!sent || !sameToken(sent, this.token)) {
+        this.lastError = 'token 不匹配'
+        this._json(res, 403, { ok: false, message: '配对令牌不对：请在 PanBox 的「浏览器插件」里点「重新配对」' })
+        return
+      }
+      if (!body.url || !/^https?:\/\//i.test(String(body.url))) {
+        this._json(res, 400, { ok: false, message: 'url 必须是 http(s) 地址' })
+        return
+      }
+      let out
+      try {
+        out = this.onPage ? await this.onPage(body) : { ok: false, message: '这一版 PanBox 还不支持' }
+      } catch (e) {
+        out = { ok: false, message: (e && e.message) || String(e) }
+      }
+      if (!(out && out.ok) && out && out.message) this.lastError = out.message
       this._json(res, out && out.ok ? 200 : 400, out || { ok: false })
       return
     }

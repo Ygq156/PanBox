@@ -419,7 +419,7 @@ function makeResolver({ shareId, passToken, flat, cred, deviceId, transferred })
 
     if (!cred || !cred.accessToken) {
       const err = new Error(
-        '迅雷云盘的分享只能匿名浏览：文件名和体积都能读到，但**转存/取直链必须登录**。' +
+        '迅雷云盘的分享只能匿名浏览：文件名和体积都能读到，但转存和取直链必须登录。' +
           '请在「设置 → 网盘账号」里登录迅雷云盘（程序会用你自己的账号转存到 /PanBox 再取直链，下载完自动删除）。',
       )
       err.needCookie = true

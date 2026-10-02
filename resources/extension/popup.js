@@ -85,4 +85,16 @@ $('sendPage').addEventListener('click', async () => {
   else say((r && r.message) || '投递失败', 'err')
 })
 
+/* 分享页被反爬挡住时：把「浏览器此刻在这一页用的身份」交给 PanBox，
+ * 它拿这份现场去取页就能过。地址以浏览器里真实的那个为准。 */
+$('sendCtx').addEventListener('click', async () => {
+  const tab = await activeTab()
+  if (!tab || !tab.url || !/^https?:/i.test(tab.url)) return say('这一页不是网页', 'err')
+  say('正在交给 PanBox…')
+  const r = await ask({ type: 'pageContext', url: tab.url, tabId: tab.id, title: tab.title })
+  if (r && r.ok) say(`已交给 PanBox：${r.message || '可以直接解析这一页了'}`, 'ok')
+  else say((r && r.message) || '投递失败', 'err')
+  refresh()
+})
+
 refresh()
