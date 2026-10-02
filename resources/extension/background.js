@@ -254,6 +254,8 @@ function collectFileLinks() {
 /* 投递                                                                */
 /* ------------------------------------------------------------------ */
 
+/* 面板列表里的「文件」地址是浏览器真身换出来的，所以按条目自己记下的 UA / 分享页
+ * 地址投递 —— 一条地址一个身份，别让面板当前开着哪一页去影响它。 */
 async function handOver(items, info) {
   const referer = (info && info.pageUrl) || ''
   const title = (info && info.pageTitle) || ''
@@ -261,14 +263,15 @@ async function handOver(items, info) {
   let last = null
   for (const it of items) {
     const name = it.name || baseName(it.url) || 'download.bin'
+    const page = it.referer || referer
     last = await send({
       url: it.url,
       name,
-      referer,
+      referer: page,
       pageTitle: title,
       cookie: await cookieFor(it.url, seen.get(it.url)),
-      userAgent: (seen.get(it.url) || {}).ua || navigator.userAgent,
-      headers: referer ? { Referer: referer } : {},
+      userAgent: it.ua || (seen.get(it.url) || {}).ua || navigator.userAgent,
+      headers: page ? { Referer: page } : {},
     })
     if (last && last.ok) okCount += 1
   }
@@ -354,6 +357,8 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     if (!['main_frame', 'sub_frame', 'xmlhttprequest', 'media', 'object', 'other'].includes(d.type)) return
     const h = {}
     for (const x of d.requestHeaders || []) h[String(x.name || '').toLowerCase()] = x.value
+    /* 浏览器此刻的真身：下载域记录里要照着填，不能拿写死的 Chrome UA 去凑 */
+    if (h['user-agent']) lastUA = String(h['user-agent']).slice(0, 400)
     /* 除 Cookie 外**一个都不丢**：反爬站点常看 Sec-Fetch-* / Sec-CH-UA / Accept 这一组，
      * 少一个就和「真浏览器」对不上。只掐掉长度异常的头，免得一条巨大 header 撑爆投递体。 */
     const keep = {}
@@ -517,6 +522,26 @@ function kindOfUrl(url, ct) {
   return 'file'
 }
 
+/* 这个标签页此刻的地址（下载域记录里要写「从哪一页点的」）。
+ * 这里只能问 `seen`（onBeforeSendHeaders 每次请求都记了一条）——
+ * 扩展的 webRequest 回调是同步的，等不了 chrome.tabs.get 的异步结果。 */
+function pageUrlOf(tabId) {
+  if (tabId == null || tabId < 0) return ''
+  let best = ''
+  let at = 0
+  for (const [, v] of seen) {
+    if (v.tabId !== tabId || !v.referer) continue
+    if (v.t > at) {
+      at = v.t
+      best = v.referer
+    }
+  }
+  return best
+}
+
+/* 最近一次真的看到过的 User-Agent（onBeforeSendHeaders 里带）。 */
+let lastUA = ''
+
 function rememberMedia(tabId, url, ct, size, name, attach) {
   let m = mediaByTab.get(tabId)
   if (!m) {
@@ -535,6 +560,15 @@ function rememberMedia(tabId, url, ct, size, name, attach) {
     name: nm,
     attach: !!(attach || (old && old.attach)),
   })
+  /* 下载域的现场：这个地址是浏览器真身换出来的，UA 与「从哪一页点的」都由浏览器
+   * 自己说。PanBox 之后拿这条地址去下时，照着填就能和浏览器一模一样；不填这些，
+   * 部分 CDN 会认成换了个人来取，直接拒。 */
+  if (attach) {
+    const rec = m.get(url)
+    const page = pageUrlOf(tabId)
+    if (page) rec.referer = page
+    if (lastUA) rec.ua = lastUA
+  }
   if (m.size > MEDIA_MAX) {
     const now = Date.now()
     for (const [k, v] of m) if (now - v.t > MEDIA_TTL) m.delete(k)
@@ -592,7 +626,13 @@ function attachUrlsOf(tabId) {
     .filter(([, v]) => v.attach && now - v.t <= MEDIA_TTL)
     .sort((a, b) => b[1].t - a[1].t)
     .slice(0, 20)
-    .map(([url, v]) => ({ url, name: v.name || '', size: v.size || 0 }))
+    .map(([url, v]) => ({
+      url,
+      name: v.name || '',
+      size: v.size || 0,
+      referer: v.referer || '',
+      ua: v.ua || '',
+    }))
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => dropTab(tabId))
