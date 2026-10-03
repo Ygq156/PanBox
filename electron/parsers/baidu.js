@@ -22,6 +22,7 @@
  */
 
 const { req, reqJson, decodeEntities, sleep } = require('./util')
+const { sameFile, Reclaimer } = require('./transferReclaim')
 
 /** 取 dlink 时必须伪装成 pan.baidu.com，否则 31326 防盗链 */
 const BAIDU_UA = 'pan.baidu.com'
@@ -227,7 +228,7 @@ module.exports = {
 
     const entries = flat
     /* 转存到用户自己网盘的文件——下载完必须删掉，否则会在用户的网盘里留一堆垃圾 */
-    const transferred = []
+    const rec = new Reclaimer()
 
     const DIR = '/PanBox'
     const dh = { ...h, Cookie: mergeCookie(cookie, bduss), Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
@@ -266,12 +267,6 @@ module.exports = {
       await sleep(600)
     }
 
-    /** 同名冲突时百度会存成 `名字(1).ext`，所以要能把 `名字(2).zip` 认回 `名字.zip`。 */
-    const variant = (n) => {
-      const m = /^(.*?)(?:\((\d+)\))?(\.[^.]+)$/.exec(String(n))
-      return m ? { base: m[1], ext: m[3] } : null
-    }
-
     /**
      * 批量解析：**一次**转存 + **一次** filemetas 把一整批文件全拿下来。
      *
@@ -303,7 +298,7 @@ module.exports = {
       await ensureDir(DIR)
       /* 转存**之前**先记下目录里已有的 fs_id —— 只有新出现的才是我们转存进去的副本，
        * 绝不能把用户本来就有的同名文件当成副本删掉。 */
-      const beforeIds = new Set((await listOwn(DIR)).map((x) => String(x.fs_id)))
+      rec.snapshot((await listOwn(DIR)).map((x) => String(x.fs_id)))
 
       /* 1) 一次转存整批文件到自己的 /PanBox */
       const transfer = await reqJson(
@@ -317,7 +312,7 @@ module.exports = {
       const tj = transfer.json || {}
       /* errno 12 = 目标目录已存在同名文件；errno 4 = "文件已转存"（同一份额里同一个文件之前转过）。
        * 两者都视为成功——复用 /PanBox 里已有的那份继续取直链。
-       * 注意：这种情况命中的文件在 beforeIds 里，**不会**被登记回收（绝不删用户本来就有的东西）。 */
+       * 注意：这种情况命中的文件在转存前的快照里，**不会**被登记回收（绝不删用户本来就有的东西）。 */
       if (tj.errno !== 0 && tj.errno !== 12 && tj.errno !== 4) {
         throw new Error(`转存失败（errno=${tj.errno}）：${tj.errmsg || tj.show_msg || ''}`)
       }
@@ -326,20 +321,17 @@ module.exports = {
       /* 2) 在 /PanBox 里把每个文件认领到具体的 fs_id。
        * `used` 保证两个不同的文件不会同时认领到同一份副本。 */
       const owned = await listOwn(DIR)
-      const fresh = owned.filter((x) => !beforeIds.has(String(x.fs_id)))
+      const fresh = owned.filter((x) => rec.isOurs(x.fs_id))
       const used = new Set()
       const claimed = []
       for (const e of items) {
-        const want = variant(e.name)
+        /* 两轮找：先按完整文件名精确命中（百度会把重名文件存成 `名字(1).ext`，
+         * 所以退一步允许「基名 + 扩展名相同」）。分两轮是为了优先级 ——
+         * 池子里同时有 `x.pdf` 和 `x(1).pdf` 时必须先拿精确的那个。
+         * `used` 保证两个不同的文件不会同时认领到同一份副本。 */
         const pick = (pool) =>
           pool.find((x) => !used.has(String(x.fs_id)) && x.server_filename === e.name) ||
-          (want
-            ? pool.find((x) => {
-                if (used.has(String(x.fs_id))) return false
-                const v = variant(x.server_filename)
-                return v && v.base === want.base && v.ext === want.ext
-              })
-            : null)
+          pool.find((x) => !used.has(String(x.fs_id)) && sameFile(x.server_filename, e.name))
         /* 单文件时允许退化成「新出现的第一份」；多文件时绝不乱认领（宁可报错，也不下错文件） */
         const hit =
           pick(fresh) || pick(owned) || (items.length === 1 ? fresh.find((x) => !used.has(String(x.fs_id))) : null)
@@ -349,14 +341,11 @@ module.exports = {
         }
         used.add(String(hit.fs_id))
         const fsId = String(hit.fs_id)
-        /* 只有**新出现**的文件才登记回收（命中用户原有的同名文件时绝不删） */
-        if (!beforeIds.has(fsId) && !transferred.some((x) => x.fsId === fsId)) {
-          transferred.push({
-            fsId,
-            path: String(hit.path || `${DIR}/${hit.server_filename}`),
-            name: String(hit.server_filename || e.name),
-          })
-        }
+        /* 只有**新出现**的文件才登记回收（命中用户原有的同名文件时 rec 会拒绝登记） */
+        rec.claim(fsId, {
+          path: String(hit.path || `${DIR}/${hit.server_filename}`),
+          name: String(hit.server_filename || e.name),
+        })
         claimed.push({ entry: e, fsId })
       }
 
@@ -398,7 +387,7 @@ module.exports = {
       /* 删掉我们转存到 /PanBox 的副本（下载完成后调用）。
        * 一次请求把整批路径都删掉（`filelist` 收数组），失败才退化成逐个删。 */
       removeTransferred: async () => {
-        if (!transferred.length || !bduss) return 0
+        if (!rec.size || !bduss) return 0
         const delH = {
           ...h,
           Cookie: mergeCookie(cookie, bduss),
@@ -419,7 +408,7 @@ module.exports = {
           const bad = info.filter((x) => x && x.errno)
           return { ok: (r.json || {}).errno === 0 && !bad.length, raw: r.json || r.text, bad }
         }
-        const todo = transferred.splice(0)
+        const todo = rec.take()
         let n = 0
         try {
           const one = await del(todo.map((t) => t.path))

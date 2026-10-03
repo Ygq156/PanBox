@@ -2,6 +2,7 @@
 
 const { req, reqJson, UA_PC_CHROME, UA_QUARK } = require('./util')
 const { probeUrl } = require('./probe')
+const { pollUntil, retryAsync, sameFile, Reclaimer } = require('./transferReclaim')
 
 /**
  * 夸克 / UC 网盘：同一套 clouddrive 接口的两个站点。
@@ -257,17 +258,15 @@ function makeParser(key) {
    * 实测隔几秒再删就成功 —— 「用完就删」这条承诺不能因为一次抖动就断掉。 */
   async function removeFids(fids, cookie) {
     if (!fids || !fids.length) return false
-    let last = null
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const r = await reqJson(api('/1/clouddrive/file/delete'), {
-        method: 'POST',
-        headers: headers(cookie, true),
-        body: JSON.stringify({ action_type: 2, filelist: fids.slice(), exclude_fids: [] }),
-      }).catch(() => null)
-      last = r
-      if (r && r.json && r.json.code === 0) break
-      if (attempt < 3) await new Promise((res) => setTimeout(res, 1200))
-    }
+    const last = await retryAsync(
+      () =>
+        reqJson(api('/1/clouddrive/file/delete'), {
+          method: 'POST',
+          headers: headers(cookie, true),
+          body: JSON.stringify({ action_type: 2, filelist: fids.slice(), exclude_fids: [] }),
+        }).catch(() => null),
+      { attempts: 4, intervalMs: 1200, ok: (r) => !!(r && r.json && r.json.code === 0) },
+    )
     if (process.env.PANBOX_DEBUG_DL) {
       try {
         require('node:fs').writeFileSync(
@@ -279,8 +278,8 @@ function makeParser(key) {
     return !!(last && last.json && last.json.code === 0)
   }
 
-  /* 转存进用户网盘的副本 fid，下载完成后由 removeTransferred() 回收 */
-  const transferred = []
+  /* 转存进用户网盘的副本，下载完成后由 removeTransferred() 回收 */
+  const rec = new Reclaimer()
 
   /** 分页列出某目录（最多 5 页 ×100） */
   async function listAll(pdirFid, cookie) {
@@ -302,16 +301,9 @@ function makeParser(key) {
     return out
   }
 
-  /** 转存后的文件名可能是 `x.zip` / `x(1).zip` / `x(2).zip`，都要认 */
-  function sameName(fname, want) {
-    if (fname === want) return true
-    const i = String(want).lastIndexOf('.')
-    const base = i > 0 ? want.slice(0, i) : want
-    const ext = i > 0 ? want.slice(i) : ''
-    if (fname === base + ext) return true
-    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    return new RegExp(`^${esc(base)}\\(\\d+\\)${esc(ext)}$`).test(fname)
-  }
+  /** 夸克把同名文件存成 `x(1).zip`（`(1)` 贴着基名，中间不带空格），
+   *  判据本身在 transferReclaim 里，这里只声明本站的写法。 */
+  const sameName = (fname, want) => sameFile(fname, want, { spaced: false })
 
   /** ③-B 转存 → 轮询 → 从自己网盘取 dlink */
   async function dlinkByTransfer(pwdId, stoken, entries, cookie) {
@@ -325,7 +317,7 @@ function makeParser(key) {
     const toFid = await targetDir(cookie)
     /* 转存前先拍一张目录快照：只有「转存之后新出现的文件」才是我们造的副本，
      * 才允许在下载完成后删除。同名老文件很可能是用户自己的东西，绝不能删。 */
-    const beforeIds = new Set((await listAll(toFid, cookie)).map((x) => x.fid))
+    rec.snapshot((await listAll(toFid, cookie)).map((x) => x.fid))
     const save = await reqJson(api('/1/clouddrive/share/sharepage/save'), {
       method: 'POST',
       headers: headers(cookie, true),
@@ -343,19 +335,29 @@ function makeParser(key) {
     if (!okOf(sj)) throw new Error(`转存失败：${msgOf(sj) || `code ${codeOf(sj)}`}`)
     const taskId = sj.data && (sj.data.task_id || sj.data.taskId)
 
-    for (let i = 0; taskId && i < 40; i++) {
-      await new Promise((r) => setTimeout(r, 500))
-      const t = await reqJson(api('/1/clouddrive/task', { task_id: taskId, retry_index: i }), {
-        headers: headers(cookie),
-      }).catch(() => null)
-      const d = (t && t.json && t.json.data) || {}
-      if (Number(d.status) === 2 || Number(d.status) === 3) break
+    /* 等落盘：`status` 2/3 = 任务结束。第一次问之前先等一拍 —— 刚 save 完问必然是「还没好」。 */
+    if (taskId) {
+      await pollUntil(
+        (i) =>
+          reqJson(api('/1/clouddrive/task', { task_id: taskId, retry_index: i }), {
+            headers: headers(cookie),
+          }).catch(() => null),
+        {
+          attempts: 40,
+          intervalMs: 500,
+          delayFirst: true,
+          until: (t) => {
+            const d = (t && t.json && t.json.data) || {}
+            return Number(d.status) === 2 || Number(d.status) === 3
+          },
+        },
+      )
     }
 
     /* 转存响应里的 `save_as_top_fids` / `save_as_select_top_fids` 就是**落盘后的 fid**。
      * 早前踩过的坑：转存刚返回就拿着这个 fid 调 `file/download` 会回
      * `404 {"code":21001,"message":"file not found [38a61b16…]"}` —— 那不是 fid 错了，
-     * 是索引还没就绪。下面的下载重试循环（10 次 × 900ms）就是为它准备的。
+     * 是索引还没就绪。下面的下载重试循环（8 次 × 900ms）就是为它准备的。
      * 只有拿不到 fid（比如转存的是目录、条目数对不上）时才退回**轮询目录**：
      * `/1/clouddrive/file/sort` 索引有延迟，转存刚返回时列目录还看不到新文件。
      * ⚠️ 曾经只用轮询，结果夸克索引慢于 25×700ms 时直接报「未返回下载直链」，
@@ -373,17 +375,22 @@ function makeParser(key) {
     async function downloadByFids(pairs) {
       const got = new Map()
       for (const it of pairs) {
-        let dl = null
-        for (let attempt = 0; attempt < 8; attempt++) {
-          dl = await reqJson(api('/1/clouddrive/file/download'), {
-            method: 'POST',
-            headers: headers(cookie, true),
-            body: JSON.stringify({ fids: [it.fid] }),
-          }).catch(() => null)
-          const a = (dl && dl.json && dl.json.data) || []
-          if (a[0] && a[0].download_url) break
-          if (attempt < 7) await new Promise((r) => setTimeout(r, 900))
-        }
+        const dl = await retryAsync(
+          () =>
+            reqJson(api('/1/clouddrive/file/download'), {
+              method: 'POST',
+              headers: headers(cookie, true),
+              body: JSON.stringify({ fids: [it.fid] }),
+            }).catch(() => null),
+          {
+            attempts: 8,
+            intervalMs: 900,
+            ok: (r) => {
+              const a = (r && r.json && r.json.data) || []
+              return !!(a[0] && a[0].download_url)
+            },
+          },
+        )
         if (process.env.PANBOX_DEBUG_DL) {
           try {
             require('node:fs').writeFileSync(
@@ -398,22 +405,24 @@ function makeParser(key) {
       return got
     }
 
-    /** 列目录、按文件名认领 → 返回可直接喂下载的 {entry, fid, ours} 列表 */
+    /** 列目录、按文件名认领 → 返回可直接喂下载的 {entry, fid} 列表 */
     async function collectByPolling() {
-      let list = await listAll(toFid, cookie)
-      let freshList = list.filter((x) => !beforeIds.has(x.fid))
-      for (let i = 0; i < 25 && !freshList.length; i++) {
-        await new Promise((r) => setTimeout(r, 700))
-        list = await listAll(toFid, cookie)
-        freshList = list.filter((x) => !beforeIds.has(x.fid))
-      }
+      /* 目录索引也是最终一致的：转存刚返回时列目录还看不见新文件，所以要等。
+       * 「新」的判据 = 不在转存前的快照里（rec.isOurs），这也是唯一允许删的依据。 */
+      const seen = await pollUntil(
+        async () => {
+          const list = await listAll(toFid, cookie)
+          return { list, freshList: list.filter((x) => rec.isOurs(x.fid)) }
+        },
+        { attempts: 25, intervalMs: 700, until: (v) => v.freshList.length > 0 },
+      )
+      const { list, freshList } = seen
       debugDump(list, freshList, false)
-      /* 只把「转存前不存在的新文件」登记为待删；命中的若是用户原有的同名文件则绝不删。 */
       const out = []
       for (const e of entries) {
         const fresh = freshList.find((x) => sameName(x.file_name, e.name))
         const hit = fresh || list.find((x) => sameName(x.file_name, e.name))
-        if (hit) out.push({ entry: e, fid: hit.fid, ours: !!fresh })
+        if (hit) out.push({ entry: e, fid: hit.fid })
       }
       return out
     }
@@ -429,7 +438,7 @@ function makeParser(key) {
               saveJson: sj,
               taskId,
               saveAs,
-              beforeCount: beforeIds.size,
+              beforeCount: rec.before ? rec.before.size : 0,
               listCount: list.length,
               list: list.map((x) => ({ fid: x.fid, name: x.file_name, type: x.file_type })),
               freshCount: freshList.length,
@@ -457,7 +466,7 @@ function makeParser(key) {
      * 所以快路也是「试」出来的 —— 拿不到直链就退回轮询，绝不因为快路失败就报错。 */
     if (hinted.length === entries.length) {
       usedHint = true
-      const pairs = entries.map((e, i) => ({ entry: e, fid: hinted[i], ours: true }))
+      const pairs = entries.map((e, i) => ({ entry: e, fid: hinted[i] }))
       const got = await downloadByFids(pairs)
       for (const [k, v] of got) map.set(k, v)
     }
@@ -473,20 +482,21 @@ function makeParser(key) {
      * 查重索引命中的可能是同内容但**已经被删/改名**的那一份，夸克照样会新落一份 `xxx(1).zip`。
      * 实测（`electron test/cleanup-quark-junk.js`）就抓到过这种泄漏：副本躺在用户网盘里
      * 永远没人回收。所以只要走了快路又没拿到轮询结果，就补一次列目录 ——
-     * `collectByPolling()` 的 `ours` 判据（转存前不存在同名文件）是唯一可靠的回收依据，
+     * `collectByPolling()` 的「转存前不存在同名文件」判据是唯一可靠的回收依据，
      * 宁可多花一次列目录的时间，也不能把副本留在用户网盘里。 */
     if (!polled.length && usedHint) polled = await collectByPolling()
     if (!polled.length) debugDump([], [], usedHint)
 
-    /* ── 登记待删。两套依据，都要求「这份副本确实是我们刚造的」：
-     *   ① 轮询结果：转存前不存在同名文件 → ours=true（最可靠）；
+    /* ── 登记待删。两套依据，都要求「这份副本确实是我们刚造的」（`rec` 会用转存前的
+     *   快照再核对一遍，用户原有的同名文件永远不会被登记）：
+     *   ① 轮询结果（最可靠）；
      *   ② 快路：`search_exit === false` = 服务端没找到同名文件、确实新落了一份盘。
      *      `search_exit === true` 时**不再**直接放弃登记，而是靠上面补的那次轮询来判定。 */
     if (polled.length) {
-      for (const it of polled) if (it.ours && map.has(it.entry.fid)) transferred.push(it.fid)
+      for (const it of polled) if (map.has(it.entry.fid)) rec.claim(it.fid)
     } else if (usedHint && saveAs.search_exit === false) {
       entries.forEach((e, i) => {
-        if (map.has(e.fid)) transferred.push(hinted[i])
+        if (map.has(e.fid)) rec.claim(hinted[i])
       })
     } else if (usedHint && map.size) {
       console.warn(
@@ -641,7 +651,7 @@ function makeParser(key) {
 
         /** 下载完成后调用：把转存进来的副本从用户网盘删掉，别留一堆 `xxx(1).zip`。
          *  ⚠️ 绝不能在下载开始前调用——直接是 CDN 的签名链接，删了源文件可能当场失效。 */
-        removeTransferred: () => removeFids(transferred, cookie),
+        removeTransferred: () => removeFids(rec.ids(), cookie),
       }
     },
   }
