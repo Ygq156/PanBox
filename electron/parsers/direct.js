@@ -2,6 +2,7 @@
 
 const { urlBaseName, withExt, sanitizeFileName } = require('./util')
 const { probeUrl } = require('./probe')
+const identity = require('./identity')
 
 /* 只给「假站点起在本机」的测试用（见 test\verify-name-ext.js）：产品路径永远关闭，
  * 免得远端响应把我们引去打内网（见 util.js 里 assertOutbound 的注释）。 */
@@ -35,8 +36,11 @@ module.exports = {
     let ct = ''
     try {
       /* 只问一次响应头（HEAD，站点不认时 probeUrl 自己换 Range 的 GET）：
-       * 名字、体积、响应类型都在里面。 */
-      const p = await probeUrl(url, { headers: {}, cookie: ctx.cookie, allowLocal: ALLOW_LOCAL })
+       * 名字、体积、响应类型都在里面。身份用**浏览器现场那份** —— 直链常常挂在
+       * Cloudflare 这类墙后面（用户报的 ACM 就是），只有带着浏览器那副 UA / cookie
+       * 才看得到响应头；用户自己配的凭证排在现场之后合并。 */
+      const h = identity.addCookie(identity.forRequest(url, {}), ctx.cookie)
+      const p = await probeUrl(url, { headers: h, allowLocal: ALLOW_LOCAL })
       ct = p.ct
       name = p.name
       size = p.size
@@ -63,7 +67,9 @@ module.exports = {
           mime: ct,
         },
       ],
-      resolve: async () => ({ url, headers }),
+      /* 直链也带上用户为「直链」配的那份凭证：以前只有探测带、真正下载不带，
+       * 于是「探测说能下、下载 403」——那些需要凭证的直链就是这么失败的。 */
+      resolve: async () => ({ url, headers: identity.addCookie(headers, ctx.cookie) }),
     }
   },
 }
