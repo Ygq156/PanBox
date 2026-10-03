@@ -418,9 +418,9 @@ function decodeEntities(s) {
     .replace(/&#39;/g, "'")
 }
 
-/** 把 "1.5M" / "2G" 这类人类可读大小转成字节 */
+/** 把 "1.5M" / "2G" 这类人类可读大小转成字节（全仓只此一份，别在解析器里再抄） */
 function humanSizeToBytes(s) {
-  if (typeof s === 'number') return s
+  if (typeof s === 'number') return isFinite(s) ? s : 0
   const m = String(s || '').trim().match(/^([\d.]+)\s*([KMGTP]?)B?$/i)
   if (!m) return 0
   const n = parseFloat(m[1])

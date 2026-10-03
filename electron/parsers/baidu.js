@@ -23,6 +23,10 @@
 
 const { req, reqJson, decodeEntities, sleep } = require('./util')
 const { sameFile, Reclaimer } = require('./transferReclaim')
+/* 合并 Cookie 只认 identity 那一份：它按**名字**去重、后者胜。以前这里是一条字符串拼接，
+ * 于是同一串里同一个名字会出现两次 —— 服务端多半认前面那个旧的，写在最后面的「用户配的
+ * 那份 BDUSS」其实一点作用都没起。 */
+const { mergeCookie } = require('./identity')
 
 /** 取 dlink 时必须伪装成 pan.baidu.com，否则 31326 防盗链 */
 const BAIDU_UA = 'pan.baidu.com'
@@ -40,7 +44,6 @@ function parseShareId(url) {
 }
 
 const cookieOf = (r) => (r.headers.getSetCookie ? r.headers.getSetCookie() : []).map((c) => c.split(';')[0]).join('; ')
-const mergeCookie = (a, b) => [a, b].filter(Boolean).join('; ')
 
 /** 从分享页里抠出文件列表 JSON。百度两种模板并存：
  *   - 新版：`<script id="locals-data" type="application/json">{…}</script>`

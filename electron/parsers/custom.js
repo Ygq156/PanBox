@@ -25,7 +25,7 @@
  *   也支持数组形式（目录分享一次返回多个文件）。用户也可以显式指定 `field`（如 `data.url`）。
  */
 
-const { req, detectNetdisk } = require('./util')
+const { req, detectNetdisk, humanSizeToBytes } = require('./util')
 
 /**
  * 常见「直链」字段名，按优先级排列。
@@ -84,16 +84,6 @@ function firstOf(obj, keys) {
   return undefined
 }
 
-function toSize(v) {
-  if (typeof v === 'number' && isFinite(v)) return v
-  const m = String(v == null ? '' : v).trim().match(/^([\d.]+)\s*([KMGTP]?)B?$/i)
-  if (!m) return 0
-  const n = parseFloat(m[1])
-  if (!isFinite(n)) return 0
-  const unit = (m[2] || '').toUpperCase()
-  return Math.round(n * ({ '': 1, K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4, P: 1024 ** 5 }[unit] || 1))
-}
-
 /** 支持 `data.url` / `data.list[0].url` 这种点号+下标路径 */
 function pickByPath(root, path) {
   if (!path) return undefined
@@ -126,7 +116,7 @@ function scan(node, depth, out, seen) {
   if (typeof link === 'string' && /^https?:\/\//i.test(link)) {
     if (!seen.has(link)) {
       seen.add(link)
-      out.push({ url: link, name: firstOf(node, NAME_KEYS), size: toSize(firstOf(node, SIZE_KEYS)) })
+      out.push({ url: link, name: firstOf(node, NAME_KEYS), size: humanSizeToBytes(firstOf(node, SIZE_KEYS)) })
     }
     return
   }
@@ -246,11 +236,11 @@ async function callOne(ep, url, ctx) {
         .map((it) => ({
           url: typeof it === 'string' ? it : (firstOf(it || {}, LINK_KEYS) || ''),
           name: typeof it === 'object' && it ? firstOf(it, NAME_KEYS) : '',
-          size: typeof it === 'object' && it ? toSize(firstOf(it, SIZE_KEYS)) : 0,
+          size: typeof it === 'object' && it ? humanSizeToBytes(firstOf(it, SIZE_KEYS)) : 0,
         }))
         .filter((x) => /^https?:\/\//i.test(String(x.url)))
     } else if (typeof v === 'string' && /^https?:\/\//i.test(v)) {
-      files = [{ url: v, name: String(firstOf(j, NAME_KEYS) || ''), size: toSize(firstOf(j, SIZE_KEYS)) }]
+      files = [{ url: v, name: String(firstOf(j, NAME_KEYS) || ''), size: humanSizeToBytes(firstOf(j, SIZE_KEYS)) }]
     }
   } else {
     const seen = new Set([target])
