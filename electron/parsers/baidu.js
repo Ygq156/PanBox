@@ -103,10 +103,6 @@ function errnoText(eno, errmsg) {
 module.exports = {
   netdisk: 'baidu',
 
-  test(url) {
-    return /(pan|yun|eyun)\.baidu\.com/i.test(String(url))
-  },
-
   async open(url, ctx = {}) {
     const { shareId, surl } = parseShareId(url)
     const bduss = ctx.cookie || ''

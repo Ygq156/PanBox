@@ -143,18 +143,8 @@ function cdnUrl(a, base) {
   return `${base || cdnBase()}/d_attachment/${j.slug}/${tail}/article_deploy/${tail}.pdf`
 }
 
-/** 这个 ISSN 认不认识（给「换个入口」的提示用） */
-function known(issn) {
-  return !!JOURNALS[issn]
-}
-
 module.exports = {
   netdisk: 'mdpi',
-
-  test(url) {
-    const a = parseArticle(url)
-    return !!a && known(a.issn)
-  },
 
   async open(url, ctx = {}) {
     const a = parseArticle(url)
