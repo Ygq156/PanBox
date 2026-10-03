@@ -14,7 +14,7 @@ const parsers = require('./parsers')
 const login = require('./core/login')
 const bridge = require('./core/bridge')
 const proxy = require('./core/proxy')
-const { detectNetdisk, setOutboundProxy } = require('./parsers/util')
+const { detectNetdisk, setOutboundProxy, req } = require('./parsers/util')
 const browserCtx = require('./parsers/browserCtx')
 
 /* 安装版可以就地更新：electron-updater 走 NSIS，安装器会静默跑旧卸载器
@@ -518,6 +518,81 @@ function createWindow() {
 /* ------------------------------------------------------------------ */
 
 /**
+ * 文件有哪些可下的地址：主地址 + 解析器给的备用地址（去掉重复的）。
+ * 顺序就是尝试顺序。
+ */
+function fileCandidates(f) {
+  const list = [{ url: f.url, headers: f.headers || {} }]
+  for (const u of Array.isArray(f.urls) ? f.urls : []) {
+    if (!u || !u.url || u.url === list[0].url) continue
+    if (list.some((x) => x.url === u.url)) continue
+    list.push({ url: u.url, headers: u.headers || {} })
+  }
+  return list
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return ''
+  }
+}
+
+/** 本机地址（测试用的假站点）不做预检：那些站点的 HEAD 行为千奇百怪，白折腾 */
+function isLocalUrl(url) {
+  const h = hostOf(url)
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]'
+}
+
+/**
+ * 预检一条地址：先 `HEAD`，被拒不认时用 `Range: bytes=0-0` 的 `GET` 再确认一次。
+ *
+ * 为什么要多这一步：下载引擎（尤其 aria2）遇到 403/404 会**反复重试**，用户看到的
+ * 是一条卡在 0% 的任务，而不是「这条地址不行」。这里提前判定，就能直接换备用地址。
+ * 只在有备用地址时才值得做（见 addResolved），否则等于白白多一次请求。
+ */
+async function handable(url, headers) {
+  if (isLocalUrl(url)) return { ok: true, status: 0, finalUrl: url }
+  const ua = headers['User-Agent'] || settings.load().userAgent || ''
+  const h = ua ? { ...headers, 'User-Agent': ua } : headers
+  for (const attempt of [
+    { method: 'HEAD', headers: h },
+    { method: 'GET', headers: { ...h, Range: 'bytes=0-0' } },
+  ]) {
+    try {
+      const r = await req(url, { ...attempt, timeout: 15000, noBody: true })
+      if (r.status >= 200 && r.status < 400) return { ok: true, status: r.status, finalUrl: r.url || url }
+      /* 405 / 501：服务器不认这个方法，换下一个再试 */
+      if (r.status === 405 || r.status === 501) continue
+      return { ok: false, status: r.status, finalUrl: url }
+    } catch {
+      /* 网络层的错留给引擎去重试：它比这里更清楚要不要等一会儿 */
+      return { ok: true, status: 0, finalUrl: url }
+    }
+  }
+  return { ok: true, status: 0, finalUrl: url }
+}
+
+/**
+ * 从候选里挑第一条能用的。只有一条候选时不做预检（不白花一次请求）。
+ * 全被拒时返回最后一条：让引擎自己去试、把真实报错交给用户看。
+ */
+async function firstHandable(cands, name) {
+  if (cands.length < 2) return { url: cands[0].url, headers: cands[0].headers }
+  for (let i = 0; i < cands.length; i++) {
+    const c = cands[i]
+    const pr = await handable(c.url, c.headers)
+    if (pr.ok) {
+      if (i) boot('url-candidate', name, `改用备用地址 host=${hostOf(c.url)}`)
+      return { url: pr.finalUrl || c.url, headers: c.headers }
+    }
+    boot('url-rejected', name, `host=${hostOf(c.url)} status=${pr.status}`)
+  }
+  return { url: cands[cands.length - 1].url, headers: cands[cands.length - 1].headers }
+}
+
+/**
  * 把一批已经拿到直链的文件真正排进下载队列。
  * 两个入口共用：渲染层的 `downloads:add`，和浏览器插件的 HTTP 通道（bridge）。
  */
@@ -569,31 +644,49 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
     if (useProxy) options['all-proxy'] = useProxy
     const segConns = perEndpoint ? 0 : segConnectionsFor(cfg, netdisk)
     try {
+      /* 主地址 + 备用地址。与初次添加同一套规矩：分段引擎先试，它自己会探测（探测不通过
+       * 就在 add() 里抛错），所以这里按候选顺序逐条试，一条都不行才回退 aria2。
+       * aria2 没有「探测」这个环节，遇到 403 只会反复重试卡在 0%，所以先用 handable()
+       * 把明显不能下的候选挑掉。 */
+      const cands = fileCandidates(f)
+      let pick = { url: cands[0].url, headers: cands[0].headers }
       let gid = ''
       let engine = 'aria2'
-      if (segConns && f.url) {
-        try {
-          gid = await seg.add({
-            url: f.url,
-            headers: f.headers || {},
-            dir: subdir,
-            out: sanitizeName(f.name),
-            connections: segConns,
-            netdisk,
-            source,
-            proxy: useProxy,
-            insecure: !!cfg.ignoreCert,
-          })
-          engine = 'seg'
-        } catch (e) {
-          /* 不支持 Range（老服务器）、或者探测失败 → 回退 aria2，别让任务加不进来 */
-          boot('seg-fallback', netdisk, f.name, (e && e.message) || String(e))
-          gid = ''
+      if (segConns && cands.length) {
+        for (let i = 0; i < cands.length && !gid; i++) {
+          try {
+            gid = await seg.add({
+              url: cands[i].url,
+              headers: cands[i].headers,
+              dir: subdir,
+              out: sanitizeName(f.name),
+              connections: segConns,
+              netdisk,
+              source,
+              proxy: useProxy,
+              insecure: !!cfg.ignoreCert,
+            })
+            engine = 'seg'
+            pick = cands[i]
+            if (i) boot('url-candidate', f.name, `分段引擎改用备用地址 host=${hostOf(cands[i].url)}`)
+          } catch (e) {
+            /* 不支持 Range（老服务器）、或者探测失败 → 换下一条候选，都不行再回退 aria2 */
+            boot('seg-fallback', netdisk, f.name, `host=${hostOf(cands[i].url)} ` + ((e && e.message) || String(e)))
+            gid = ''
+          }
         }
       }
       if (!gid) {
-        gid = await aria2.addUri([f.url], options)
+        pick = await firstHandable(cands, f.name)
+        const opts2 = { ...options }
+        const h2 = buildHeaders(pick.headers)
+        if (h2.length) opts2.header = h2
+        else delete opts2.header
+        gid = await aria2.addUri([pick.url], opts2)
         engine = 'aria2'
+        /* 这条不能只写进 boot：用户看到的报错得能分辨是哪个站拒的 */
+        boot('add-aria2', f.name, `host=${hostOf(pick.url)} cands=${cands.length}`)
+        options.header = opts2.header
       }
       tasks.remember(gid, {
         name: f.name,
@@ -610,6 +703,10 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
           name: f.name,
           dir: f.dir || '',
           engine,
+          /* 这次真正交给引擎的那条地址。「换直链」时先拿它判断是什么站
+           * （插件抓来的投递地址 `/Delivery.cfm/…` 需要就地换新签名，而不是重新解析一遍）。 */
+          url: pick.url,
+          headers: pick.headers || {},
           opts: { ...options },
         },
       })
@@ -708,6 +805,27 @@ async function bridgeAdd(p) {
   if (!name) name = 'download.bin'
 
   const session = [{ id: '0', name, size: finalSize || Number((p && p.size) || 0), isDir: false, dir: '', url: finalUrl, headers }]
+  /* 论文站这类「地址本身就是会过期的投递地址」的：提交前先问站点要一条新的。
+   * 插件抓到的那条往往是几分钟前点的按钮地址，那时它就差一步到 5 分钟有效期了。 */
+  if (nd === 'ssrn' && parsers.PARSERS.ssrn && parsers.PARSERS.ssrn.isDelivery(finalUrl)) {
+    try {
+      const got = await parsers.PARSERS.ssrn.resolveDelivery(finalUrl, {
+        cookie: p && p.cookie,
+        headers,
+        userAgent: (p && p.userAgent) || '',
+      })
+      if (got && got.ok) {
+        session[0].url = got.url
+        /* 预签名地址自带签名和有效期，不需要再带 Cookie / Referer；
+         * 留着旧头反而可能把一张「只认签名」的地址带歪。 */
+        session[0].headers = { ...got.headers }
+        viaParser = 'ssrn'
+        boot('bridge-add-fresh', name, `host=${hostOf(got.url)}`)
+      }
+    } catch (e) {
+      boot('bridge-add-fresh-err', name, (e && e.message) || String(e))
+    }
+  }
   const r = await addResolved(cfg, {
     session,
     netdisk: viaParser || 'direct',
@@ -990,11 +1108,12 @@ function registerIpc() {
     }
   })
 
-  ipcMain.handle('dialog:pickDir', async () => {
+  ipcMain.handle('dialog:pickDir', async (_e, kind) => {
+    const trash = kind === 'trash'
     const r = await dialog.showOpenDialog(win, {
-      title: '选择下载目录',
+      title: trash ? '选择回收站目录' : '选择下载目录',
       properties: ['openDirectory', 'createDirectory'],
-      defaultPath: settings.load().downloadDir,
+      defaultPath: trash ? settings.load().trashDir : settings.load().downloadDir,
     })
     return r.canceled || !r.filePaths.length ? null : r.filePaths[0]
   })
@@ -1254,16 +1373,114 @@ function registerIpc() {
   /* 「换直链」：重新解析同一条分享、拿一条新的下载地址替换掉当前任务的地址。
    * 直链过期、或者某次分到的 CDN 节点太慢时用得上（也相当于迅雷客户端那套
    * 「重建任务重新调度节点」的合法等价物）。 */
-  ipcMain.handle('downloads:refresh', async (_e, gid) => {
-    const meta = tasks.info(gid)
-    const o = meta && meta.origin
-    if (!o || !o.source) {
-      return { ok: false, message: '这个任务没有可重新解析的来源（只有经「解析 → 开始下载」加入的任务支持换直链）' }
-    }
-    const cfg = settings.load()
-    let fresh = null
-    let newSession = ''
+  /**
+ * 把「一条已经取到的新直链」重新排进队列，换掉原来的那条任务。
+ *
+ * 为什么是「移除 + 重新加入」而不是 aria2 的 `changeUri` 热替换：
+ * 本机实测（aria2 1.37）对一个正在下载的任务调 `changeUri` 之后，aria2 进程会失联，
+ * 紧接着所有 RPC 都报 `TypeError: fetch failed`，任务进度停在原地。
+ * `.aria2` 控制文件还在，`--continue=true` 会让它从断点续传，不会白下。
+ *
+ * @param o     `tasks.info(gid).origin`（保存着来源、名字、引擎与原参数）
+ * @param fresh `{url, headers}` 新地址
+ * @returns `{gid, engine, was, live}`
+ */
+async function readdTask(gid, o, fresh) {
+  const header = buildHeaders(fresh.headers)
+  const opts = { ...(o.opts || {}) }
+  delete opts.gid
+  if (header.length) opts.header = header
+
+  let st = null
+  try {
+    st = await aria2.tellStatus(gid)
+  } catch {
+    /* 任务可能已经被删了，或者本来就在分段引擎上，照样走重新加入的路径 */
+  }
+  if (!st) {
     try {
+      st = seg.tellStatus(gid)
+    } catch {
+      /* ignore */
+    }
+  }
+  const live = st && (st.status === 'active' || st.status === 'paused' || st.status === 'waiting')
+
+  if (isSegTask(gid)) {
+    await seg.remove(gid).catch(() => {})
+  } else {
+    await aria2.remove(gid).catch(() => {})
+    /* 同样要把旧 gid 的结果从停止列表里清掉，否则旧任务会以「已停止」的形态赖在界面上 */
+    await aria2.removeDownloadResult(gid).catch(() => {})
+  }
+  tasks.forget(gid)
+  cleanupTake(o.name)
+  /* 与「初次添加」保持同一套参数：连接数取设置里那份（0 = 不走分段引擎，退回 aria2），
+   * 忽略证书也要跟着带上 —— 否则勾了「忽略证书错误」的任务换一次直链就又开始校验证书。 */
+  const cfgNow = settings.load()
+  const segConns = segConnectionsFor(cfgNow, o.netdisk)
+  let ngid = ''
+  let nengine = 'aria2'
+  if (o.engine === 'seg' && segConns) {
+    try {
+      ngid = await seg.add({
+        url: fresh.url,
+        headers: fresh.headers || {},
+        dir: opts.dir,
+        out: sanitizeName(o.name),
+        connections: segConns,
+        netdisk: o.netdisk,
+        source: o.source,
+        proxy: o.netdisk === 'direct' ? proxy.effective(cfgNow) : '',
+        insecure: !!cfgNow.ignoreCert,
+      })
+      nengine = 'seg'
+    } catch (e) {
+      boot('seg-fallback', 'refresh', o.name, (e && e.message) || String(e))
+    }
+  }
+  if (!ngid) {
+    ngid = await aria2.addUri([fresh.url], opts)
+    nengine = 'aria2'
+  }
+  tasks.remember(ngid, {
+    name: o.name,
+    netdisk: o.netdisk,
+    source: o.source,
+    dir: opts.dir,
+    engine: nengine,
+    origin: { ...o, engine: nengine },
+  })
+  tasks.kick()
+  return { gid: ngid, engine: nengine, was: st ? st.status : 'gone', live: !!live }
+}
+
+/**
+ * 按「来源」重新取一条直链给这个任务换上（界面上那个「换直链」按钮走的就是这条）。
+ * @returns `{ok, gid?, message, name?}`
+ */
+async function refreshTask(gid) {
+  const meta = tasks.info(gid)
+  const o = meta && meta.origin
+  if (!o || !o.source) {
+    return { ok: false, message: '这个任务没有可重新解析的来源（只有经「解析 → 开始下载」加入的任务支持换直链）' }
+  }
+  const cfg = settings.load()
+  const url = String(o.url || '')
+  const nd = detectNetdisk(url)
+  let fresh = null
+  let newSession = ''
+  try {
+    /* 论文站的投递地址是「签一次用 5 分钟」的：重新解析拿到的很可能还是同一条
+     * （页面里的按钮地址不会变），但它 302 的终点每次都是新的 —— 所以这里先换新地址，
+     * 换不出来再退回「重新解析一遍」。 */
+    if (nd === 'ssrn' && parsers.PARSERS.ssrn && parsers.PARSERS.ssrn.isDelivery(url)) {
+      /* Cookie 不用从别处找：主进程里那份浏览器现场（插件交过来的）就有，
+       * resolveDelivery 自己会按主机去取。 */
+      const got = await parsers.PARSERS.ssrn.resolveDelivery(url, { headers: o.headers || {} })
+      if (got && got.ok) fresh = { url: got.url, headers: got.headers || {} }
+    }
+    if (!fresh) {
       const { results } = await parsers.parseShare({ text: o.source, password: '', settings: cfg })
       const r = (results || []).find((x) => x.ok)
       if (!r) throw new Error((results && results[0] && results[0].message) || '重新解析失败')
@@ -1275,94 +1492,84 @@ function registerIpc() {
       if (!got.length) throw new Error('重新解析没有拿到新直链')
       fresh = got[0]
       newSession = r.sessionId
-    } catch (e) {
-      return { ok: false, message: (e && e.message) || String(e) }
     }
+  } catch (e) {
+    return { ok: false, message: (e && e.message) || String(e), name: o.name }
+  }
+  try {
+    const r = await readdTask(gid, o, fresh)
+    if (newSession) cleanupRemember(o.name, newSession)
+    boot('refresh', o.name, `re-add ok gid=${r.gid} engine=${r.engine} was=${r.was} live=${r.live}`)
+    return { ok: true, gid: r.gid, name: o.name, message: '已用新的下载地址重新加入队列（会从断点接着下）' }
+  } catch (e) {
+    boot('refresh-err', (e && e.stack) || String(e))
+    return { ok: false, message: '换直链失败：' + ((e && e.message) || String(e)), name: o.name }
+  }
+}
 
-    const header = buildHeaders(fresh.headers)
-    const opts = { ...(o.opts || {}) }
-    delete opts.gid
-    if (header.length) opts.header = header
+/**
+ * 「直链过期」这种失败自动换一次直链（只换一次，换完还失败就不再折腾）。
+ *
+ * 为什么需要：论文站预签名地址只有 5 分钟，夸克/百度这类网盘直链也会过期；
+ * 一条已经躺在队列里的任务，用户过一会儿点「继续」时地址早就死了，
+ * 引擎只会一遍遍重试同一个死地址，界面上停在 0%。
+ *
+ * @returns 真的发起了换链就返回 true
+ */
+async function autoRefreshExpired(list) {
+  const busy = (list || []).some((t) => t.status === 'active' || t.status === 'waiting')
+  if (busy) return false
+  for (const t of list || []) {
+    const gid = String(t.gid || '')
+    if (!gid || t.status !== 'error') continue
+    if (autoRefreshed.has(gid)) continue
+    if (!looksLikeAddrExpired(t)) continue
+    const meta = tasks.info(gid)
+    const o = meta && meta.origin
+    if (!o || !o.source) continue
+    autoRefreshed.add(gid)
+    boot('auto-refresh', o.name, `gid=${gid} code=${t.errorCode || ''}`)
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('downloads:notice', { text: `「${o.name}」的下载地址过期了，已换一条新的接着下` })
+    }
+    const r = await refreshTask(gid).catch(() => null)
+    boot('auto-refresh-done', o.name, r && r.ok ? `ok gid=${r.gid}` : `fail ${(r && r.message) || ''}`)
+    return true
+  }
+  return false
+}
 
-    let st = null
-    try {
-      st = await aria2.tellStatus(gid)
-    } catch {
-      /* 任务可能已经被删了，或者本来就在分段引擎上，照样走重新加入的路径 */
-    }
-    if (!st) {
-      try {
-        st = seg.tellStatus(gid)
-      } catch {
-        /* ignore */
-      }
-    }
-    const live = st && (st.status === 'active' || st.status === 'paused' || st.status === 'waiting')
-    try {
-      /* ⚠️ 这里**故意不用** aria2 的 `changeUri` 热替换。
-       * 本机实测（aria2 1.37）：对一个正在下载的任务调 `changeUri` 之后，aria2 进程会失联——
-       * 紧接着所有 RPC 都报 `TypeError: fetch failed`，任务进度停在原地。
-       * 所以统一改成「先移除、再用新地址重新加入」：
-       * `.aria2` 控制文件还在，`--continue=true` 会让它从断点续传，不会白下。 */
-      if (isSegTask(gid)) {
-        await seg.remove(gid).catch(() => {})
-      } else {
-        await aria2.remove(gid).catch(() => {})
-        /* 同样要把旧 gid 的结果从停止列表里清掉，否则旧任务会以「已停止」的形态赖在界面上 */
-        await aria2.removeDownloadResult(gid).catch(() => {})
-      }
-      tasks.forget(gid)
-      cleanupTake(o.name)
-      /* 与「初次添加」保持同一套参数：连接数取设置里那份（0 = 不走分段引擎，退回 aria2），
-       * 忽略证书也要跟着带上 —— 否则勾了「忽略证书错误」的任务换一次直链就又开始校验证书。 */
-      const cfgNow = settings.load()
-      const segConns = segConnectionsFor(cfgNow, o.netdisk)
-      let ngid = ''
-      let nengine = 'aria2'
-      if (o.engine === 'seg' && segConns) {
-        try {
-          ngid = await seg.add({
-            url: fresh.url,
-            headers: fresh.headers || {},
-            dir: opts.dir,
-            out: sanitizeName(o.name),
-            connections: segConns,
-            netdisk: o.netdisk,
-            source: o.source,
-            proxy: o.netdisk === 'direct' ? proxy.effective(cfgNow) : '',
-            insecure: !!cfgNow.ignoreCert,
-          })
-          nengine = 'seg'
-        } catch (e) {
-          boot('seg-fallback', 'refresh', o.name, (e && e.message) || String(e))
-        }
-      }
-      if (!ngid) {
-        ngid = await aria2.addUri([fresh.url], opts)
-        nengine = 'aria2'
-      }
-      tasks.remember(ngid, {
-        name: o.name,
-        netdisk: o.netdisk,
-        source: o.source,
-        dir: opts.dir,
-        engine: nengine,
-        origin: { ...o, engine: nengine },
-      })
-      if (newSession) cleanupRemember(o.name, newSession)
-      tasks.kick()
-      boot('refresh', o.name, `re-add ok gid=${ngid} engine=${nengine} was=${st ? st.status : 'gone'} live=${!!live}`)
-      return { ok: true, gid: ngid, message: '已用新的下载地址重新加入队列（会从断点接着下）' }
-    } catch (e) {
-      boot('refresh-err', (e && e.stack) || String(e))
-      return { ok: false, message: '换直链失败：' + ((e && e.message) || String(e)) }
-    }
-  })
-  ipcMain.handle('downloads:remove', async (_e, gid) => {
+/** 这条报错像不像「地址过期/被拒」：过期的地址重试多少次都是同样的错，换链才有意义 */
+function looksLikeAddrExpired(t) {
+  const code = String((t && t.errorCode) || '')
+  if (!code || code === '0') return false
+  /* aria2：16 = 文件已存在之类，22 = HTTP 响应头异常（403/404 都落这里） */
+  return /^(19|22|23)$/.test(code)
+}
+
+/* 自动换过链的任务：换完还失败就不再折腾（同一个 gid 只自动重来一次） */
+const autoRefreshed = new Set()
+
+ipcMain.handle('downloads:refresh', async (_e, gid) => refreshTask(gid))
+ipcMain.handle('downloads:remove', async (_e, gid, mode) => {
+    /* mode（只在「已下载完成的任务」上有意义）：
+     *   'trash'    —— 文件挪进回收站，任务从队列里移除
+     *   'purge'    —— 文件和任务一起彻底删掉
+     *   其它/缺省  —— 只把任务从队列里移除，磁盘上的文件留着
+     * 没下完的任务一概不动磁盘（它还要靠分片文件续传）。 */
+    const want = mode === 'trash' || mode === 'purge' ? mode : ''
     /* ⚠️ 必须**先**取名字再 forget：否则中途撤销任务时，那份转到用户网盘里的副本
      * 就再也没人认领，会永久留在 `/PanBox` 里。 */
     const meta = tasks.info(gid)
     const onSeg = isSegTask(gid)
+
+    let done = null
+    if (want) {
+      const f = await taskFile(gid).catch(() => null)
+      if (!f || !f.path) return { ok: false, message: '找不到这个任务对应的文件' }
+      if (f.status !== 'complete') return { ok: false, message: '这个任务还没下载完' }
+      done = f
+    }
 
     /* ① 还在下载/排队中的任务：先停掉（forceRemove 对已停止的任务会报错，所以吞掉） */
     let stopped = false
@@ -1397,10 +1604,39 @@ function registerIpc() {
     if (meta && meta.name) await recycleTransferCopy(meta.name, 'remove').catch(() => {})
     /* 立刻推一次，别让用户等下一个 800ms 轮询 */
     tasks.kick()
-    boot('remove', gid, `stopped=${stopped} purged=${purged} name=${(meta && meta.name) || ''}`)
+
+    /* ② 文件去留：挪进回收站 / 直接删掉。任务已经摘干净了，这一步失败也不影响队列，
+     * 但要把原因如实回报（文件被别的程序占用时删不掉）。 */
+    let moved = null
+    let wiped = false
+    let fileErr = ''
+    if (done && want === 'trash') {
+      try {
+        moved = await trash.add(done.path, { netdisk: (meta && meta.netdisk) || '', gid })
+        if (!moved) fileErr = '文件已经不在磁盘上了'
+      } catch (e) {
+        fileErr = (e && e.message) || String(e)
+      }
+    } else if (done && want === 'purge') {
+      try {
+        await fs.promises.rm(done.path, { recursive: true, force: true })
+        wiped = true
+      } catch (e) {
+        fileErr = (e && e.message) || String(e)
+      }
+    }
+    boot('remove', gid, `stopped=${stopped} purged=${purged} mode=${want || '-'} name=${(meta && meta.name) || ''}`, fileErr ? 'err=' + fileErr : '')
 
     /* 只要 aria2 的结果清掉了就算成功；停不掉也没关系（本来就已停止） */
-    return purged || stopped
+    return {
+      ok: (purged || stopped) && !fileErr,
+      moved: !!moved,
+      wiped,
+      name: (moved && moved.name) || (meta && meta.name) || '',
+      size: (moved && moved.size) || 0,
+      id: (moved && moved.id) || '',
+      message: fileErr,
+    }
   })
   /* ---- 回收站 ------------------------------------------------------ */
   /* 删「已完成的下载文件」：不抹盘，先把文件挪进回收站，再把任务从队列里移除。
@@ -1532,9 +1768,11 @@ async function applyRuntimeSettings(before, after) {
     await startBridge().catch(() => {})
   }
   applyAutoStart(after)
-  /* 下载目录换了，回收站跟着搬到新目录下 */
-  if (String(after.downloadDir) !== String(before.downloadDir)) {
-    trash.configure({ downloadDir: after.downloadDir })
+  /* 回收站目录换了（或者下载目录换了 —— 老位置的回收站要跟着搬）：重新指一次，
+   * 并把旧目录里还在的内容搬进新目录。 */
+  if (String(after.trashDir) !== String(before.trashDir) || String(after.downloadDir) !== String(before.downloadDir)) {
+    trash.configure({ dir: after.trashDir, downloadDir: after.downloadDir })
+    purgeTrash('settings')
   }
   /* 托盘图标开关：关掉立刻撤图标，打开立刻建出来 */
   if (!!after.trayIcon !== !!before.trayIcon) {
@@ -1773,9 +2011,11 @@ if (!gotLock) {
     boot('outbound-proxy', px.proxy || '(直连)', px.ok ? 'ok' : '失败：' + (px.message || ''))
     registerIpc()
     initAutoUpdater()
-    /* 回收站索引跟着用户数据走，回收目录放在下载目录里（用户能在资源管理器里直接看到） */
+    /* 回收站索引跟着用户数据走；回收目录默认也在用户数据目录下（设置里可改），
+     * 不在下载目录里造文件夹。configure 里会顺手把老位置的回收站内容搬过来。 */
     trash.configure({
       indexPath: path.join(app.getPath('userData'), 'trash.json'),
+      dir: settings.load().trashDir,
       downloadDir: settings.load().downloadDir,
       retentionDays: settings.load().trashRetentionDays,
     })
@@ -1814,6 +2054,7 @@ if (!gotLock) {
 
     tasks.on('update', (list) => {
       resumePreempted(list).catch(() => {})
+      autoRefreshExpired(list).catch(() => {})
       if (win && !win.isDestroyed()) win.webContents.send('downloads:update', list)
     })
 

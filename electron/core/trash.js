@@ -2,12 +2,13 @@
 
 /**
  * 回收站：用户删掉「已完成的下载文件」时，不直接抹掉，而是把文件改名挪进
- * `<下载目录>\PanBox回收站\`，并在 `%APPDATA%\PanBox\trash.json` 里留一条记录。
- * 同一卷内 rename 是瞬时的，不搬字节；还原就是把文件挪回原位。
+ * 回收站目录（默认 `%APPDATA%\PanBox\回收站`，设置里可改），并在
+ * `%APPDATA%\PanBox\trash.json` 里留一条记录。同一卷内 rename 是瞬时的，
+ * 不搬字节；还原就是把文件挪回原位。
  *
  * 设计取舍：
- *  - 目录放在下载目录里（同一卷），rename 才快；用户换了下载目录也不影响旧记录，
- *    因为索引里存的是绝对路径。
+ *  - 目录不放在下载目录里 —— 用户的下载目录里不该凭空多出文件夹；代价是
+ *    跨盘时 rename 失败，退回「复制 + 删源」（大文件会慢一些，见 add()）。
  *  - 索引文件独立于 settings.json，写坏也不影响下载配置。
  *  - 不依赖 electron：路径由 configure() 传进来，方便用 Node 直接测。
  */
@@ -16,18 +17,20 @@ const fs = require('node:fs')
 const fsp = require('node:fs/promises')
 const path = require('node:path')
 
-/** 回收站目录名（在下载目录下），普通名字，别和下载的文件重名 */
-const DIR_NAME = 'PanBox回收站'
-/** 早期用过的带点名字，启动时把里面的文件搬过来（老用户无感） */
-const LEGACY_DIR_NAMES = ['.PanBox 回收站', '.PanBox回收站']
+/** 早期回收站是下载目录下的一个文件夹，启动时把里面的东西搬走（老用户无感） */
+const LEGACY_DIR_NAME = 'PanBox回收站'
+const LEGACY_DIR_NAMES = [LEGACY_DIR_NAME, '.PanBox 回收站', '.PanBox回收站']
 /** 回收站最多留 200 条；超量的最旧条目在下一次删除时真删 —— 免得当永久仓库用 */
 const MAX_ITEMS = 200
 /** 到期自动清理的默认天数（0 = 永不自动删）。见 settings.js 的 trashRetentionDays */
 const DEFAULT_RETENTION_DAYS = 30
 /** 一天的毫秒数（保留天数换算成时间戳用；list() 里换算剩余天数也用同一份，避免各写一遍魔数） */
 const MS_PER_DAY = 24 * 60 * 60 * 1000
+/** 启动时最多搬这么多字节的老回收站内容；换过盘的用户不会卡在启动上，剩下的下次再搬 */
+const MIGRATE_MAX_BYTES = 512 * 1024 * 1024
 
 let indexPath = ''
+let dir = ''
 let downloadDir = ''
 let items = []
 let loaded = false
@@ -36,6 +39,8 @@ let retentionDays = DEFAULT_RETENTION_DAYS
 function configure(opts) {
   const o = opts || {}
   if (o.indexPath) indexPath = String(o.indexPath)
+  /* dir 是回收站目录本身，优先用它；没给就按老规则落在下载目录下（只给测试与老代码兜底） */
+  if (o.dir) dir = String(o.dir)
   if (o.downloadDir) downloadDir = String(o.downloadDir)
   if (o.retentionDays !== undefined) setRetention(o.retentionDays)
   loaded = false
@@ -53,8 +58,8 @@ function getRetention() {
 }
 
 function trashDir() {
-  const base = downloadDir || process.cwd()
-  return path.join(base, DIR_NAME)
+  if (dir) return dir
+  return path.join(downloadDir || process.cwd(), LEGACY_DIR_NAME)
 }
 
 function inside(dir, p) {
@@ -62,22 +67,42 @@ function inside(dir, p) {
   return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel)
 }
 
+/** 估算一个文件/目录的字节数（跨盘搬迁要按预算来，见 MIGRATE_MAX_BYTES） */
+function sizeOf(p) {
+  try {
+    const st = fs.statSync(p)
+    if (!st.isDirectory()) return Number(st.size || 0)
+    let total = 0
+    for (const one of fs.readdirSync(p)) total += sizeOf(path.join(p, one))
+    return total
+  } catch {
+    return 0
+  }
+}
+
 /**
- * 把老目录（`.PanBox 回收站`）里的东西并到新目录，并修正索引里的路径。
- * 只做同一卷上的 rename；失败就留着下次再试，不影响启动。
+ * 把老回收站里的东西并到当前回收站目录，并修正索引里指向别处的路径。
+ *
+ * 搬迁一律在同一卷上是 rename（瞬时）；跨卷（用户换过盘，或回收站设到了别的盘）
+ * 会退化成复制，所以这里按 MIGRATE_MAX_BYTES 限一个启动预算：搬不完的下次启动接着搬，
+ * 不影响启动，也不丢记录。
  */
 function migrateSync() {
   const target = trashDir()
   let changed = false
+  let budget = MIGRATE_MAX_BYTES
 
   /* 索引里指向别处（老目录 / 换过下载目录）的条目：搬进当前回收站 */
   for (const it of items) {
     if (!it.to || inside(target, it.to)) continue
     try {
       if (!fs.existsSync(it.to)) continue
+      const need = sizeOf(it.to)
+      if (need > budget) continue
       fs.mkdirSync(target, { recursive: true })
       const next = uniqueTarget(target, path.basename(it.to))
       fs.renameSync(it.to, next)
+      budget -= need
       it.to = next
       changed = true
     } catch {
@@ -86,46 +111,54 @@ function migrateSync() {
   }
 
   /* 老目录里没被索引到的散落文件：一并搬过来并补一条记录 */
+  const from = downloadDir || process.cwd()
   for (const name of LEGACY_DIR_NAMES) {
-    const old = path.join(downloadDir || process.cwd(), name)
-    if (old === target || !fs.existsSync(old)) continue
-    let entries = []
-    try {
-      entries = fs.readdirSync(old)
-    } catch {
-      continue
-    }
-    fs.mkdirSync(target, { recursive: true })
-    for (const one of entries) {
+    const bases = name === LEGACY_DIR_NAME ? [from, path.dirname(from)] : [from]
+    for (const base of bases) {
+      if (!base) continue
+      const old = path.join(base, name)
+      if (old === target || !fs.existsSync(old)) continue
+      let entries = []
       try {
-        const next = uniqueTarget(target, one)
-        fs.renameSync(path.join(old, one), next)
-        let st = null
-        try {
-          st = fs.statSync(next)
-        } catch {
-          st = null
-        }
-        items.push({
-          id: newId(),
-          name: one,
-          from: path.join(downloadDir || process.cwd(), one),
-          to: next,
-          size: st && !st.isDirectory() ? Number(st.size || 0) : 0,
-          dir: !!(st && st.isDirectory()),
-          netdisk: '',
-          gid: '',
-          at: Date.now(),
-        })
-        changed = true
+        entries = fs.readdirSync(old)
       } catch {
-        /* 单个文件搬不动就跳过 */
+        continue
       }
-    }
-    try {
-      fs.rmdirSync(old)
-    } catch {
-      /* 还有东西没搬走就留着 */
+      fs.mkdirSync(target, { recursive: true })
+      for (const one of entries) {
+        try {
+          const need = sizeOf(path.join(old, one))
+          if (need > budget) continue
+          const next = uniqueTarget(target, one)
+          fs.renameSync(path.join(old, one), next)
+          budget -= need
+          let st = null
+          try {
+            st = fs.statSync(next)
+          } catch {
+            st = null
+          }
+          items.push({
+            id: newId(),
+            name: one,
+            from: path.join(from, one),
+            to: next,
+            size: st && !st.isDirectory() ? Number(st.size || 0) : 0,
+            dir: !!(st && st.isDirectory()),
+            netdisk: '',
+            gid: '',
+            at: Date.now(),
+          })
+          changed = true
+        } catch {
+          /* 单个文件搬不动就跳过 */
+        }
+      }
+      try {
+        fs.rmdirSync(old)
+      } catch {
+        /* 还有东西没搬走就留着 */
+      }
     }
   }
   return changed
@@ -362,6 +395,6 @@ module.exports = {
   purgeExpired,
   setRetention,
   getRetention,
-  DIR_NAME,
+  DIR_NAME: LEGACY_DIR_NAME,
   _trashDir: trashDir,
 }

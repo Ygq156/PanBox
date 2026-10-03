@@ -238,6 +238,7 @@ async function resolveFiles({ sessionId, ids }) {
         size: m.size || 0,
         url: g.url,
         headers: g.headers || {},
+        urls: Array.isArray(g.urls) ? g.urls : [],
         viaEndpoint: viaEndpoint || !!g.viaEndpoint,
       })
     }
@@ -261,6 +262,9 @@ async function resolveFiles({ sessionId, ids }) {
       size: m.size || 0,
       url: r.url,
       headers: r.headers || {},
+      /* 解析器可以给「备用下载地址」：主地址被拒时引擎按顺序再试（比如文章页那条
+       * CDN 地址在某些出口上会被 403，备用那条还能顶上）。没有就是空数组。 */
+      urls: Array.isArray(r && r.urls) ? r.urls : [],
       viaEndpoint: viaEndpoint || !!(r && r.viaEndpoint),
     })
   }

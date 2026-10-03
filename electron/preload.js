@@ -16,7 +16,8 @@ contextBridge.exposeInMainWorld('panbox', {
   /* 插队：把这条任务顶到最前（队满时暂停一条正在下载的给它腾位置，稍后自动恢复） */
   jumpTask: (gid) => invoke('downloads:jumpTop', gid),
   refreshTask: (gid) => invoke('downloads:refresh', gid),
-  removeTask: (gid) => invoke('downloads:remove', gid),
+  /* 移除任务。第二个参数只管「已完成的任务」磁盘上那个文件：trash=进回收站，purge=彻底删，不给=留着 */
+  removeTask: (gid, mode) => invoke('downloads:remove', gid, mode),
   /* 删掉已下完的文件：文件进回收站，任务同时从队列移除 */
   deleteTaskFile: (gid) => invoke('downloads:deleteFile', gid),
   pauseAll: () => invoke('downloads:pauseAll'),
@@ -32,7 +33,7 @@ contextBridge.exposeInMainWorld('panbox', {
   getSettings: () => invoke('settings:get'),
   setSettings: (s) => invoke('settings:set', s),
   resetSettings: () => invoke('settings:reset'),
-  pickDir: () => invoke('dialog:pickDir'),
+  pickDir: (kind) => invoke('dialog:pickDir', kind),
   openPath: (p) => invoke('shell:openPath', p),
 
   aria2Status: () => invoke('aria2:status'),
@@ -76,6 +77,14 @@ contextBridge.exposeInMainWorld('panbox', {
     const h = (_e, data) => cb(data)
     ipcRenderer.on('update:state', h)
     return () => ipcRenderer.removeListener('update:state', h)
+  },
+
+  /* 主进程在后台替用户做了什么（比如直链过期、自动换了一条），
+   * 用一句话讲清就行，不需要用户点任何东西 */
+  onDownloadsNotice: (cb) => {
+    const h = (_e, data) => cb(data)
+    ipcRenderer.on('downloads:notice', h)
+    return () => ipcRenderer.removeListener('downloads:notice', h)
   },
 
   /* 浏览器插件投递进来一个「网盘分享链接」时，主进程把它送到这里，

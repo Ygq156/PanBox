@@ -8,18 +8,30 @@ const { DEFAULT_UA } = require('../parsers/util')
 
 const FILE = () => path.join(app.getPath('userData'), 'settings.json')
 
+/* 默认下载目录就是系统的「下载」本身，**不再套一层 PanBox**：
+ * 下载下来的东西直接落在用户选的那个目录里，不额外造文件夹。 */
 function defaultDownloadDir() {
-  let base
   try {
-    base = app.getPath('downloads')
+    return app.getPath('downloads')
   } catch {
-    base = path.join(os.homedir(), 'Downloads')
+    return path.join(os.homedir(), 'Downloads')
   }
-  return path.join(base, 'PanBox')
+}
+
+/* 回收站的默认位置：用户数据目录下（%APPDATA%\PanBox\回收站）。
+ * 为什么不放在下载目录里：那等于在用户的下载目录里凭空多一个文件夹，
+ * 而且回收站是全局一份，跟着下载目录变来变去没有意义。设置里可以改成任何路径。 */
+function defaultTrashDir() {
+  try {
+    return path.join(app.getPath('userData'), '回收站')
+  } catch {
+    return path.join(os.tmpdir(), 'PanBox回收站')
+  }
 }
 
 const DEFAULTS = () => ({
   downloadDir: defaultDownloadDir(),
+  trashDir: defaultTrashDir(),
   maxConcurrent: 3,
   split: 16,
   maxConnectionPerServer: 16,
@@ -35,7 +47,7 @@ const DEFAULTS = () => ({
   /* 托盘图标（首次启动就显示）。关掉之后没有托盘入口，关闭窗口 = 直接退出，
    * 所以主进程会把「关闭到后台」也一并按「不留后台」处理。 */
   trayIcon: true,
-  /* 回收站（<下载目录>\PanBox回收站）里超过这么多天的文件自动真删，0 = 永不自动删。
+  /* 回收站里超过这么多天的文件自动真删，0 = 永不自动删（目录见 trashDir）。
    * 索引里另有 200 条的容量上限（trash.js 的 MAX_ITEMS）：双上限，免得回收站无限长大。
    * 判据用条目入站时间，清理在启动时、设置变更时与每 6 小时各做一次；删不掉的（文件被占用）
    * 保留记录下次再试。 */
@@ -189,6 +201,12 @@ function sanitizePatch(patch) {
     if ('trashRetentionDays' in patch) {
       out.trashRetentionDays = int(patch.trashRetentionDays, 0, 3650, '回收站保留天数')
     }
+    if ('trashDir' in patch) {
+      const s = str(patch.trashDir, 512, '回收站目录')
+      if (!s) throw new Error('回收站目录不能为空')
+      if (!path.isAbsolute(s)) throw new Error('回收站目录必须是绝对路径')
+      out.trashDir = path.resolve(s)
+    }
     if ('autoCheckUpdate' in patch) out.autoCheckUpdate = bool(patch.autoCheckUpdate, '自动检查更新')
     if ('autoStart' in patch) out.autoStart = bool(patch.autoStart, '开机自启动')
     if ('startupShowWindow' in patch) out.startupShowWindow = bool(patch.startupShowWindow, '启动时显示窗口')
@@ -330,6 +348,11 @@ function save(partial) {
   }
   try {
     fs.mkdirSync(next.downloadDir, { recursive: true })
+  } catch {
+    /* ignore */
+  }
+  try {
+    fs.mkdirSync(next.trashDir, { recursive: true })
   } catch {
     /* ignore */
   }

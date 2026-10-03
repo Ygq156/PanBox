@@ -107,7 +107,14 @@ export interface PanboxAPI {
   /** 插队：把任务顶到最前；队满时主进程会暂停一条正在下载的让它先跑（结束后自动恢复） */
   jumpTask(gid: string): Promise<{ ok: boolean; status?: string; paused?: string[]; message?: string }>
   refreshTask(gid: string): Promise<{ ok: boolean; gid?: string; message?: string }>
-  removeTask(gid: string): Promise<boolean>
+  /**
+   * 把任务从队列里移除。`mode` 只管「已完成的任务」磁盘上的那个文件：
+   * `trash` = 挪进回收站，`purge` = 连同文件彻底删掉，不给 = 文件留着。
+   */
+  removeTask(
+    gid: string,
+    mode?: 'trash' | 'purge',
+  ): Promise<{ ok: boolean; moved?: boolean; wiped?: boolean; name?: string; size?: number; id?: string; message?: string }>
   /** 删掉已下载完成的文件：文件进回收站，任务同时从队列移除 */
   deleteTaskFile(gid: string): Promise<{ ok: boolean; name?: string; size?: number; message?: string }>
   pauseAll(): Promise<boolean>
@@ -121,7 +128,7 @@ export interface PanboxAPI {
   setSettings(s: Partial<Settings>): Promise<Settings>
   /** 恢复默认设置（登录凭证与自备解析接口保留），返回恢复后的设置 */
   resetSettings(): Promise<Settings>
-  pickDir(): Promise<string | null>
+  pickDir(kind?: 'trash'): Promise<string | null>
   openPath(p: string): Promise<string>
   aria2Status(): Promise<Aria2Status>
   restartAria2(): Promise<Aria2Status>
@@ -141,6 +148,8 @@ export interface PanboxAPI {
   updateDownload(): Promise<{ ok: boolean; message?: string }>
   updateInstall(): Promise<{ ok: boolean; message?: string }>
   onDownloadsUpdate(cb: (tasks: DownloadTask[]) => void): () => void
+  /** 主进程在后台替用户做的事（如直链过期后自动换了一条），一句话提示即可 */
+  onDownloadsNotice(cb: (data: { text: string }) => void): () => void
   onBridgePrefill(cb: (data: { url: string; netdisk: string; message?: string }) => void): () => void
   onUpdateAvailable(cb: (data: { latest: string; current: string; url: string; name?: string; publishedAt?: string }) => void): () => void
   onUpdateState(cb: (data: UpdateState) => void): () => void
