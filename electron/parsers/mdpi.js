@@ -1,6 +1,7 @@
 'use strict'
 
-const { req } = require('./util')
+const { sanitizeFileName } = require('./util')
+const { probeUrl } = require('./probe')
 
 /* ------------------------------------------------------------------ */
 /* MDPI：文章页地址 → mdpi-res.com 上的 PDF 直链                        */
@@ -147,28 +148,6 @@ function known(issn) {
   return !!JOURNALS[issn]
 }
 
-/* `Content-Disposition: attachment; filename="futureinternet-15-00192.pdf"` → 文件名 */
-function fileNameOf(cd) {
-  const s = String(cd || '')
-  let m = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/i.exec(s)
-  if (m) {
-    try {
-      return decodeURIComponent(m[1].trim().replace(/^"|"$/g, '')).slice(0, 200)
-    } catch {
-      /* 编码坏了就用原样 */
-    }
-  }
-  m = /filename\s*=\s*"?([^";]+)"?/i.exec(s)
-  return m ? m[1].trim().slice(0, 200) : ''
-}
-
-/* 文件名兜底：CDN 不给 disposition 时用 journal-卷-文号.pdf。
- * 名字里带 `[\\/:*?"<>|]` 的文件名在 Windows 上会写不出去，统一换掉。 */
-function safeName(s) {
-  const t = String(s || '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim()
-  return t.slice(0, 180)
-}
-
 module.exports = {
   netdisk: 'mdpi',
 
@@ -192,15 +171,16 @@ module.exports = {
       /* 只要响应头：`noBody` 不读正文，就算服务器不认 HEAD 也不会白拉几百 KB。
        * 带 Range 时 CDN 回 206，所以这里只要求 2xx。
        * allowLocal 只在「CDN 起点被指向本机假站点」的测试里为真（见 cdnBase）。 */
-      const r = await req(pdf, { method: 'HEAD', timeout: 20000, noBody: true, allowLocal: !!process.env.PANBOX_MDPI_BASE })
-      if (r.status >= 200 && r.status < 300) {
-        name = fileNameOf(r.headers.get('content-disposition'))
-        size = Number(r.headers.get('content-length') || 0) || 0
+      const r = await probeUrl(pdf, { allowLocal: !!process.env.PANBOX_MDPI_BASE })
+      if (r.ok) {
+        name = sanitizeFileName(r.name)
+        size = r.size
       }
     } catch {
       /* HEAD 不通不算失败：直链已经算出来了，名字用兜底的，交给下载器自己去问 */
     }
-    if (!name) name = safeName(`${j.slug}-${a.volume}-${String(a.art).padStart(5, '0')}.pdf`)
+    /* 兜底名字：journal-卷-文号.pdf（CDN 不给 disposition 时用） */
+    if (!name) name = sanitizeFileName(`${j.slug}-${a.volume}-${String(a.art).padStart(5, '0')}.pdf`)
 
     return {
       title: `${j.name} ${a.volume}: ${name}`,

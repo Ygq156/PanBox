@@ -1,6 +1,7 @@
 'use strict'
 
-const { req } = require('./util')
+const { req, filenameFromHeaders, sanitizeFileName } = require('./util')
+const { probeUrl, PROBE_TIMEOUT_LONG } = require('./probe')
 const browserCtx = require('./browserCtx')
 
 /* ------------------------------------------------------------------ */
@@ -96,40 +97,15 @@ function defaultDelivery(id) {
 
 /** `Content-Disposition` / 页面标题 → 文件名 */
 function nameOf(cd, title, id) {
-  const s = String(cd || '')
-  let m = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/i.exec(s)
-  if (m) {
-    try {
-      return decode(clean(m[1]))
-    } catch {
-      /* 编码坏了就用原样 */
-    }
-  }
-  m = /filename\s*=\s*"?([^";]+)"?/i.exec(s)
-  if (m) return clean(m[1])
+  const cdName = filenameFromHeaders({ 'content-disposition': cd })
+  if (cdName) return sanitizeFileName(cdName)
   const t = String(title || '').trim()
   if (t) {
     /* 页面标题常是 `Title by Author :: SSRN` 这种，取 `::` 前面那段 */
     const head = t.split(/\s*::\s*/)[0].replace(/\s+/g, ' ').trim()
-    if (head && head.length <= 160) return clean(head + '.pdf')
+    if (head && head.length <= 160) return sanitizeFileName(head + '.pdf')
   }
   return `ssrn-${id}.pdf`
-}
-
-function clean(s) {
-  return String(s || '')
-    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 180)
-}
-
-function decode(s) {
-  try {
-    return decodeURIComponent(String(s).trim().replace(/^"|"$/g, ''))
-  } catch {
-    return String(s).trim().replace(/^"|"$/g, '')
-  }
 }
 
 /** 页面 <title> 里那句论文名（只是给列表看着顺眼，拿不到就算了） */
@@ -168,21 +144,20 @@ async function resolveDelivery(url, payload = {}) {
   const jar = browserCtx.jarFor(siteUrl, payload.cookie)
   const headers = { ...pageHeaders(siteUrl, siteBase() + '/'), ...withCookie }
   try {
-    const probe = await req(target, {
-      method: 'GET',
+    const probe = await probeUrl(target, {
       /* 不给 fallbackReferer：终点常常已经换到别家公司的主机上（download.ssrn.com 或 S3），
        * 把论文页地址当 Referer 带过去既是跨站泄露，也不是浏览器会做的事。 */
-      headers: { ...headers, Range: 'bytes=0-0' },
+      method: 'GET',
+      range: true,
+      headers,
       jar,
-      timeout: 30000,
-      noBody: true,
+      timeout: PROBE_TIMEOUT_LONG,
       allowLocal: !!process.env.PANBOX_SSRN_BASE,
     })
-    if (probe.status >= 200 && probe.status < 300) {
-      const finalUrl = probe.url || target
+    if (probe.ok) {
       return {
         ok: true,
-        url: finalUrl,
+        url: probe.url || target,
         name: nameOf(probe.headers.get('content-disposition'), '', abstractIdOf(url)),
         /* 预签名地址自带签名，头不需要跟着走 */
         headers: {},

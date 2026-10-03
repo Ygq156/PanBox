@@ -15,7 +15,17 @@ const parsers = require('./parsers')
 const login = require('./core/login')
 const bridge = require('./core/bridge')
 const proxy = require('./core/proxy')
-const { detectNetdisk, setOutboundProxy, req, withExt, hasKnownExt, contentTypeExt, urlBaseName } = require('./parsers/util')
+const {
+  detectNetdisk,
+  setOutboundProxy,
+  req,
+  withExt,
+  hasKnownExt,
+  contentTypeExt,
+  urlBaseName,
+  sanitizeFileName,
+} = require('./parsers/util')
+const { probeUrl, PROBE_TIMEOUT } = require('./parsers/probe')
 const browserCtx = require('./parsers/browserCtx')
 
 /* 安装版可以就地更新：electron-updater 走 NSIS，安装器会静默跑旧卸载器
@@ -408,26 +418,6 @@ let portableExt = null
 /* 工具                                                                */
 /* ------------------------------------------------------------------ */
 
-/** Windows 保留设备名：这些名字（含带扩展名的形式）不能作为文件名 */
-const WIN_DEVICE_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i
-
-function sanitizeName(s) {
-  let name =
-    String(s || '')
-      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
-      .replace(/^\.+/, '_')
-      .trim()
-      .slice(0, 180) || 'unnamed'
-  /* Windows 上文件名不能以点或空格结尾（会被静默截断，导致落盘名和任务名对不上，
-   * 后续「换直链/续传」按名字找不到文件） */
-  name = name.replace(/[. ]+$/, '')
-  if (!name) name = 'unnamed'
-  /* 设备名：NUL / CON / COM1 … 会被 Windows 当成设备，写进去等于丢弃数据 */
-  const base = name.replace(/\.[^.]*$/, '')
-  if (WIN_DEVICE_NAMES.test(base)) name = `_${name}`
-  return name
-}
-
 /**
  * 这个名字缺后缀时，问一下地址「你是什么」。服务器没给 `content-disposition`
  * 文件名的时候，浏览器就是这么做决定的：URL 最后一段当名字，**响应类型补后缀**
@@ -438,24 +428,8 @@ function sanitizeName(s) {
  */
 async function ctOf(url, headers) {
   if (!/^https?:\/\//i.test(url)) return { ct: '', cdName: '' }
-  for (const attempt of [
-    { method: 'HEAD', headers },
-    { method: 'GET', headers: { ...headers, Range: 'bytes=0-0' } },
-  ]) {
-    try {
-      const r = await req(url, { ...attempt, timeout: 12000, noBody: true, allowLocal: allowLocalReq() })
-      if (r.status >= 200 && r.status < 400) {
-        const cd = r.headers.get('content-disposition') || ''
-        const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
-        return { ct: r.headers.get('content-type') || '', cdName: m ? m[1].trim().replace(/^"|"$/g, '') : '' }
-      }
-      if (r.status === 405 || r.status === 501) continue
-      return { ct: '', cdName: '' }
-    } catch {
-      return { ct: '', cdName: '' }
-    }
-  }
-  return { ct: '', cdName: '' }
+  const p = await probeUrl(url, { headers, allowLocal: allowLocalReq() })
+  return { ct: p.ct, cdName: p.name }
 }
 
 /**
@@ -468,24 +442,24 @@ async function ctOf(url, headers) {
  * 多问一次白花站点资源还可能提前作废。
  */
 async function resolveFileName(f, netdisk, headers) {
-  let name = sanitizeName(f.name || '')
+  let name = sanitizeFileName(f.name || '')
   const url = f.url || ''
   if (!url || netdisk !== 'direct' || isLocalUrl(url)) return name
   /* 名字是「地址路径最后一段」那种猜出来的（插件与解析器都这么兜底），
    * 而地址其实把真名写在查询串上时，用查询串那个（见 util.urlBaseName）。
    * 真的文件名（服务器给的、有后缀的）一律不动。 */
   const fromUrl = urlBaseName(url)
-  if (fromUrl && hasKnownExt(fromUrl) && !hasKnownExt(name)) name = sanitizeName(fromUrl)
+  if (fromUrl && hasKnownExt(fromUrl) && !hasKnownExt(name)) name = sanitizeFileName(fromUrl)
   if (name && hasKnownExt(name)) return name
   const got = await ctOf(url, headers || {})
   /* 留一句给「下下来没有后缀」这类反馈用：一眼能看出这次有没有问出响应类型 */
   boot('name-ext', name || '(空)', 'ct=' + (got.ct || '-'))
   if (got.cdName) {
-    const cd = sanitizeName(got.cdName)
+    const cd = sanitizeFileName(got.cdName)
     /* 服务器自己给的文件名优先，除非它自己也没后缀而我们有类型线索 */
     if (cd && (hasKnownExt(cd) || !contentTypeExt(got.ct))) return cd
   }
-  return sanitizeName(withExt(name, got.ct))
+  return sanitizeFileName(withExt(name, got.ct))
 }
 
 function buildHeaders(obj) {
@@ -676,22 +650,10 @@ async function handable(url, headers) {
   if (isLocalUrl(url)) return { ok: true, status: 0, finalUrl: url }
   const ua = headers['User-Agent'] || settings.load().userAgent || ''
   const h = ua ? { ...headers, 'User-Agent': ua } : headers
-  for (const attempt of [
-    { method: 'HEAD', headers: h },
-    { method: 'GET', headers: { ...h, Range: 'bytes=0-0' } },
-  ]) {
-    try {
-      const r = await req(url, { ...attempt, timeout: 15000, noBody: true })
-      if (r.status >= 200 && r.status < 400) return { ok: true, status: r.status, finalUrl: r.url || url }
-      /* 405 / 501：服务器不认这个方法，换下一个再试 */
-      if (r.status === 405 || r.status === 501) continue
-      return { ok: false, status: r.status, finalUrl: url }
-    } catch {
-      /* 网络层的错留给引擎去重试：它比这里更清楚要不要等一会儿 */
-      return { ok: true, status: 0, finalUrl: url }
-    }
-  }
-  return { ok: true, status: 0, finalUrl: url }
+  const p = await probeUrl(url, { headers: h, timeout: PROBE_TIMEOUT })
+  /* 网络层的错（`err` 有值、status 为 0）留给引擎去重试：它比这里更清楚要不要等一会儿 */
+  if (!p.status && p.err) return { ok: true, status: 0, finalUrl: url }
+  return { ok: p.usable, status: p.status, finalUrl: p.usable ? p.url || url : url }
 }
 
 /**
@@ -732,7 +694,7 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
   const errors = []
   /* 定稿后的名字（与落盘、队列显示的是同一个），给调用方回话用 */
   const names = []
-  const shareTitle = sanitizeName(title || 'PanBox')
+  const shareTitle = sanitizeFileName(title || 'PanBox')
   /* 只有一个文件、且它没有目录归属时，直接落在下载根目录。
    * 否则会出现「下载目录/文件名/文件名」这种多此一举的嵌套——
    * 蓝奏优享这类「分享标题就等于文件名」的网盘必然踩到。 */
@@ -747,7 +709,11 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
      * 定稿之后再算目录、落盘名、队列名，三处都是同一个名字。 */
     f.name = await resolveFileName(f, netdisk, f.headers)
     const subdir = nest
-      ? path.join(cfg.downloadDir, shareTitle, ...(f.dir ? String(f.dir).split(/[\\/]/).filter(Boolean).map(sanitizeName) : []))
+      ? path.join(
+            cfg.downloadDir,
+            shareTitle,
+            ...(f.dir ? String(f.dir).split(/[\\/]/).filter(Boolean).map(sanitizeFileName) : [])
+          )
       : cfg.downloadDir
     try {
       fs.mkdirSync(subdir, { recursive: true })
@@ -765,7 +731,7 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
     const split = isBaidu ? Math.max(1, Number(cfg.baiduConnections) || 1) : perEndpoint ? cfg.split : ARIA2_SPLIT_OVERRIDE[netdisk] || cfg.split
     const options = {
       dir: subdir,
-      out: sanitizeName(f.name),
+      out: sanitizeFileName(f.name),
       continue: 'true',
       split: String(split),
       'max-connection-per-server': String(split),
@@ -830,7 +796,7 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
               url: cands[i].url,
               headers: cands[i].headers,
               dir: subdir,
-              out: sanitizeName(f.name),
+              out: sanitizeFileName(f.name),
               connections: segConns,
               netdisk,
               source,
@@ -967,18 +933,18 @@ async function bridgeAdd(p) {
     }
   }
 
-  let name = sanitizeName(finalName || (p && p.name) || '')
+  let name = sanitizeFileName(finalName || (p && p.name) || '')
   if (!name) {
     try {
       const seg2 = new URL(url).pathname.split('/').filter(Boolean).pop() || ''
-      name = sanitizeName(decodeURIComponent(seg2))
+      name = sanitizeFileName(decodeURIComponent(seg2))
     } catch {
       name = ''
     }
   }
   /* 插件从响应头里读到过类型就先用上（ACM 那类地址最后一段是个编号，没有后缀）。
    * 没读到也不要紧：addResolved 提交前会自己问一次。 */
-  name = sanitizeName(withExt(name, (p && p.mime) || ''))
+  name = sanitizeFileName(withExt(name, (p && p.mime) || ''))
   if (!name) name = 'download.bin'
 
   const session = [
@@ -1686,7 +1652,7 @@ async function readdTask(gid, o, fresh) {
         url: fresh.url,
         headers: fresh.headers || {},
         dir: opts.dir,
-        out: sanitizeName(o.name),
+        out: sanitizeFileName(o.name),
         connections: segConns,
         netdisk: o.netdisk,
         source: o.source,

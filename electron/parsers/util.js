@@ -592,6 +592,65 @@ function urlBaseName(url) {
   }
 }
 
+/* ---- 文件名：从响应头抠出来、洗成各平台都写得出去的名字 ----------------
+ * 这两件事以前在 5 个地方各写一遍（main.js、direct、lanzou、mdpi、ssrn），
+ * 每处的正则、截断长度、非法字符表都不一样 —— 同一台服务器给的同一个名字，
+ * 从哪条路进来可能得到不同的结果（漏掉控制字符、把 `a.ndjson` 当成有后缀、
+ * 遇到 `NUL` 这种设备名直接写不进盘）。收敛到一份，取各处最严的那个。
+ */
+
+/**
+ * `Content-Disposition` → 文件名。认 `filename*=UTF-8''…`（RFC 5987，值是百分号编码）
+ * 与 `filename="…"` 两种写法。参数可以是 `util.req` 回来的 Headers，也可以是普通对象。
+ * 抠不到就返回空串，由调用方兜底。
+ */
+function filenameFromHeaders(headers) {
+  const raw0 =
+    headers && typeof headers.get === 'function' ? headers.get('content-disposition') : (headers || {})['content-disposition']
+  const s = String(raw0 || '')
+  if (!s) return ''
+  const star = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/i.exec(s)
+  const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(s)
+  const raw = String((star ? star[1] : plain ? plain[1] : '') || '')
+    .trim()
+    .replace(/^"|"$/g, '')
+  if (!raw) return ''
+  /* `filename*` 那条按标准一定是编码过的；`filename=` 那条标准上不该编码，实测有站点编，
+   * 所以「看着像编码就试着解，解不开就用原样」—— 不猜，也不因为一个坏 % 丢掉整个名字。 */
+  if (star || /%[0-9a-f]{2}/i.test(raw)) {
+    try {
+      return decodeURIComponent(raw)
+    } catch {
+      return raw
+    }
+  }
+  return raw
+}
+
+/** Windows 保留设备名：这些名字（含带扩展名的形式）不能作为文件名 */
+const WIN_DEVICE_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i
+
+/**
+ * 洗成能落盘的文件名：非法字符与控制字符换成 `_`、连续空白收成一个空格、
+ * 掐掉结尾的点与空格（Windows 会静默截断，导致落盘名和任务名对不上，
+ * 后续「换直链/续传」按名字找不到文件）、避开设备名。空名字给 `unnamed`。
+ *
+ * @param s   原始名字
+ * @param max 长度上限（NTFS 单段 255，默认 180 给路径留余量）
+ */
+function sanitizeFileName(s, { max = 180 } = {}) {
+  let name = String(s || '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+    .replace(/^\.+/, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max)
+  name = name.replace(/[. ]+$/, '')
+  if (!name) return 'unnamed'
+  const base = name.replace(/\.[^.]*$/, '')
+  return WIN_DEVICE_NAMES.test(base) ? `_${name}` : name
+}
+
 function form(data) {
   return Object.entries(data)
     .filter(([, v]) => v !== undefined && v !== null)
@@ -628,4 +687,6 @@ module.exports = {
   hasKnownExt,
   withExt,
   urlBaseName,
+  filenameFromHeaders,
+  sanitizeFileName,
 }

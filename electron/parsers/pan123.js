@@ -102,7 +102,7 @@ function isDirItem(it) {
 async function pickApiHost(shareHost, shareKey) {
   const seen = new Set()
   const candidates = [...API_HOST_CANDIDATES, shareHost.replace(/^www\./, ''), shareHost]
-  const probeUrl = (h) =>
+  const infoUrl = (h) =>
     `https://${h}/b/api/share/info?shareKey=${encodeURIComponent(shareKey)}&` +
     `SharePwd=&ParentFileId=0&Page=1&limit=100&next=1&orderBy=file_name&orderDirection=asc`
 
@@ -111,7 +111,7 @@ async function pickApiHost(shareHost, shareKey) {
     if (!h || seen.has(h)) continue
     seen.add(h)
     try {
-      const r = await req(probeUrl(h), { headers: apiHeaders(h, shareKey), timeout: 15000 })
+      const r = await req(infoUrl(h), { headers: apiHeaders(h, shareKey), timeout: 15000 })
       if (!/json/i.test(r.headers.get('content-type') || '')) continue
       return { host: h, preflight: JSON.parse(r.text) }
     } catch (e) {

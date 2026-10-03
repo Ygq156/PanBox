@@ -1,6 +1,7 @@
 'use strict'
 
-const { req, withExt, urlBaseName } = require('./util')
+const { urlBaseName, withExt, sanitizeFileName } = require('./util')
+const { probeUrl } = require('./probe')
 
 /* 只给「假站点起在本机」的测试用（见 test\verify-name-ext.js）：产品路径永远关闭，
  * 免得远端响应把我们引去打内网（见 util.js 里 assertOutbound 的注释）。 */
@@ -33,25 +34,19 @@ module.exports = {
     let headers = {}
     let ct = ''
     try {
-      const r = await req(url, { method: 'HEAD', timeout: 15000, cookie: ctx.cookie, allowLocal: ALLOW_LOCAL })
-      const cd = r.headers.get('content-disposition') || ''
-      ct = r.headers.get('content-type') || ''
-      let m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
-      if (m) {
-        try {
-          name = decodeURIComponent(m[1])
-        } catch {
-          name = m[1]
-        }
-      }
-      size = Number(r.headers.get('content-length') || 0)
+      /* 只问一次响应头（HEAD，站点不认时 probeUrl 自己换 Range 的 GET）：
+       * 名字、体积、响应类型都在里面。 */
+      const p = await probeUrl(url, { headers: {}, cookie: ctx.cookie, allowLocal: ALLOW_LOCAL })
+      ct = p.ct
+      name = p.name
+      size = p.size
       headers = { Referer: new URL(url).origin + '/' }
     } catch {
-      /* HEAD 不被支持时忽略，交给 aria2 自己猜 */
+      /* 连地址都不合法时忽略，交给 aria2 自己猜 */
     }
 
     if (!name) name = nameFromUrl(url)
-    name = withExt(name, ct)
+    name = sanitizeFileName(withExt(name, ct))
 
     return {
       title: name,

@@ -10,7 +10,18 @@
  *      才能换到真正的 CDN 直链；过早提交只会得到 `url=?SignError`
  */
 
-const { req, form, sleep, decodeEntities, humanSizeToBytes, Jar, UA_PC_CHROME, UA_MOBILE_ANDROID } = require('./util')
+const {
+  req,
+  form,
+  sleep,
+  decodeEntities,
+  humanSizeToBytes,
+  Jar,
+  UA_PC_CHROME,
+  UA_MOBILE_ANDROID,
+  sanitizeFileName,
+} = require('./util')
+const { probeUrl, PROBE_TIMEOUT_LONG } = require('./probe')
 const { withArg1Retry, hasChallenge, extractArg1, acwScV2 } = require('./esa')
 const browserCtx = require('./browserCtx')
 
@@ -202,24 +213,17 @@ async function probeFileMeta(url, ref) {
   const out = { name: '', size: 0 }
   try {
     /* 只要响应头：正文一个字节都不读。这些一次性签名的地址再取一次是白花站点
-     * 的资源，能少一次就少一次。 */
-    const r = await req(url, {
+     * 的资源，能少一次就少一次。**不带 Range**：要靠完整响应的 content-length
+     * 才知道文件多大。 */
+    const r = await probeUrl(url, {
+      method: 'GET',
       headers: cdnHeaders(url, ref),
       redirect: 'manual',
-      timeout: 25000,
+      timeout: PROBE_TIMEOUT_LONG,
       allowLocal: ALLOW_LOCAL,
-      noBody: true,
     })
-    const cd = String(r.headers.get('content-disposition') || '')
-    const m = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/i.exec(cd) || /filename\s*=\s*"?([^";]+)"?/i.exec(cd)
-    if (m) {
-      try {
-        out.name = decodeURIComponent(m[1].trim().replace(/^"|"$/g, '')).slice(0, 200)
-      } catch {
-        out.name = m[1].trim().replace(/^"|"$/g, '').slice(0, 200)
-      }
-    }
-    out.size = Number(r.headers.get('content-length') || 0) || 0
+    out.name = r.name ? sanitizeFileName(r.name) : ''
+    out.size = r.size || 0
   } catch {
     /* 拿不到就算了：名字退回 `/fn` 页算出来的那个 */
   }
@@ -231,7 +235,7 @@ function nameFromUrl(url) {
   try {
     const fn = new URL(url).searchParams.get('fn')
     if (!fn) return ''
-    return decodeURIComponent(fn).replace(/[\\/:*?"<>|]/g, '_').slice(0, 200)
+    return sanitizeFileName(decodeURIComponent(fn))
   } catch {
     return ''
   }
