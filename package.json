@@ -1,7 +1,7 @@
 {
   "name": "panbox",
   "productName": "PanBox",
-  "version": "1.0.2",
+  "version": "1.0.4",
   "private": true,
   "description": "PanBox 网盘快取 —— 多网盘分享链接解析 + aria2 多线程下载桌面客户端",
   "main": "electron/main.js",
@@ -93,6 +93,7 @@
     "@rolldown/binding-win32-x64-msvc": "^1.2.11"
   },
   "dependencies": {
-    "electron-updater": "^6.8.9"
+    "electron-updater": "^6.8.9",
+    "undici": "^7.30.0"
   }
 }

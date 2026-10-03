@@ -14,7 +14,7 @@ const parsers = require('./parsers')
 const login = require('./core/login')
 const bridge = require('./core/bridge')
 const proxy = require('./core/proxy')
-const { detectNetdisk } = require('./parsers/util')
+const { detectNetdisk, setOutboundProxy } = require('./parsers/util')
 const browserCtx = require('./parsers/browserCtx')
 
 /* 安装版可以就地更新：electron-updater 走 NSIS，安装器会静默跑旧卸载器
@@ -642,7 +642,12 @@ async function bridgeAdd(p) {
   if (!/^https?:\/\//i.test(url)) return { ok: false, message: '只接受 http(s) 地址' }
 
   const nd = detectNetdisk(url)
-  if (nd && nd !== 'direct' && nd !== 'unknown') {
+  /* ⚠️ 判据是**站点在不在那张网盘表里**，不是「nd 不等于 direct」。
+   * 之前写成 `nd !== 'direct' && nd !== 'unknown'`，于是每加一个「不是网盘、
+   * 但有专门解析器」的站点（mdpi / ssrn 这类论文站）都会被当成分享链接，
+   * 插件交过来的下载地址会被塞进「请用户勾选」那条路 —— 对一个单文件直链
+   * 来说那是死路。 */
+  if (parsers.SHARE_NETDISKS.has(nd)) {
     if (win && !win.isDestroyed()) {
       if (win.isMinimized()) win.restore()
       win.show()
@@ -658,7 +663,40 @@ async function bridgeAdd(p) {
   if (p && p.userAgent) headers['User-Agent'] = p.userAgent
   if (p && p.cookie) headers.Cookie = p.cookie
 
-  let name = sanitizeName((p && p.name) || '')
+  /**
+   * 站点自己的「下载按钮」地址往往**不是**文件地址：MDPI 的按钮在 www.mdpi.com 上，
+   * 后面站着 Akamai —— 引擎拿着它直连只会吃 403；真正的文件在 mdpi-res.com 的 CDN 上。
+   * 论文站这类「有专门解析器、但网址本身不是文件」的站点，先让解析器把真地址换出来，
+   * 再交给引擎。换不出来（站点改版、挑战过不去）就退回原地址，行为与以前一致。
+   */
+  let finalUrl = url
+  let finalName = ''
+  let finalSize = 0
+  let viaParser = ''
+  if (nd !== 'direct' && parsers.PARSERS[nd]) {
+    let sid = ''
+    try {
+      const one = (await parsers.parseShare({ text: url, settings: cfg })).results[0]
+      sid = one && one.sessionId ? one.sessionId : ''
+      if (one && one.ok && one.files && one.files.length) {
+        const got = await parsers.resolveFiles({ sessionId: one.sessionId, ids: [one.files[0].id] })
+        if (got.length && got[0].url) {
+          finalUrl = got[0].url
+          finalName = got[0].name || one.files[0].name || ''
+          finalSize = Number(got[0].size || one.files[0].size || 0)
+          viaParser = nd
+          for (const [k, v] of Object.entries(got[0].headers || {})) if (v && !headers[k]) headers[k] = v
+        }
+      }
+    } catch (e) {
+      boot('bridge-add-parse', nd, (e && e.message) || String(e))
+    } finally {
+      /* 会话只是这条路上的一次性缓存，用完就丢（不留着等 gc） */
+      if (sid) parsers.dropSession(sid)
+    }
+  }
+
+  let name = sanitizeName(finalName || (p && p.name) || '')
   if (!name) {
     try {
       const seg2 = new URL(url).pathname.split('/').filter(Boolean).pop() || ''
@@ -669,10 +707,10 @@ async function bridgeAdd(p) {
   }
   if (!name) name = 'download.bin'
 
-  const session = [{ id: '0', name, size: Number((p && p.size) || 0), isDir: false, dir: '', url, headers }]
+  const session = [{ id: '0', name, size: finalSize || Number((p && p.size) || 0), isDir: false, dir: '', url: finalUrl, headers }]
   const r = await addResolved(cfg, {
     session,
-    netdisk: 'direct',
+    netdisk: viaParser || 'direct',
     source: (p && p.referer) || '',
     title: (p && p.pageTitle) || name,
   })
@@ -704,7 +742,7 @@ async function bridgePage(p) {
   boot('bridge-page', 'hosts=' + n, 'url=' + url.slice(0, 80))
 
   const nd = detectNetdisk(url)
-  const isShare = !!(nd && nd !== 'direct' && nd !== 'unknown')
+  const isShare = parsers.SHARE_NETDISKS.has(nd)
   if (win && !win.isDestroyed()) {
     if (win.isMinimized()) win.restore()
     win.show()
@@ -1729,6 +1767,10 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     boot('whenReady, resourcesPath=' + process.resourcesPath, 'indexHtml=' + indexHtml(), 'exists=' + fs.existsSync(indexHtml()), 'aria2=' + aria2ExePath(), 'aria2Exists=' + fs.existsSync(aria2ExePath()))
+    /* 解析请求跟随系统代理：Node 自带的 fetch 不读 Windows 代理设置，直连状态下
+     * 有些站点（本机实测 papers.ssrn.com）连挑战页都拿不到，只会超时。 */
+    const px = setOutboundProxy(proxy.effective(settings.load()))
+    boot('outbound-proxy', px.proxy || '(直连)', px.ok ? 'ok' : '失败：' + (px.message || ''))
     registerIpc()
     initAutoUpdater()
     /* 回收站索引跟着用户数据走，回收目录放在下载目录里（用户能在资源管理器里直接看到） */

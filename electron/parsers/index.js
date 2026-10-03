@@ -12,6 +12,8 @@ const pan123 = require('./pan123')
 const baidu = require('./baidu')
 const xunlei = require('./xunlei')
 const custom = require('./custom')
+const mdpi = require('./mdpi')
+const ssrn = require('./ssrn')
 
 const PARSERS = {
   direct,
@@ -22,9 +24,17 @@ const PARSERS = {
   '123pan': pan123,
   baidu,
   xunlei,
+  /** 论文站：地址里只有文章页，PDF 要另外换算出一条地址来（见各自文件顶部注释） */
+  mdpi,
+  ssrn,
   /** 用户自备的「网盘解析站」适配层（见 custom.js 顶部注释） */
   custom,
 }
+
+/** 真的是「网盘分享链接」的那些站点：只能叫窗口出来让用户勾选，不能当直链下。
+ *  mdpi / ssrn 这类**论文站**不在此列 —— 它们虽然是专门解析器，但一条地址就是
+ *  一个文件，走「加入下载队列」那条路（BRIDGE_DIRECT 用的就是下面这个集合）。 */
+const SHARE_NETDISKS = new Set(['lanzou', 'ilanzou', 'quark', 'uc', '123pan', 'baidu', 'xunlei', 'aliyun', 'tianyi', 'yidong', 'pan115', 'weiyun', 'custom'])
 
 /** 会话缓存：解析出来的目录树和「取直链」闭包留在主进程，渲染层只拿到可序列化的部分 */
 const sessions = new Map()
@@ -298,4 +308,4 @@ async function cleanupDownloaded(sessionId) {
   }
 }
 
-module.exports = { parseShare, resolveFiles, dropSession, cleanupDownloaded, PARSERS, indexResolved, _maps: { sessions, recycler } }
+module.exports = { parseShare, resolveFiles, dropSession, cleanupDownloaded, pickParser, PARSERS, SHARE_NETDISKS, indexResolved, _maps: { sessions, recycler } }

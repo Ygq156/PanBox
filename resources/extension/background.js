@@ -566,6 +566,12 @@ const OCTET_RE = /^application\/octet-stream/i
  * 这是**最可靠**的一条线索：蓝奏的下载域（exe2.webgetstore.com 这类 CDN）
  * 地址里既没有 .exe 也没有 video/，只有这个头能认出来。 */
 const ATTACH_RE = /^\s*attachment\b/i
+/* PDF 单独认一条。它**不是媒体**，别混进 MEDIA_CT_RE（那个会参与 kindOfUrl 的
+ * 类型判断）；但它是「用户真想存下来的文件」，最典型的就是论文站：
+ * MDPI / SSRN 的下载按钮换出来的末尾响应有两种形态 ——
+ *   `Content-Disposition: attachment`（能走上面那条）或者干脆**内联**打开。
+ * 内联那种以前一条都记不下来，面板就永远是「扫描完成：0 个」。 */
+const PDF_CT_RE = /^application\/(pdf|x-pdf)/i
 
 const MEDIA_TTL = 3 * 60 * 1000 /* 换视频后旧地址会失效；3 分钟足够，也顺便自动淘汰上一个视频 */
 const MEDIA_MAX = 240
@@ -765,6 +771,13 @@ chrome.webRequest.onHeadersReceived.addListener(
       /* 服务器明说要下载：不管什么类型都记下来 —— 这是「插件抓到真实下载
        * 链接」的主力，蓝奏/123 这类 CDN 地址里没有任何后缀可认。 */
       rememberMedia(d.tabId, d.url, ct, len, nameFromDisposition(cd), true)
+      return
+    }
+    /* PDF：地址以 .pdf 结尾，或者响应类型是 application/pdf。
+     * 和 attachment 同等对待（照记 Referer 与 UA，让 PanBox 之后能原样重放），
+     * 否则 worker 一被回收，用户点过的那个 PDF 就从面板上消失了。 */
+    if (PDF_CT_RE.test(ct) || /\.pdf(?:$|[?#])/i.test(d.url)) {
+      rememberMedia(d.tabId, d.url, ct || 'application/pdf', len, nameFromDisposition(cd), true)
       return
     }
     const media =
