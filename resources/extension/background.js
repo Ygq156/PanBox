@@ -1,5 +1,11 @@
 'use strict'
 
+/* 「响应类型 → 后缀」这套规矩只有一份：rules.js。
+ * 它与主进程 electron/parsers/util.js 由 test/verify-ext-rules.js 逐条比着，
+ * 这边不要再抄一份 —— 以前抄漏了 x-zip / vnd.rar，同一个地址浏览器给 .pdf、
+ * 插件面板上却写 .bin。 */
+importScripts('rules.js')
+
 /**
  * PanBox 下载助手 —— 后台脚本（MV3 service worker）。
  *
@@ -335,7 +341,7 @@ async function handOver(items, info) {
   let okCount = 0
   let last = null
   for (const it of items) {
-    const name = withExt(it.name || baseName(it.url) || 'download.bin', it.ct)
+    const name = PanBoxRules.withExt(it.name || baseName(it.url) || 'download.bin', it.ct)
     const page = it.referer || referer
     last = await send({
       url: it.url,
@@ -637,104 +643,6 @@ function nameFromDisposition(cd) {
   return m ? m[1].trim().slice(0, 200) : ''
 }
 
-/* 名字缺后缀时，按响应类型补一个 —— 和浏览器、和 PanBox 主进程同一套规矩。
- * ACM 那种 `…/doi/epdf/10.1145/3345768.3355908` 地址最后一段是个编号，
- * 浏览器存下来会叫 `3345768.3355908.pdf`，插件也得给出同一个名字。 */
-const MIME_EXT = {
-  pdf: 'pdf',
-  zip: 'zip',
-  'x-7z-compressed': '7z',
-  'x-rar-compressed': 'rar',
-  'vnd.rar': 'rar',
-  'x-tar': 'tar',
-  gzip: 'gz',
-  'x-gzip': 'gz',
-  'x-bzip2': 'bz2',
-  'x-xz': 'xz',
-  'x-msdownload': 'exe',
-  'x-msdos-program': 'exe',
-  'x-msi': 'msi',
-  'java-archive': 'jar',
-  'vnd.android.package-archive': 'apk',
-  'x-apple-diskimage': 'dmg',
-  'epub+zip': 'epub',
-  msword: 'doc',
-  'vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
-  'vnd.ms-excel': 'xls',
-  'vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
-  'vnd.ms-powerpoint': 'ppt',
-  'vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
-  rtf: 'rtf',
-  'x-mobipocket-ebook': 'mobi',
-  'x-flac': 'flac',
-  'x-iso9660-image': 'iso',
-  'octet-stream': 'bin',
-  'x-binary': 'bin',
-}
-
-const KNOWN_EXTS = new Set(
-  (
-    'pdf zip rar 7z tar gz bz2 xz zst exe msi apk ipa dmg iso jar deb rpm appimage ' +
-    'doc docx xls xlsx ppt pptx rtf odt ods epub mobi azw azw3 txt md csv json xml html htm ' +
-    'png jpg jpeg gif bmp webp svg ico tif tiff heic avif ' +
-    'mp3 wav flac aac ogg opus m4a wma ape ' +
-    'mp4 mkv avi mov wmv flv webm m4v mpg mpeg ts m3u8 m4s rmvb ' +
-    'bin dat img cue nrg vhd vmdk pak cab txz tbz lz4 br'
-  ).split(' ')
-)
-
-/* 网页/接口类型不给后缀：它们不是文件（和主进程 util.js 同一张表） */
-const WEB_TYPES = new Set([
-  'text/html',
-  'application/xhtml+xml',
-  'text/plain',
-  'text/css',
-  'text/javascript',
-  'application/javascript',
-  'application/json',
-  'text/json',
-  'application/xml',
-  'text/xml',
-])
-
-/* 表里认得的后缀当然是；表外的只要不像编号也算（免得 `a.ndjson` 被叠成 `a.ndjson.pdf`）。
- * 纯数字那段不算后缀 —— `3345768.3355908` 的最后一段是编号，这正是它要补 .pdf 的原因。 */
-function hasKnownExt(name) {
-  const m = /\.([A-Za-z0-9]{1,8})$/.exec(String(name || ''))
-  if (!m) return false
-  const ext = m[1].toLowerCase()
-  if (KNOWN_EXTS.has(ext)) return true
-  return !/^\d+$/.test(ext)
-}
-
-/** `application/pdf; charset=utf-8` → `pdf`；网页/文本类型返回空（它们不是文件） */
-function extForCt(ct) {
-  const s = String(ct || '')
-    .split(';')[0]
-    .trim()
-    .toLowerCase()
-  if (!s || WEB_TYPES.has(s)) return ''
-  const m = /^([a-z0-9.-]+)\/(.+)$/.exec(s)
-  if (!m) return ''
-  const major = m[1]
-  let sub = m[2]
-  if (major === 'application') {
-    const hit = MIME_EXT[sub]
-    if (hit) return hit
-    sub = sub.replace(/\+.*$/, '')
-    if (sub.startsWith('x-')) sub = sub.slice(2)
-    return /^[a-z0-9]{1,8}$/.test(sub) ? sub : 'bin'
-  }
-  return sub.replace(/\+.*$/, '').replace(/^x-/, '')
-}
-
-function withExt(name, ct) {
-  const s = String(name || '').trim()
-  if (!s || hasKnownExt(s)) return s
-  const ext = extForCt(ct)
-  return ext ? `${s}.${ext}` : s
-}
-
 function kindOfUrl(url, ct) {
   const c = String(ct || '')
   if (/\.(m3u8|mpd)(?:$|[?#])/i.test(url)) return 'stream'
@@ -994,7 +902,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
     url: item.url,
     /* item.filename 是浏览器自己按响应类型定的名字（`…/3355908` → `3355908.pdf`），
      * 它没给后缀时再按 mime 补一次，保证交出去的名字和后缀对得上。 */
-    name: withExt(fromPath || baseName(item.url) || 'download.bin', item.mime || ''),
+    name: PanBoxRules.withExt(fromPath || baseName(item.url) || 'download.bin', item.mime || ''),
     referer: item.referrer || hint.referer || '',
     pageTitle: '',
     cookie: await cookieFor(item.url, hint),

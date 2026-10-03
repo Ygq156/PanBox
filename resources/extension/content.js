@@ -20,6 +20,9 @@
  *   5. **位置随用户**（v1.1.2）：收起态的按钮和展开后的标题栏都能按住拖动，位置存进
  *      chrome.storage.local.panelPos，换页 / 刷新 / 重开浏览器都还在。以前 .wrap 自己是
  *      position:fixed，改 host 的 left/top 根本挪不动它 —— 看着能拖其实钉死在左上角。
+ *
+ * 依赖：rules.js 由 manifest 排在本文件之前注入（同一个隔离世界，直接读 PanBoxRules）。
+ * 「响应类型 → 后缀」那套判定不许在本文件里再抄一份 —— 见 rules.js 的文件头。
  */
 
 ;(function () {
@@ -147,23 +150,12 @@
     }
     if (/mpegurl/i.test(c)) return 'm3u8'
     if (/dash\+xml/i.test(c)) return 'mpd'
-    /* PDF 这类「文档」以前落到最后的 'bin'，面板上就叫成 `3345768.bin` —— 名字对不上
-     * 真实文件（ACM 的 `…/epdf/10.1145/3345768.3355908` 就是这种地址）。 */
-    if (/^application\/(pdf|x-pdf)/i.test(c)) return 'pdf'
-    if (/^application\/(zip|x-zip-compressed|x-7z-compressed|x-rar-compressed)/i.test(c)) {
-      return /7z/.test(c) ? '7z' : /rar/.test(c) ? 'rar' : 'zip'
-    }
-    if (/^application\/(x-msdownload|x-msdos-program)/i.test(c)) return 'exe'
-    if (/^application\/(x-tar|gzip|x-gzip)/i.test(c)) return /tar/.test(c) ? 'tar' : 'gz'
-    if (/^application\/(vnd\.android\.package-archive)/i.test(c)) return 'apk'
-    if (/^application\/(epub\+zip)/i.test(c)) return 'epub'
-    if (/^application\/(msword)/i.test(c)) return 'doc'
-    if (/^application\/(vnd\.openxmlformats-officedocument\.wordprocessingml\.document)/i.test(c)) return 'docx'
-    if (/^application\/(vnd\.ms-excel)/i.test(c)) return 'xls'
-    if (/^application\/(vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet)/i.test(c)) return 'xlsx'
-    if (/^application\/(vnd\.ms-powerpoint)/i.test(c)) return 'ppt'
-    if (/^application\/(vnd\.openxmlformats-officedocument\.presentationml\.presentation)/i.test(c)) return 'pptx'
-    if (/^application\/(x-iso9660-image)/i.test(c)) return 'iso'
+    /* 其余类型的判定全问共享表（rules.js，与主进程 util.js 逐条对齐）。
+     * 以前这里手抄了半张表，抄漏了 `vnd.rar`、`java-archive` 这些，
+     * 于是面板上把 tar、jar 之类一律写成 `xxx.bin` —— ACM 那条
+     * `…/epdf/10.1145/3345768.3355908` 被叫成 `3345768.bin` 也是这么来的。 */
+    const shared = PanBoxRules.contentTypeExt(c)
+    if (shared) return shared
     /* 下载入口（蓝奏那类藏在 `/fn?TOKEN` 页里的分享入口）**不是文件**：
      * 名字要等 PanBox 打开分享页才知道，这里硬猜一个后缀只会让面板显示
      * 「fn.bin」这种假名字，所以宁可留空。 */
