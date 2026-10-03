@@ -1,6 +1,7 @@
 'use strict'
 
 const { req, reqJson, UA_PC_CHROME, UA_QUARK } = require('./util')
+const { probeUrl } = require('./probe')
 
 /**
  * 夸克 / UC 网盘：同一套 clouddrive 接口的两个站点。
@@ -508,38 +509,11 @@ function makeParser(key) {
     return h
   }
 
-  /** 只读响应头就断开，绝不把文件体吸进内存 */
-  function peek(url, headers, timeout = 20000) {
-    return new Promise((resolve) => {
-      let u
-      try {
-        u = new URL(url)
-      } catch {
-        return resolve({ status: 0 })
-      }
-      const mod = u.protocol === 'http:' ? require('node:http') : require('node:https')
-      const r = mod.request(
-        {
-          method: 'GET',
-          hostname: u.hostname,
-          port: u.port || (u.protocol === 'http:' ? 80 : 443),
-          path: u.pathname + u.search,
-          headers: { ...headers, Range: 'bytes=0-1' },
-          timeout,
-        },
-        (res) => {
-          const st = res.statusCode
-          res.destroy()
-          resolve({ status: st })
-        },
-      )
-      r.on('timeout', () => {
-        r.destroy()
-        resolve({ status: 0 })
-      })
-      r.on('error', () => resolve({ status: 0 }))
-      r.end()
-    })
+  /** 只读响应头就断开，绝不把文件体吸进内存。
+   *  走 util.req（= 走代理、过「别打内网」那道闸）：以前这里直接开 node:http，
+   *  用户开了代理时这条探测是**绕过代理**发出去的，结论自然是错的。 */
+  function peek(url, headers) {
+    return probeUrl(url, { method: 'GET', range: true, headers })
   }
 
   /**
