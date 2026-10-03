@@ -268,11 +268,23 @@
 }
 .pill .x:hover { color: #ff5b5b; background: rgba(255,91,91,.12); }
 .card {
-  margin-top: 6px; width: 360px; max-height: 62vh; display: flex; flex-direction: column;
+  position: relative;
+  margin-top: 6px; width: 360px; height: 330px;
+  display: flex; flex-direction: column;
   background: #171a21; border: 1px solid #3a4560; border-radius: 10px;
   box-shadow: 0 10px 30px rgba(0,0,0,.55); overflow: hidden;
 }
 .card[hidden] { display: none; }
+/* 右下角拉大小（自己画，不用浏览器那个 resize 角 —— 它的样子改不了，
+   和面板配色对不上）。按住它调宽高，松手记住。 */
+.grip {
+  position: absolute; right: 0; bottom: 0; width: 16px; height: 16px;
+  cursor: nwse-resize; z-index: 2; touch-action: none;
+  background: linear-gradient(135deg, transparent 46%, #46506a 46%, #46506a 58%, transparent 58%,
+    transparent 68%, #46506a 68%, #46506a 80%, transparent 80%);
+}
+.grip:hover { filter: brightness(1.35); }
+.grip:focus-visible { outline: 1px solid #4c8dff; outline-offset: -2px; }
 .head {
   display: flex; align-items: center; gap: 6px; padding: 7px 9px;
   background: #1d222c; border-bottom: 1px solid #262b36; cursor: move;
@@ -350,6 +362,7 @@
       '</div>' +
       '<div class="note" hidden></div>' +
       '<div class="list"></div>' +
+      '<div class="grip" role="separator" tabindex="0" title="按住拖动可调整面板大小"></div>' +
       '<div class="foot"><span class="msg">点条目右边的「下载」即可转到 PanBox</span></div>' +
       '</div>'
     root.appendChild(wrap)
@@ -365,6 +378,7 @@
       card: el('.card'),
       cnt: el('.cnt'),
       list: el('.list'),
+      grip: el('.grip'),
       note: el('.note'),
       msg: el('.msg'),
       sendAll: el('.sendAll'),
@@ -460,6 +474,9 @@
       /* 标题栏与那个收起状态的小按钮都能拖 —— 用户点名说「按钮没办法挪动」 */
       ui.head.addEventListener('pointerdown', startDrag)
       ui.pill.addEventListener('pointerdown', startDrag)
+      /* 右下角那个把手只管「拉大小」，别让它顺手把面板也拖走 */
+      ui.grip.addEventListener('pointerdown', startResize)
+      ui.grip.addEventListener('keydown', onGripKey)
       window.addEventListener('resize', keepInView)
       ui.list.addEventListener('click', (e) => {
         const btn = e.target.closest('button[data-url]')
@@ -489,9 +506,19 @@
       const maxY = Math.max(0, window.innerHeight - h)
       return [Math.min(Math.max(0, x), maxX), Math.min(Math.max(0, y), maxY)]
     }
-    /* 窗口变小 / 换显示器后，别把面板留在屏幕外 */
+    /* 窗口变小 / 换显示器后，别把面板留在屏幕外，也别让拉过的面板比窗口还大 */
     function keepInView() {
       if (!ui || !ui.host.isConnected) return
+      if (!ui.card.hidden) {
+        const w = parseFloat(ui.card.style.width)
+        const h = parseFloat(ui.card.style.height)
+        /* 记下来的尺寸可能是在大屏上拉的，换到小窗口就得收回来 */
+        if (w || h) {
+          const [cw, ch] = clampCardSize(w || ui.card.getBoundingClientRect().width, h || ui.card.getBoundingClientRect().height)
+          ui.card.style.width = cw + 'px'
+          ui.card.style.height = ch + 'px'
+        }
+      }
       const r = ui.host.getBoundingClientRect()
       const [x, y] = clampPos(r.left, r.top, Math.min(r.width, window.innerWidth), Math.min(r.height, window.innerHeight))
       setHostPos(x, y)
@@ -550,11 +577,105 @@
       }
     }
 
+    /* ---- 大小：右下角把手拖宽高，松手记进 storage ----
+     * 面板宽度以前是写死的 360px，稍长一点的文件名就被截成「…」，用户看不到自己
+     * 要下的是哪个（提过这个意见）。现在按自己的需要拉，尺寸跟着用户走。 */
+    const CARD_MIN = { w: 260, h: 140 }
+    let resize = null
+
+    function clampCardSize(w, h) {
+      return [
+        Math.min(Math.max(CARD_MIN.w, Math.round(w)), Math.max(CARD_MIN.w, window.innerWidth - 24)),
+        Math.min(Math.max(CARD_MIN.h, Math.round(h)), Math.max(CARD_MIN.h, window.innerHeight - 60)),
+      ]
+    }
+    function applyCardSize(w, h) {
+      const [cw, ch] = clampCardSize(w, h)
+      ui.card.style.width = cw + 'px'
+      ui.card.style.height = ch + 'px'
+    }
+    function startResize(e) {
+      if (e.button !== 0) return
+      e.preventDefault()
+      e.stopPropagation()
+      const r = ui.card.getBoundingClientRect()
+      resize = { sx: e.clientX, sy: e.clientY, sw: r.width, sh: r.height }
+      try {
+        e.target.setPointerCapture(e.pointerId)
+      } catch {
+        /* 拿不到捕获也不要紧，下面还挂了 window 监听 */
+      }
+      window.addEventListener('pointermove', onResize, true)
+      window.addEventListener('pointerup', endResize, true)
+      window.addEventListener('pointercancel', endResize, true)
+    }
+    function onResize(e) {
+      if (!resize) return
+      e.preventDefault()
+      applyCardSize(resize.sw + (e.clientX - resize.sx), resize.sh + (e.clientY - resize.sy))
+    }
+    function endResize() {
+      window.removeEventListener('pointermove', onResize, true)
+      window.removeEventListener('pointerup', endResize, true)
+      window.removeEventListener('pointercancel', endResize, true)
+      if (!resize) return
+      resize = null
+      keepInView()
+      const w = ui.card.style.width
+      const h = ui.card.style.height
+      if (w && h) {
+        try {
+          chrome.storage.local.set({ panelSize: { w, h } })
+        } catch {
+          /* ignore */
+        }
+      }
+      /* 拉完浏览器也会补一个 click，别让它把面板收起来 */
+      suppressClickUntil = Date.now() + 300
+    }
+    /* 键盘也能调：把手拿到焦点后方向键微调，按住 Shift 步子大一点。
+       把手是这面板上唯一能改大小的地方，只用鼠标的话够不着键盘用户。 */
+    function onGripKey(e) {
+      const step = e.shiftKey ? 40 : 10
+      const r = ui.card.getBoundingClientRect()
+      const map = {
+        ArrowRight: [r.width + step, r.height],
+        ArrowLeft: [r.width - step, r.height],
+        ArrowDown: [r.width, r.height + step],
+        ArrowUp: [r.width, r.height - step],
+      }
+      const d = map[e.key]
+      if (!d) return
+      e.preventDefault()
+      applyCardSize(d[0], d[1])
+      keepInView()
+      const w = ui.card.style.width
+      const h = ui.card.style.height
+      if (w && h) {
+        try {
+          chrome.storage.local.set({ panelSize: { w, h } })
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
     /* ---- 渲染 ---- */
+    /* 列表只在「内容真的变了」时才重建。以前每次刷新都把整段 innerHTML 重写一遍，
+     * 于是每 2 秒闪一下：正在看列表的人会被打断，滚动位置也会跳回顶部。 */
+    let listSig = ''
     function render() {
       ensure()
       ui.pillN.textContent = String(items.length)
       ui.cnt.textContent = items.length ? `这一页发现 ${items.length} 个` : ''
+      const sig =
+        items.length +
+        '|' +
+        blobCount +
+        '|' +
+        items.map((x) => x.url + '|' + x.kind + '|' + x.name + '|' + x.size).join('~')
+      if (sig === listSig) return
+      listSig = sig
       if (!items.length) {
         ui.list.innerHTML = '<div class="empty">这一页暂时没发现能下的东西</div>'
         ui.note.hidden = true
@@ -703,9 +824,14 @@
     }
 
     /* ---- 启动 ---- */
-    storageGet({ panel: true, panelPos: null }).then((got) => {
+    storageGet({ panel: true, panelPos: null, panelSize: null }).then((got) => {
       globalOff = got.panel === false
       ensure()
+      if (got.panelSize) {
+        const w = parseFloat(got.panelSize.w)
+        const h = parseFloat(got.panelSize.h)
+        if (w > 0 && h > 0) applyCardSize(w, h)
+      }
       if (got.panelPos && got.panelPos.left) {
         const px = parseFloat(got.panelPos.left)
         const py = parseFloat(got.panelPos.top)
@@ -741,15 +867,20 @@
       /* ignore */
     }
 
-    /* 常驻轮询：不管面板开着还是收起，每 2 秒都对一次网络媒体列表 + 看看地址有没有变。
-     * v1.1.0 只在面板展开时每 5 秒刷一次，于是「网页换了内容面板却不刷新」。 */
-    setInterval(() => {
-      if (location.href !== lastHref) {
-        lastHref = location.href
-        onNavigateSoon()
-        return
-      }
-      refresh(false, { dom: false })
-    }, 2000)
+    /* 常驻轮询：不管面板开着还是收起，都对一次网络媒体列表 + 看看地址有没有变。
+     * v1.1.0 只在面板展开时每 5 秒刷一次，于是「网页换了内容面板却不刷新」。
+     * 面板没展开时没人盯着看，就不必那么勤 —— 4 秒一次足够，也少一点页面里
+     * 的定时开销（列表内容没变时 render 不会再动 DOM）。 */
+    setInterval(
+      () => {
+        if (location.href !== lastHref) {
+          lastHref = location.href
+          onNavigateSoon()
+          return
+        }
+        refresh(false, { dom: false })
+      },
+      open ? 2000 : 4000,
+    )
   }
 })()

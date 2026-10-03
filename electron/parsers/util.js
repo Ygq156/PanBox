@@ -12,6 +12,44 @@ const DEFAULT_UA =
 /** 解析（或重定向到）本机/局域网地址的拦截。 */
 const MAX_RESP_SIZE = Number(process.env.PANBOX_MAX_RESP || 8 * 1024 * 1024) || 8 * 1024 * 1024
 
+/* ------------------------------------------------------------------ */
+/* 出站走不走系统代理                                                  */
+/* ------------------------------------------------------------------ */
+
+/* Node 自带的 fetch（undici）**不读 Windows 系统代理** —— 系统开着代理时，
+ * 解析请求仍然是本机直连。实测后果（2026-10，同一台机器、同一时刻）：
+ *   papers.ssrn.com / download.ssrn.com  直连 → UND_ERR_CONNECT_TIMEOUT
+ *                                        走代理 → 能连上（403 = 站点的挑战，不是网络问题）
+ * 也就是说直连状态下这两个域连「站点的反爬页」都拿不到，用户看到的是「请求超时」。
+ * 所以跟随系统代理这件事必须显式装上，不能指望运行时自动。 */
+let proxyInstalled = ''
+
+/**
+ * 让 util.req 的出站跟随系统代理。由 electron/main.js 在启动时喂一次
+ * （代理配置属于 settings/main 那一层，parsers 不该自己去读设置）。
+ * @param {string} uri 形如 `http://127.0.0.1:7897`；空字符串 = 直连
+ */
+function setOutboundProxy(uri) {
+  const want = String(uri || '').trim()
+  if (want === proxyInstalled) return { ok: true, changed: false, proxy: want }
+  proxyInstalled = want
+  if (!want) return { ok: true, changed: true, proxy: '' }
+  try {
+    /* 延迟 require：只有真的要装代理时才碰 undici。
+     * noProxy 必须带上本机 —— 否则假站点测试与 bridge（127.0.0.1:7799）也会被塞进代理。 */
+    const { ProxyAgent, setGlobalDispatcher } = require('undici')
+    setGlobalDispatcher(new ProxyAgent({ uri: want, noProxy: 'localhost,127.0.0.1,::1' }))
+    return { ok: true, changed: true, proxy: want }
+  } catch (e) {
+    return { ok: false, changed: true, proxy: '', message: (e && e.message) || String(e) }
+  }
+}
+
+/** 现在装的是哪个代理（空 = 直连）。给测试与诊断用。 */
+function outboundProxy() {
+  return proxyInstalled
+}
+
 /** 日志/错误里出现的 URL 去掉 query —— 分享链接的 ?pwd= 与直链签名都在 query 里 */
 function safeUrl(u) {
   try {
@@ -317,6 +355,12 @@ const MATCHERS = [
   { netdisk: 'pan115', re: /(115\.com|115cdn\.com|anxia\.com)/i },
   { netdisk: 'weiyun', re: /(share\.weiyun\.com|weiyun\.com)/i },
   { netdisk: '123pan', re: /(123pan\.com|123pan\.cn|123panpay\.com|123684\.com|123865\.com|123912\.com|123592\.com)/i },
+  /* 论文站：不是网盘，但同样「一条页面地址要换算成一条文件地址」，
+   * 靠 MATCHERS 认出来才能派给各自的解析器（见 mdpi.js / ssrn.js 顶部注释）。
+   * 域名的边界要卡住：`mdpi.com` 后面只能是 `/ ? #` 或结尾，否则
+   * `notmdpi.com` / `mdpi.com.evil.com` 这种也会被认成它（这是**真的**踩过的坑）。 */
+  { netdisk: 'mdpi', re: /(^|\.)mdpi\.com(?=[/:?#]|$)/i },
+  { netdisk: 'ssrn', re: /(^|\.)ssrn\.com(?=[/:?#]|$)/i },
 ]
 
 function detectNetdisk(url) {
@@ -418,6 +462,8 @@ module.exports = {
   Jar,
   req,
   reqJson,
+  setOutboundProxy,
+  outboundProxy,
   readTextCapped,
   MAX_RESP_SIZE,
   isBinaryBody,
