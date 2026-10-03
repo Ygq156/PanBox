@@ -86,6 +86,18 @@ function apiHeaders(host, shareKey) {
   }
 }
 
+/* 这几条请求就是分享页自己发的 XHR，所以带上浏览器现场（真 UA、浏览器的 Referer、
+ * 该主机自己的 cookie）——风控认的是「这一套」，光有 UA 常量不算。
+ * 这里能安全地开 browser 是因为 apiHeaders 里**没有** sec-ch-ua / Sec-Fetch-* 那组指纹头：
+ * 单换 UA 不会造成「UA 是浏览器而 sec-ch-ua 还写着旧版本」的自相矛盾。
+ * cookie 参数是用户在设置里贴的 123 云盘凭证（以前传进来却被丢掉，等于没配）；
+ * 没有配置时它是空串，请求照旧不带 Cookie。 */
+const shareReqOpts = (host, shareKey, cookie) => ({
+  headers: apiHeaders(host, shareKey),
+  cookie,
+  browser: true,
+})
+
 function okOf(j) {
   return !!j && Number(j.code) === 0
 }
@@ -99,7 +111,7 @@ function isDirItem(it) {
 }
 
 /** 轮询候选 API 域名，返回第一个吐出 JSON 的 */
-async function pickApiHost(shareHost, shareKey) {
+async function pickApiHost(shareHost, shareKey, cookie) {
   const seen = new Set()
   const candidates = [...API_HOST_CANDIDATES, shareHost.replace(/^www\./, ''), shareHost]
   const infoUrl = (h) =>
@@ -111,7 +123,7 @@ async function pickApiHost(shareHost, shareKey) {
     if (!h || seen.has(h)) continue
     seen.add(h)
     try {
-      const r = await req(infoUrl(h), { headers: apiHeaders(h, shareKey), timeout: 15000 })
+      const r = await req(infoUrl(h), { ...shareReqOpts(h, shareKey, cookie), timeout: 15000 })
       if (!/json/i.test(r.headers.get('content-type') || '')) continue
       return { host: h, preflight: JSON.parse(r.text) }
     } catch (e) {
@@ -126,7 +138,7 @@ async function shareInfo(host, shareKey, pwd, cookie) {
     `https://${host}/b/api/share/info?shareKey=${encodeURIComponent(shareKey)}` +
     `&SharePwd=${encodeURIComponent(pwd || '')}&ParentFileId=0&Page=1&limit=100&next=1` +
     `&orderBy=file_name&orderDirection=asc`
-  const r = await reqJson(url, { headers: apiHeaders(host, shareKey) })
+  const r = await reqJson(url, shareReqOpts(host, shareKey, cookie))
   return r.json || {}
 }
 
@@ -136,7 +148,7 @@ async function listDir(host, shareKey, pwd, parentId, cookie) {
     `${base}?limit=100&next=1&orderBy=file_name&orderDirection=asc` +
     `&shareKey=${encodeURIComponent(shareKey)}&SharePwd=${encodeURIComponent(pwd || '')}` +
     `&ParentFileId=${encodeURIComponent(parentId || '0')}&Page=1&event=homeListFile&operateType=1`
-  const r = await reqJson(url, { headers: apiHeaders(host, shareKey) })
+  const r = await reqJson(url, shareReqOpts(host, shareKey, cookie))
   const j = r.json || {}
   if (!okOf(j)) {
     const e = new Error(`123云盘列表失败：${msgOf(j) || `code ${j.code}`}`)
@@ -176,6 +188,7 @@ async function walk(host, shareKey, pwd, cookie) {
 async function getDownloadUrl(host, shareKey, entry, cookie) {
   const url = `https://${host}/b/api/share/download/info`
   const r = await reqJson(url, {
+    ...shareReqOpts(host, shareKey, cookie),
     method: 'POST',
     headers: { ...apiHeaders(host, shareKey), 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -219,7 +232,7 @@ async function open(url, ctx = {}) {
   const pwd = String(ctx.password || '').trim()
 
   // 先探一次 share/info：既挑出能用的 API 域名，又拿分享名、提前发现提取码
-  const picked = await pickApiHost(shareHost, shareKey)
+  const picked = await pickApiHost(shareHost, shareKey, ctx.cookie)
   const host = picked.host
   const info = await shareInfo(host, shareKey, pwd, ctx.cookie)
   const title = (info.data && (info.data.ShareName || info.data.shareName)) || `123云盘分享 ${shareKey}`
