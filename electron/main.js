@@ -27,6 +27,7 @@ const {
 } = require('./parsers/util')
 const { probeUrl, PROBE_TIMEOUT } = require('./parsers/probe')
 const browserCtx = require('./parsers/browserCtx')
+const identity = require('./parsers/identity')
 
 /* 安装版可以就地更新：electron-updater 走 NSIS，安装器会静默跑旧卸载器
  * （`/S /KEEP_APP_DATA --updated`，见 app-builder-lib 的 installUtil.nsh），
@@ -608,6 +609,12 @@ function createWindow() {
 /**
  * 文件有哪些可下的地址：主地址 + 解析器给的备用地址（去掉重复的）。
  * 顺序就是尝试顺序。
+ *
+ * 每条候选带两份头：
+ *   - `headers`：解析器给的原样。它会写进任务记录（落盘）、也会出现在界面报错里。
+ *   - `send`   ：真正交给引擎的那份 —— 再补一层浏览器身份（同站 cookie + 浏览器 UA +
+ *                该主机的 Referer）。浏览器点得下来的地址，程序拿同一副身份去取才算数；
+ *                而浏览器现场的 cookie 只存内存，绝不跟着记录落盘。
  */
 function fileCandidates(f) {
   const list = [{ url: f.url, headers: f.headers || {} }]
@@ -616,6 +623,7 @@ function fileCandidates(f) {
     if (list.some((x) => x.url === u.url)) continue
     list.push({ url: u.url, headers: u.headers || {} })
   }
+  for (const c of list) c.send = identity.forRequest(c.url, c.headers)
   return list
 }
 
@@ -659,19 +667,22 @@ async function handable(url, headers) {
 /**
  * 从候选里挑第一条能用的。只有一条候选时不做预检（不白花一次请求）。
  * 全被拒时返回最后一条：让引擎自己去试、把真实报错交给用户看。
+ *
+ * 预检用的必须是 `send` —— 与随后真正下载用的是同一副身份。拿裸头去探、
+ * 再拿带身份的头去下，会出现「探测说 403、其实下得动」这种自相矛盾的结论。
  */
 async function firstHandable(cands, name) {
-  if (cands.length < 2) return { url: cands[0].url, headers: cands[0].headers }
+  if (cands.length < 2) return cands[0]
   for (let i = 0; i < cands.length; i++) {
     const c = cands[i]
-    const pr = await handable(c.url, c.headers)
+    const pr = await handable(c.url, c.send)
     if (pr.ok) {
       if (i) boot('url-candidate', name, `改用备用地址 host=${hostOf(c.url)}`)
-      return { url: pr.finalUrl || c.url, headers: c.headers }
+      return { ...c, url: pr.finalUrl || c.url }
     }
     boot('url-rejected', name, `host=${hostOf(c.url)} status=${pr.status}`)
   }
-  return { url: cands[cands.length - 1].url, headers: cands[cands.length - 1].headers }
+  return cands[cands.length - 1]
 }
 
 /**
@@ -754,7 +765,7 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
        * aria2 没有「探测」这个环节，遇到 403 只会反复重试卡在 0%，所以先用 handable()
        * 把明显不能下的候选挑掉。 */
       const cands = fileCandidates(f)
-      let pick = { url: cands[0].url, headers: cands[0].headers }
+      let pick = cands[0]
       let gid = ''
       let engine = 'aria2'
       /* HLS 播放列表必须交 HLS 引擎：aria2 官方不支持 m3u8（下下来是一个几 KB 的
@@ -765,7 +776,7 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
       if (!plKind && f.stream && cands.length) {
         plKind = await hls
           .sniff(cands[0].url, {
-            headers: cands[0].headers,
+            headers: cands[0].send,
             proxy: useProxy,
             insecure: !!cfg.ignoreCert,
           })
@@ -775,7 +786,7 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
       if (plKind === 'hls') {
         gid = await hls.add({
           url: cands[0].url,
-          headers: cands[0].headers,
+          headers: cands[0].send,
           dir: subdir,
           name: f.name,
           proxy: useProxy,
@@ -794,7 +805,7 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
           try {
             gid = await seg.add({
               url: cands[i].url,
-              headers: cands[i].headers,
+              headers: cands[i].send,
               dir: subdir,
               out: sanitizeFileName(f.name),
               connections: segConns,
@@ -818,14 +829,16 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
       if (!gid) {
         pick = await firstHandable(cands, f.name)
         const opts2 = { ...options }
-        const h2 = buildHeaders(pick.headers)
+        const h2 = buildHeaders(pick.send)
         if (h2.length) opts2.header = h2
         else delete opts2.header
         gid = await aria2.addUri([pick.url], opts2)
         engine = 'aria2'
         /* 这条不能只写进 boot：用户看到的报错得能分辨是哪个站拒的 */
         boot('add-aria2', f.name, `host=${hostOf(pick.url)} cands=${cands.length}`)
-        options.header = opts2.header
+        /* 写进 options 的那份头留解析器原样（它跟着 origin 落盘）：浏览器现场的
+         * cookie 只用上面 opts2 这一份，进引擎，不落盘。 */
+        options.header = buildHeaders(pick.headers)
       }
       tasks.remember(gid, {
         name: f.name,
@@ -1595,7 +1608,10 @@ function registerIpc() {
  * @returns `{gid, engine, was, live}`
  */
 async function readdTask(gid, o, fresh) {
-  const header = buildHeaders(fresh.headers)
+  /* 交给引擎的那份头补一层浏览器身份（换链换来的地址同样是「浏览器能用、程序不一定」
+   * 那一类）；`fresh.headers` 保持原样，它跟着任务记录走。 */
+  const send = identity.forRequest(fresh.url, fresh.headers || {})
+  const header = buildHeaders(send)
   const opts = { ...(o.opts || {}) }
   delete opts.gid
   if (header.length) opts.header = header
@@ -1632,7 +1648,7 @@ async function readdTask(gid, o, fresh) {
     try {
       ngid = await hls.add({
         url: fresh.url,
-        headers: fresh.headers || {},
+        headers: send,
         dir: opts.dir,
         name: o.name,
         netdisk: o.netdisk,
@@ -1650,7 +1666,7 @@ async function readdTask(gid, o, fresh) {
     try {
       ngid = await seg.add({
         url: fresh.url,
-        headers: fresh.headers || {},
+        headers: send,
         dir: opts.dir,
         out: sanitizeFileName(o.name),
         connections: segConns,

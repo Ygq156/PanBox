@@ -22,6 +22,8 @@
 const http = require('node:http')
 const https = require('node:https')
 const { shouldBypass } = require('./proxy')
+/* 跟重定向时「凭据只发给本站」这条规矩，解析层（parsers/util.js）也要用同一份 */
+const { headersForHop } = require('./netHosts')
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -65,7 +67,10 @@ function openStream(url, { headers = {}, signal, timeout = 30000, redirects = 5,
       if (code >= 300 && code < 400 && res.headers.location && redirects > 0) {
         res.resume()
         const next = new URL(res.headers.location, url).toString()
-        return openStream(next, { headers, signal, timeout, redirects: redirects - 1, proxy, insecure }).then(resolve, reject)
+        /* 同站（含 www. 这类兄弟主机）照旧带上凭据，会话与防盗链都需要它；
+           换到别家主机就摘掉 —— 浏览器也不会把 A 站的 cookie 发给 B 站。 */
+        const nh = headersForHop(headers, url, next)
+        return openStream(next, { headers: nh, signal, timeout, redirects: redirects - 1, proxy, insecure }).then(resolve, reject)
       }
       resolve({ status: code, headers: res.headers, stream: res, url })
     }

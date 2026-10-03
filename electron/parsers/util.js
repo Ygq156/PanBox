@@ -1,6 +1,8 @@
 'use strict'
 
 const dns = require('node:dns').promises
+/* 跟重定向时「凭据只发给本站」这条规矩与下载引擎共用一份实现 */
+const { headersForHop } = require('../core/netHosts')
 
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
@@ -265,7 +267,16 @@ async function req(url, opts = {}) {
     const maxHop = redirect === 'manual' ? 0 : 5
     for (let hop = 0; ; hop++) {
       await assertOutbound(current, { allowLocal })
-      res = await fetch(current, { method, headers: h, body, redirect: 'manual', signal: ac.signal })
+      /* 凭据只发给「本站」：跳到别家主机就摘掉 Cookie / Authorization
+       * （浏览器也不会把 A 站的 cookie 发给 B 站）。需要自己跨站带 cookie 的流程
+       * —— 蓝奏、优享 —— 走 redirect:'manual'，由它们自己决定带什么，不受这条影响。 */
+      res = await fetch(current, {
+        method,
+        headers: headersForHop(h, url, current),
+        body,
+        redirect: 'manual',
+        signal: ac.signal,
+      })
       const code = res.status
       const loc = res.headers.get('location')
       if (redirect === 'manual') break
