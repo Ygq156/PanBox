@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { api, formatEta, formatSize, formatSpeed } from './api'
 import type { AppInfo, BridgeStatus, ProxyStatus, TrashItem, UpdateInfo, UpdateState } from './api'
@@ -1379,6 +1379,133 @@ const STATUS_TEXT: Record<string, string> = {
   removed: '已移除',
 }
 
+/**
+ * 下载队列里的一行。
+ *
+ * 为什么要单独拎出来 + memo：主进程在**下载中每 800ms** 推一次整表
+ * （taskManager 的内容指纹一变就推），以前是每推一次就重渲染整个 App ——
+ * 包括解析结果那半屏和全部队列行。现在只有「自己这一行的数据真的变了」的行才重渲染。
+ *
+ * ⚠️ 判定不能比对象身份：主进程每一轮都是新造的对象，身份永远不同。
+ * 所以逐个字段比（就是要显示的那几个字段）。
+ */
+const TaskRow = memo(
+  function TaskRow({
+    t,
+    busyJump,
+    busyRefresh,
+    onJump,
+    onPause,
+    onResume,
+    onRefresh,
+    onDeleteFile,
+    onRemove,
+  }: {
+    t: DownloadTask
+    busyJump: boolean
+    busyRefresh: boolean
+    onJump: (t: DownloadTask) => void
+    onPause: (t: DownloadTask) => void
+    onResume: (t: DownloadTask) => void
+    onRefresh: (t: DownloadTask) => void
+    onDeleteFile: (t: DownloadTask) => void
+    onRemove: (t: DownloadTask, mode?: 'trash' | 'purge') => void
+  }) {
+    const pct = t.total > 0 ? Math.min(100, (t.completed / t.total) * 100) : t.status === 'complete' ? 100 : 0
+    const barCls = t.status === 'complete' ? 'done' : t.status === 'error' ? 'err' : ''
+    return (
+      <div className="task">
+        <div className="tcell">
+          <div className="tname" title={t.name}>
+            {t.name}
+          </div>
+          <div className="tsub">
+            {label(t.netdisk)}
+            {t.engine === 'seg' ? ' · 分段引擎' : t.engine === 'hls' ? ' · HLS 引擎' : ''}
+            {t.route === 'proxy' ? ' · 走代理' : ''}
+            {t.connections ? ` · ${t.connections} 连接` : ''}
+            {t.errorMessage ? ` · ${t.errorMessage}` : ''}
+          </div>
+        </div>
+
+        <div>
+          <div className={`bar ${barCls}`}>
+            <i style={{ transform: `scaleX(${pct / 100})` }} />
+          </div>
+          <div className="meta">
+            {formatSize(t.completed)} / {formatSize(t.total)} · {pct.toFixed(1)}%
+          </div>
+        </div>
+
+        <div>
+          <div className="speed">{t.status === 'active' ? formatSpeed(t.speed) : '—'}</div>
+          <div className="meta">{t.status === 'active' ? `剩余 ${formatEta(t.total - t.completed, t.speed)}` : ' '}</div>
+        </div>
+
+        <div className="actions">
+          <span className={`status-pill ${t.status}`}>{STATUS_TEXT[t.status]}</span>
+          {(t.status === 'waiting' || t.status === 'paused') && (
+            <button className="ghost tiny" title="插队" disabled={busyJump} onClick={() => onJump(t)}>
+              {busyJump ? '…' : '⬆'}
+            </button>
+          )}
+          {t.status === 'active' && (
+            <button className="ghost tiny" title="暂停" onClick={() => onPause(t)}>
+              ⏸
+            </button>
+          )}
+          {(t.status === 'paused' || t.status === 'waiting') && (
+            <button className="ghost tiny" title="继续" onClick={() => onResume(t)}>
+              ▶
+            </button>
+          )}
+          {(t.status === 'active' || t.status === 'paused' || t.status === 'error') && t.source && (
+            <button
+              className="ghost tiny"
+              title="重新解析这条分享，用新的下载地址替换当前的。"
+              disabled={busyRefresh}
+              onClick={() => onRefresh(t)}
+            >
+              {busyRefresh ? '…' : '⟳'}
+            </button>
+          )}
+          {t.status === 'complete' && (
+            <button
+              className="ghost tiny"
+              title="删除文件（放进回收站，之后可以还原）"
+              onClick={() => onDeleteFile(t)}
+            >
+              🗑
+            </button>
+          )}
+          <button
+            className="ghost tiny"
+            title={t.status === 'complete' ? '移除（会问一句文件怎么处理）' : '移除（下到一半的会立刻回收转存副本）'}
+            onClick={() => onRemove(t)}
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+    )
+  },
+  (a, b) =>
+    a.busyJump === b.busyJump &&
+    a.busyRefresh === b.busyRefresh &&
+    a.t.gid === b.t.gid &&
+    a.t.name === b.t.name &&
+    a.t.status === b.t.status &&
+    a.t.completed === b.t.completed &&
+    a.t.total === b.t.total &&
+    a.t.speed === b.t.speed &&
+    a.t.netdisk === b.t.netdisk &&
+    a.t.engine === b.t.engine &&
+    a.t.route === b.t.route &&
+    a.t.connections === b.t.connections &&
+    a.t.errorMessage === b.t.errorMessage &&
+    a.t.source === b.t.source,
+)
+
 /* ------------------------------------------------------------------ */
 /* 回收站：删掉的下载文件先挪进这里，可以还原                                 */
 /* ------------------------------------------------------------------ */
@@ -1647,6 +1774,71 @@ export default function App() {
     }
   }, [])
 
+  /* 队列行的那几个按钮：都写成**稳定引用**的回调（useCallback 无依赖 / 只依赖 setXxx），
+   * 否则 TaskRow 的 memo 每次都会被新的内联箭头打破，等于没 memo。 */
+  const jumpTask = useCallback(async (t: DownloadTask) => {
+    setJumping(t.gid)
+    setHint({ kind: '', msg: `正在把「${t.name}」排到最前…` })
+    try {
+      const r = await api.jumpTask(t.gid)
+      setHint(
+        r.ok
+          ? {
+              kind: 'ok',
+              msg: r.paused?.length
+                ? `已插队；「${r.paused.join('」「')}」暂停让位，稍后自动继续`
+                : `「${t.name}」已排到最前`,
+            }
+          : { kind: 'err', msg: r.message || '插队失败' },
+      )
+      setTasks((await api.listDownloads()) || [])
+    } catch (e) {
+      setHint({ kind: 'err', msg: `插队失败：${String((e as Error)?.message || e)}` })
+    }
+    setJumping(null)
+  }, [])
+
+  const pauseTask = useCallback(async (t: DownloadTask) => {
+    /* 失败要说出来：原来主进程吞成 false、界面也不看返回值，
+     * 结果就是点了没反应，用户以为程序卡了 */
+    const r = await api.pauseTask(t.gid)
+    if (!r.ok) setHint({ kind: 'err', msg: r.message || '暂停失败' })
+  }, [])
+
+  const resumeTask = useCallback(async (t: DownloadTask) => {
+    const r = await api.resumeTask(t.gid)
+    if (!r.ok) setHint({ kind: 'err', msg: r.message || '继续失败' })
+  }, [])
+
+  const refreshTask = useCallback(async (t: DownloadTask) => {
+    setRefreshing(t.gid)
+    setHint({ kind: '', msg: `正在为「${t.name}」重新解析直链…` })
+    try {
+      const r = await api.refreshTask(t.gid)
+      setHint({
+        kind: r.ok ? 'ok' : 'err',
+        msg: r.message || (r.ok ? '已换成新的下载地址' : '换直链失败'),
+      })
+    } catch (e) {
+      setHint({ kind: 'err', msg: String((e as Error)?.message || e) })
+    }
+    setRefreshing(null)
+  }, [])
+
+  const deleteTaskFile = useCallback(async (t: DownloadTask) => {
+    try {
+      const r = await api.deleteTaskFile(t.gid)
+      setHint(
+        r.ok
+          ? { kind: 'ok', msg: `已删除「${r.name || t.name}」，可在回收站还原` }
+          : { kind: 'err', msg: r.message || '删除失败' },
+      )
+      setTasks((await api.listDownloads()) || [])
+    } catch (e) {
+      setHint({ kind: 'err', msg: `删除失败：${String((e as Error)?.message || e)}` })
+    }
+  }, [])
+
   const doParse = useCallback(async () => {
     const raw = text.trim()
     if (!raw) {
@@ -1748,6 +1940,52 @@ export default function App() {
     }
   }, [tasks])
 
+  /* 解析结果那半屏跟下载队列无关，但以前下载中每 800ms 的整表推送会把这里也重渲染一遍
+   * （`results` 里可能有几百个文件行，比队列本身还贵）。memo 成元素之后，
+   * 依赖没变时元素引用不变，React 会整棵跳过。 */
+  const resultsNode = useMemo(
+    () => (
+      <div className="results">
+        {results.map((r, i) =>
+          r.ok ? (
+            <ResultPanel
+              key={r.sessionId || `r${i}`}
+              result={r}
+              needsLogin={!settings?.cookies?.[r.netdisk]}
+              onDownload={doDownload}
+              onRemoveFiles={(ids) => removeFiles(r.sessionId || '', ids)}
+            />
+          ) : (
+            <ErrorPanel key={r.source || `e${i}`} result={r} />
+          ),
+        )}
+      </div>
+    ),
+    [results, settings?.cookies, doDownload, removeFiles],
+  )
+
+  /* 队列行整块也 memo 一次：App 因为别的原因（引擎状态轮询、提示条）重渲染时，
+   * 元素引用没变 → React 直接跳过整棵子树；真变了再由 TaskRow 的 memo 逐行比字段。
+   * 下载中主进程每 800ms 推一次全表，这里是最值钱的一处。 */
+  const taskRows = useMemo(
+    () =>
+      tasks.map((t) => (
+        <TaskRow
+          key={t.gid}
+          t={t}
+          busyJump={jumping === t.gid}
+          busyRefresh={refreshing === t.gid}
+          onJump={jumpTask}
+          onPause={pauseTask}
+          onResume={resumeTask}
+          onRefresh={refreshTask}
+          onDeleteFile={deleteTaskFile}
+          onRemove={removeTask}
+        />
+      )),
+    [tasks, jumping, refreshing, jumpTask, pauseTask, resumeTask, refreshTask, deleteTaskFile, removeTask],
+  )
+
   if (!settings) {
     return (
       <div className="app">
@@ -1828,23 +2066,7 @@ export default function App() {
             </div>
           )}
 
-          {results.length > 0 && (
-            <div className="results">
-              {results.map((r, i) =>
-                r.ok ? (
-                  <ResultPanel
-                    key={r.sessionId || `r${i}`}
-                    result={r}
-                    needsLogin={!settings.cookies?.[r.netdisk]}
-                    onDownload={doDownload}
-                    onRemoveFiles={(ids) => removeFiles(r.sessionId || '', ids)}
-                  />
-                ) : (
-                  <ErrorPanel key={r.source || `e${i}`} result={r} />
-                ),
-              )}
-            </div>
-          )}
+          {results.length > 0 && resultsNode}
         </div>
 
         <div className="pane-list">
@@ -1874,162 +2096,12 @@ export default function App() {
           </div>
 
           <div className="scroll">
-            {tasks.length === 0 ? (
+            {taskRows.length === 0 ? (
               <div className="empty">
                 还没有下载任务。
               </div>
             ) : (
-              tasks.map((t) => {
-                const pct = t.total > 0 ? Math.min(100, (t.completed / t.total) * 100) : t.status === 'complete' ? 100 : 0
-                const barCls = t.status === 'complete' ? 'done' : t.status === 'error' ? 'err' : ''
-                return (
-                  <div className="task" key={t.gid}>
-                    <div className="tcell">
-                      <div className="tname" title={t.name}>
-                        {t.name}
-                      </div>
-                      <div className="tsub">
-                        {label(t.netdisk)}
-                        {t.engine === 'seg' ? ' · 分段引擎' : ''}
-                        {t.route === 'proxy' ? ' · 走代理' : ''}
-                        {t.connections ? ` · ${t.connections} 连接` : ''}
-                        {t.errorMessage ? ` · ${t.errorMessage}` : ''}
-                      </div>
-                    </div>
-
-                    <div>
-                      <div className={`bar ${barCls}`}>
-                        <i style={{ transform: `scaleX(${pct / 100})` }} />
-                      </div>
-                      <div className="meta">
-                        {formatSize(t.completed)} / {formatSize(t.total)} · {pct.toFixed(1)}%
-                      </div>
-                    </div>
-
-                    <div>
-                      <div className="speed">{t.status === 'active' ? formatSpeed(t.speed) : '—'}</div>
-                      <div className="meta">
-                        {t.status === 'active' ? `剩余 ${formatEta(t.total - t.completed, t.speed)}` : ' '}
-                      </div>
-                    </div>
-
-                    <div className="actions">
-                      <span className={`status-pill ${t.status}`}>{STATUS_TEXT[t.status]}</span>
-                      {(t.status === 'waiting' || t.status === 'paused') && (
-                        <button
-                          className="ghost tiny"
-                          title="插队"
-                          disabled={jumping === t.gid}
-                          onClick={async () => {
-                            setJumping(t.gid)
-                            setHint({ kind: '', msg: `正在把「${t.name}」排到最前…` })
-                            try {
-                              const r = await api.jumpTask(t.gid)
-                              setHint(
-                                r.ok
-                                  ? {
-                                      kind: 'ok',
-                                      msg: r.paused?.length
-                                        ? `已插队；「${r.paused.join('」「')}」暂停让位，稍后自动继续`
-                                        : `「${t.name}」已排到最前`,
-                                    }
-                                  : { kind: 'err', msg: r.message || '插队失败' },
-                              )
-                              setTasks((await api.listDownloads()) || [])
-                            } catch (e) {
-                              setHint({ kind: 'err', msg: `插队失败：${String((e as Error)?.message || e)}` })
-                            }
-                            setJumping(null)
-                          }}
-                        >
-                          {jumping === t.gid ? '…' : '⬆'}
-                        </button>
-                      )}
-                      {t.status === 'active' && (
-                        <button
-                          className="ghost tiny"
-                          title="暂停"
-                          onClick={async () => {
-                            /* 失败要说出来：原来主进程吞成 false、界面也不看返回值，
-                             * 结果就是点了没反应，用户以为程序卡了 */
-                            const r = await api.pauseTask(t.gid)
-                            if (!r.ok) setHint({ kind: 'err', msg: r.message || '暂停失败' })
-                          }}
-                        >
-                          ⏸
-                        </button>
-                      )}
-                      {(t.status === 'paused' || t.status === 'waiting') && (
-                        <button
-                          className="ghost tiny"
-                          title="继续"
-                          onClick={async () => {
-                            const r = await api.resumeTask(t.gid)
-                            if (!r.ok) setHint({ kind: 'err', msg: r.message || '继续失败' })
-                          }}
-                        >
-                          ▶
-                        </button>
-                      )}
-                      {(t.status === 'active' || t.status === 'paused' || t.status === 'error') && t.source && (
-                        <button
-                          className="ghost tiny"
-                          title="重新解析这条分享，用新的下载地址替换当前的。"
-                          disabled={refreshing === t.gid}
-                          onClick={async () => {
-                            setRefreshing(t.gid)
-                            setHint({ kind: '', msg: `正在为「${t.name}」重新解析直链…` })
-                            try {
-                              const r = await api.refreshTask(t.gid)
-                              setHint({
-                                kind: r.ok ? 'ok' : 'err',
-                                msg: r.message || (r.ok ? '已换成新的下载地址' : '换直链失败'),
-                              })
-                            } catch (e) {
-                              setHint({ kind: 'err', msg: String((e as Error)?.message || e) })
-                            }
-                            setRefreshing(null)
-                          }}
-                        >
-                          {refreshing === t.gid ? '…' : '⟳'}
-                        </button>
-                      )}
-                      {t.status === 'complete' && (
-                        <button
-                          className="ghost tiny"
-                          title="删除文件（放进回收站，之后可以还原）"
-                          onClick={async () => {
-                            try {
-                              const r = await api.deleteTaskFile(t.gid)
-                              setHint(
-                                r.ok
-                                  ? { kind: 'ok', msg: `已删除「${r.name || t.name}」，可在回收站还原` }
-                                  : { kind: 'err', msg: r.message || '删除失败' },
-                              )
-                              setTasks((await api.listDownloads()) || [])
-                            } catch (e) {
-                              setHint({ kind: 'err', msg: `删除失败：${String((e as Error)?.message || e)}` })
-                            }
-                          }}
-                        >
-                          🗑
-                        </button>
-                      )}
-                      <button
-                        className="ghost tiny"
-                        title={
-                          t.status === 'complete'
-                            ? '移除（会问一句文件怎么处理）'
-                            : '移除（下到一半的会立刻回收转存副本）'
-                        }
-                        onClick={() => removeTask(t)}
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  </div>
-                )
-              })
+              taskRows
             )}
           </div>
         </div>

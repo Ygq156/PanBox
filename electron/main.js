@@ -8,6 +8,7 @@ const https = require('node:https')
 const settings = require('./core/settings')
 const aria2 = require('./core/aria2')
 const seg = require('./core/segmentDownloader')
+const hls = require('./core/hls')
 const tasks = require('./core/taskManager')
 const trash = require('./core/trash')
 const parsers = require('./parsers')
@@ -166,15 +167,22 @@ async function recycleTransferCopy(name, tag) {
 }
 
 /**
- * 这个任务跑在哪个引擎上（'aria2' 还是 'seg'）。
- * 暂停/继续/移除都要按它路由 —— 两个引擎的 gid 互不认识，
- * 把 seg 的 gid 丢给 aria2 只会静默失败（界面上看就是「点了没反应」）。
+ * 这条任务跑在哪个**本地引擎**上（分段 / HLS）。
+ * 不是本地引擎就返回 null —— 交给 aria2。
+ *
+ * 为什么要按 gid 路由：三套引擎的 gid 互不认识，
+ * 把本地引擎的 gid 丢给 aria2 只会静默失败（界面上看就是「点了没反应」）。
  */
-function isSegTask(gid) {
-  const m = tasks.info(gid)
-  if (m && m.engine) return m.engine === 'seg'
-  if (seg.has(gid)) return true
-  return String(gid).startsWith('seg-')
+function localEngine(gid) {
+  const g = String(gid)
+  const m = tasks.info(g)
+  if (m && m.engine === 'hls') return hls
+  if (m && m.engine === 'seg') return seg
+  if (seg.has(g)) return seg
+  if (hls.has(g)) return hls
+  if (g.startsWith('hls-')) return hls
+  if (g.startsWith('seg-')) return seg
+  return null
 }
 
 /* ------------------------------------------------------------------ */
@@ -208,9 +216,10 @@ function pickVictim(list, skipGid) {
 function taskLabel(gid) {
   const m = tasks.info(gid)
   if (m && m.name) return String(m.name)
-  if (seg.has(gid)) {
+  const en = localEngine(gid)
+  if (en) {
     try {
-      const st = seg.tellStatus(gid)
+      const st = en.tellStatus(gid)
       const p = st && st.files && st.files[0] && st.files[0].path
       if (p) return path.basename(String(p))
       if (st && st.name) return String(st.name)
@@ -244,9 +253,10 @@ async function resumePreempted(list) {
     preempted.delete(jumped)
     for (const p of rec.items) {
       try {
-        if (p.engine === 'seg') {
-          const s = seg.has(p.gid) ? seg.tellStatus(p.gid) : null
-          if (s && s.status === 'paused') await seg.unpause(p.gid)
+        const en = p.engine === 'seg' || p.engine === 'hls' ? localEngine(p.gid) : null
+        if (en) {
+          const s = en.has(p.gid) ? en.tellStatus(p.gid) : null
+          if (s && s.status === 'paused') await en.unpause(p.gid)
         } else {
           const s = await aria2.tellStatus(p.gid).catch(() => null)
           if (s && s.status === 'paused') await aria2.unpause(p.gid).catch(() => {})
@@ -703,6 +713,17 @@ async function firstHandable(cands, name) {
 }
 
 /**
+ * 这条直链该不该按流媒体协议处理。
+ * 返回 `'hls' | 'dash' | ''`，判据在 hls.js 里（与引擎自己认列表用的是同一份）。
+ * 只看地址后缀与响应类型，**不发额外请求** —— 一批上千个文件时每个候选都探一次体太贵。
+ */
+function playlistKind(url, f = {}) {
+  const h = (f && f.headers) || {}
+  const ct = h['content-type'] || h['Content-Type'] || (f && f.mime) || ''
+  return hls.classifyUrl(url, ct)
+}
+
+/**
  * 把一批已经拿到直链的文件真正排进下载队列。
  * 两个入口共用：渲染层的 `downloads:add`，和浏览器插件的 HTTP 通道（bridge）。
  */
@@ -716,6 +737,10 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
    * 否则会出现「下载目录/文件名/文件名」这种多此一举的嵌套——
    * 蓝奏优享这类「分享标题就等于文件名」的网盘必然踩到。 */
   const nest = session.length > 1 || session.some((f) => f.dir)
+
+  /* 「这批里有没有来自用户自己的解析接口」整批只算一次。
+   * 以前写在下面的 for 循环里 → 千文件就是百万次回调，而且是在 IPC 主线程上。 */
+  const perEndpoint = session.some((x) => x.viaEndpoint)
 
   for (const f of session) {
     /* 名字在这里定稿：缺后缀的按响应类型补上（详见 resolveFileName）。
@@ -732,7 +757,6 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
     /* 百度按「账号」维度限速：并发调大只会招致几小时~几天的惩罚性降速。
      * 但如果这条直链是用户自己的「解析接口」给的（别人的会员账号出的链），
      * 那限速档位就不是用户的账号了，再限成单线程等于白配——所以跳过这个限制。 */
-    const perEndpoint = session.some((x) => x.viaEndpoint)
     const isBaidu = netdisk === 'baidu' && !perEndpoint
     /* 不用分段引擎的那几家，aria2 的并发也要按网盘调（默认 16 会招来 503/403）。
      * 百度默认仍然是 1：它按「账号」维度限速，并发调大只会招致几小时~几天的惩罚性降速。
@@ -767,7 +791,39 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
       let pick = { url: cands[0].url, headers: cands[0].headers }
       let gid = ''
       let engine = 'aria2'
-      if (segConns && cands.length) {
+      /* HLS 播放列表必须交 HLS 引擎：aria2 官方不支持 m3u8（下下来是一个几 KB 的
+       * 列表文件，用户什么也看不了），分段引擎也只是把它当普通文件存。 */
+      let plKind = cands.length ? playlistKind(cands[0].url, f) : ''
+      /* 插件说这条是播放列表、可地址没后缀、响应类型也不认识（有些 CDN 干脆不给类型）：
+       * 才值得多发一次请求抓开头几百字节确认。只在这一种情况下探，别的都不探。 */
+      if (!plKind && f.stream && cands.length) {
+        plKind = await hls
+          .sniff(cands[0].url, {
+            headers: cands[0].headers,
+            proxy: useProxy,
+            insecure: !!cfg.ignoreCert,
+          })
+          .catch(() => '')
+        if (plKind) boot('sniff-playlist', f.name, `kind=${plKind} host=${hostOf(cands[0].url)}`)
+      }
+      if (plKind === 'hls') {
+        gid = await hls.add({
+          url: cands[0].url,
+          headers: cands[0].headers,
+          dir: subdir,
+          name: f.name,
+          proxy: useProxy,
+          insecure: !!cfg.ignoreCert,
+          netdisk,
+          source,
+        })
+        engine = 'hls'
+        boot('add-hls', f.name, `host=${hostOf(cands[0].url)}`)
+      } else if (plKind === 'dash') {
+        /* 宁可明确说不支持，也不要给用户一个打不开的 XML */
+        throw new Error('DASH（.mpd）格式暂不支持，请换 HLS 或普通直链')
+      }
+      if (!gid && segConns && cands.length) {
         for (let i = 0; i < cands.length && !gid; i++) {
           try {
             gid = await seg.add({
@@ -925,7 +981,21 @@ async function bridgeAdd(p) {
   name = sanitizeName(withExt(name, (p && p.mime) || ''))
   if (!name) name = 'download.bin'
 
-  const session = [{ id: '0', name, size: finalSize || Number((p && p.size) || 0), isDir: false, dir: '', url: finalUrl, headers }]
+  const session = [
+    {
+      id: '0',
+      name,
+      size: finalSize || Number((p && p.size) || 0),
+      isDir: false,
+      dir: '',
+      url: finalUrl,
+      headers,
+      /* 插件探到的响应类型与它的分类都带下去：地址没后缀时，
+       * 「这是不是播放列表」只能靠这两条线索（见下面 addResolved 里的 playlistKind / sniff）。 */
+      mime: (p && p.mime) || '',
+      stream: p && p.kind === 'stream' ? 1 : 0,
+    },
+  ]
   /* 论文站这类「地址本身就是会过期的投递地址」的：提交前先问站点要一条新的。
    * 插件抓到的那条往往是几分钟前点的按钮地址，那时它就差一步到 5 分钟有效期了。 */
   if (nd === 'ssrn' && parsers.PARSERS.ssrn && parsers.PARSERS.ssrn.isDelivery(finalUrl)) {
@@ -1041,17 +1111,18 @@ function bridgeInfo() {
   }
 }
 
-/** 一个任务在磁盘上的真实文件路径（aria2 与分段引擎的 tellStatus 都带 files[0].path） */
+/** 一个任务在磁盘上的真实文件路径（本地引擎与 aria2 的 tellStatus 都带 files[0].path） */
 async function taskFile(gid) {
   let st = null
   try {
     st = await aria2.tellStatus(gid)
   } catch {
-    /* 可能不在 aria2 上（分段引擎的任务），也可能已经没了 */
+    /* 可能不在 aria2 上（本地引擎的任务），也可能已经没了 */
   }
-  if (!st) {
+  const en = localEngine(gid)
+  if (!st && en) {
     try {
-      st = seg.tellStatus(gid)
+      st = en.tellStatus(gid)
     } catch {
       /* 两边都没有 */
     }
@@ -1061,21 +1132,44 @@ async function taskFile(gid) {
   return { status: String(st.status || ''), path: f.path || '', dir: st.dir || '' }
 }
 
-/** 把任务从队列与引擎里彻底清掉（与 downloads:remove 同一套动作，删文件后复用） */
-async function purgeTask(gid) {
-  if (isSegTask(gid)) {
-    await seg.remove(gid).catch(() => {})
-  } else {
-    await aria2.remove(gid).catch(() => {})
-    for (let i = 0; i < 4; i++) {
-      try {
-        await aria2.removeDownloadResult(gid)
-        break
-      } catch {
-        await new Promise((r) => setTimeout(r, 250))
-      }
+/**
+ * 把一条任务从引擎里彻底拿掉（不只是暂停）。
+ *
+ * 本地引擎（seg/hls）自己就会连临时文件一起清，直接 `remove` 即可；aria2 要两步：
+ * 先 `remove`（停止），再 `removeDownloadResult` —— 后者把结果从「已停止」列表里清掉，
+ * 不清的话下一轮 `tellStopped` 又把它读回来，界面上看起来像「点了移除没反应」。
+ *
+ * aria2 的 `removeDownloadResult` 在 `remove` 刚发出的瞬间可能报「找不到」，
+ * 所以要重试几次。以前这段在三个地方各写了一遍：一处重试 4×250ms、一处只 catch 一次，
+ * 于是「移除」偶尔会留下一条已停止的幽灵任务 —— 现在统一走这里。
+ *
+ * 清不掉也不许抛：任务在引擎里已经是停止态，调用方按「已移除」继续处理，
+ * 只在 boot 日志里留一笔。
+ * @returns {Promise<boolean>} 引擎那边是否真的清掉了（本地引擎 remove 的返回值 / aria2 清结果成功）
+ */
+async function hardRemove(gid, { retries = 4, label = '' } = {}) {
+  const en = localEngine(gid)
+  if (en) {
+    const r = await en.remove(gid).catch(() => false)
+    return !!r
+  }
+  await aria2.remove(gid).catch(() => {})
+  const tries = Math.max(1, Number(retries) || 1)
+  for (let i = 0; i < tries; i++) {
+    try {
+      await aria2.removeDownloadResult(gid)
+      return true
+    } catch {
+      if (i < tries - 1) await new Promise((r) => setTimeout(r, 250))
     }
   }
+  boot('hard-remove-miss', label || String(gid || ''))
+  return false
+}
+
+/** 把任务从队列与引擎里彻底清掉（与 downloads:remove 同一套动作，删文件后复用） */
+async function purgeTask(gid) {
+  await hardRemove(gid, { label: 'purge' })
   tasks.forget(gid)
   tasks.kick()
 }
@@ -1431,7 +1525,8 @@ function registerIpc() {
   })
   ipcMain.handle('downloads:pause', async (_e, gid) => {
     try {
-      await (isSegTask(gid) ? seg.pause(gid) : aria2.pause(gid))
+      const en = localEngine(gid)
+      await (en ? en.pause(gid) : aria2.pause(gid))
       tasks.kick()
       return { ok: true }
     } catch (e) {
@@ -1441,7 +1536,8 @@ function registerIpc() {
   })
   ipcMain.handle('downloads:resume', async (_e, gid) => {
     try {
-      await (isSegTask(gid) ? seg.unpause(gid) : aria2.unpause(gid))
+      const en = localEngine(gid)
+      await (en ? en.unpause(gid) : aria2.unpause(gid))
       tasks.kick()
       return { ok: true }
     } catch (e) {
@@ -1450,7 +1546,7 @@ function registerIpc() {
   })
 
   /* 插队 ⬆：把这条任务顶到最前面，必要时暂停一条正在下载的给它腾位置。
-   * - 排队中的任务：aria2 用 changePosition(gid, 0, 0) 挪到队首；分段引擎有自己的队列，用 seg.jumpTop()。
+   * - 排队中的任务：aria2 用 changePosition(gid, 0, 0) 挪到队首；本地引擎有自己的队列，用 jumpTop()。
    * - 名额不够：各挑一条「进度最低」的 active 任务暂停，记进 preempted，等插队任务结束后自动恢复。
    * - 已经在下 / 已经结束的任务：只回报状态，不动队列。 */
   ipcMain.handle('downloads:jumpTop', async (_e, gid) => {
@@ -1460,18 +1556,20 @@ function registerIpc() {
     const limit = Math.max(1, Number(cfg.maxConcurrent) || 1)
     const paused = []
     try {
-      if (isSegTask(id)) {
-        const st0 = seg.tellStatus(id)
+      const en = localEngine(id)
+      if (en) {
+        const st0 = en.tellStatus(id)
+        if (!st0) return { ok: false, message: '任务不存在' }
         if (st0.status === 'complete' || st0.status === 'error') {
           return { ok: false, message: `「${st0.name}」已经不在队列里了` }
         }
-        if (st0.status === 'paused') await seg.unpause(id)
-        seg.jumpTop(id)
-        if (seg.tellStatus(id).status === 'waiting' && seg.activeCount() >= limit) {
-          const victim = pickVictim(seg.list(), id)
+        if (st0.status === 'paused') await en.unpause(id)
+        en.jumpTop(id)
+        if (en.tellStatus(id).status === 'waiting' && en.activeCount() >= limit) {
+          const victim = pickVictim(en.list(), id)
           if (victim) {
-            await seg.pause(victim.gid)
-            paused.push({ gid: victim.gid, engine: 'seg', name: taskLabel(victim.gid) })
+            await en.pause(victim.gid)
+            paused.push({ gid: victim.gid, engine: en === hls ? 'hls' : 'seg', name: taskLabel(victim.gid) })
           }
         }
       } else {
@@ -1494,11 +1592,21 @@ function registerIpc() {
     } catch (e) {
       return { ok: false, message: (e && e.message) || String(e) }
     }
-    if (paused.length) preempted.set(id, { at: Date.now(), items: paused })
+    /* 被这次插队挤下去的任务要记着，等它下完再放回来。
+     * 同一个任务可能被插队两次（连续点两下 ⬆）：第二次的名单必须**并进**上一条，
+     * 整条覆盖会把第一次暂停的那些任务从记录里抹掉 —— 再也没人恢复它们，永远停在暂停。
+     * 按 gid 去重，免得同一条被 pause/unpause 两遍。`at` 字段从来没人读过，去掉了。 */
+    if (paused.length) {
+      const rec = preempted.get(id)
+      rec
+        ? (rec.items = [...new Map([...rec.items, ...paused].map((p) => [p.gid, p])).values()])
+        : preempted.set(id, { items: paused })
+    }
     tasks.kick()
     let status = ''
     try {
-      status = isSegTask(id) ? seg.tellStatus(id).status : String((await aria2.tellStatus(id)).status || '')
+      const en1 = localEngine(id)
+      status = en1 ? en1.tellStatus(id).status : String((await aria2.tellStatus(id)).status || '')
     } catch {
       /* ignore */
     }
@@ -1530,24 +1638,21 @@ async function readdTask(gid, o, fresh) {
   try {
     st = await aria2.tellStatus(gid)
   } catch {
-    /* 任务可能已经被删了，或者本来就在分段引擎上，照样走重新加入的路径 */
+    /* 任务可能已经被删了，或者本来就在本地引擎上，照样走重新加入的路径 */
   }
-  if (!st) {
+  const en0 = localEngine(gid)
+  if (!st && en0) {
     try {
-      st = seg.tellStatus(gid)
+      st = en0.tellStatus(gid)
     } catch {
       /* ignore */
     }
   }
   const live = st && (st.status === 'active' || st.status === 'paused' || st.status === 'waiting')
 
-  if (isSegTask(gid)) {
-    await seg.remove(gid).catch(() => {})
-  } else {
-    await aria2.remove(gid).catch(() => {})
-    /* 同样要把旧 gid 的结果从停止列表里清掉，否则旧任务会以「已停止」的形态赖在界面上 */
-    await aria2.removeDownloadResult(gid).catch(() => {})
-  }
+  /* 旧 gid 的结果要从停止列表里清掉，否则旧任务会以「已停止」的形态赖在界面上
+   * （重试次数与 downloads:remove / purgeTask 统一在 hardRemove 里） */
+  await hardRemove(gid, { label: 'readd' })
   tasks.forget(gid)
   cleanupTake(o.name)
   /* 与「初次添加」保持同一套参数：连接数取设置里那份（0 = 不走分段引擎，退回 aria2），
@@ -1556,7 +1661,26 @@ async function readdTask(gid, o, fresh) {
   const segConns = segConnectionsFor(cfgNow, o.netdisk)
   let ngid = ''
   let nengine = 'aria2'
-  if (o.engine === 'seg' && segConns) {
+  /* 换链换来的可能是一条播放列表地址（论文站不会，但通用直链会），判据与初次添加同一份 */
+  if (playlistKind(fresh.url, { headers: fresh.headers, mime: fresh.mime }) === 'hls') {
+    try {
+      ngid = await hls.add({
+        url: fresh.url,
+        headers: fresh.headers || {},
+        dir: opts.dir,
+        name: o.name,
+        netdisk: o.netdisk,
+        source: o.source,
+        proxy: o.netdisk === 'direct' ? proxy.effective(cfgNow) : '',
+        insecure: !!cfgNow.ignoreCert,
+      })
+      nengine = 'hls'
+      boot('add-hls', o.name, `host=${hostOf(fresh.url)} refresh=1`)
+    } catch (e) {
+      boot('hls-fallback', 'refresh', o.name, (e && e.message) || String(e))
+    }
+  }
+  if (!ngid && o.engine === 'seg' && segConns) {
     try {
       ngid = await seg.add({
         url: fresh.url,
@@ -1624,6 +1748,15 @@ var autoRefreshExpired = async function (list) {
     const meta = tasks.info(gid)
     const o = meta && meta.origin
     if (!o || !o.source) continue
+    /* 只当「同一个 gid 不重复折腾」的备忘录用，别让它无限长大：
+     * 满了就先丢掉最早的一批（Set 保持插入顺序）。 */
+    if (autoRefreshed.size >= 500) {
+      let n = 100
+      for (const k of autoRefreshed) {
+        autoRefreshed.delete(k)
+        if (--n <= 0) break
+      }
+    }
     autoRefreshed.add(gid)
     boot('auto-refresh', o.name, `gid=${gid} code=${t.errorCode || ''}`)
     if (win && !win.isDestroyed()) {
@@ -1688,15 +1821,9 @@ var refreshTask = async function (gid) {
   }
 }
 
-/**
- * 「直链过期」这种失败自动换一次直链（只换一次，换完还失败就不再折腾）。
- *
- * 为什么需要：论文站预签名地址只有 5 分钟，夸克/百度这类网盘直链也会过期；
- * 一条已经躺在队列里的任务，用户过一会儿点「继续」时地址早就死了，
- * 引擎只会一遍遍重试同一个死地址，界面上停在 0%。
- *
- * @returns 真的发起了换链就返回 true
- */
+/* 「直链过期」这种失败自动换一次直链的实现在 refreshTask()（见上面那段注释），
+ * 这里只是界面点「换直链」时的手动入口 —— 手动点不设「只换一次」的限制，
+ * 用户想再试一次就再试一次。 */
 ipcMain.handle('downloads:refresh', async (_e, gid) => refreshTask(gid))
 ipcMain.handle('downloads:remove', async (_e, gid, mode) => {
     /* mode（只在「已下载完成的任务」上有意义）：
@@ -1708,7 +1835,6 @@ ipcMain.handle('downloads:remove', async (_e, gid, mode) => {
     /* ⚠️ 必须**先**取名字再 forget：否则中途撤销任务时，那份转到用户网盘里的副本
      * 就再也没人认领，会永久留在 `/PanBox` 里。 */
     const meta = tasks.info(gid)
-    const onSeg = isSegTask(gid)
 
     let done = null
     if (want) {
@@ -1718,34 +1844,11 @@ ipcMain.handle('downloads:remove', async (_e, gid, mode) => {
       done = f
     }
 
-    /* ① 还在下载/排队中的任务：先停掉（forceRemove 对已停止的任务会报错，所以吞掉） */
-    let stopped = false
-    let purged = false
-    if (onSeg) {
-      /* 分段引擎：remove 本身就会停掉在飞请求、关掉文件、清掉分片与断点 */
-      stopped = await seg.remove(gid).catch(() => false)
-      purged = stopped
-    } else {
-      try {
-        await aria2.remove(gid)
-        stopped = true
-      } catch {
-        /* 任务早就不在活动列表里了（已完成/已失败/已停止），正常情况 */
-      }
-
-      /* ② 关键一步：把结果从 aria2 的停止列表里清掉。
-       * 不做这一步的话，taskManager 每 800ms 的 tellStopped 会把它原样读回来，
-       * 界面上那个任务根本不会消失 —— 这就是「点了移除毫无反应」的根因。
-       * 刚停掉的任务结果不一定立刻可清，所以重试几次。 */
-      for (let i = 0; i < 4 && !purged; i++) {
-        try {
-          await aria2.removeDownloadResult(gid)
-          purged = true
-        } catch {
-          await new Promise((r) => setTimeout(r, 250))
-        }
-      }
-    }
+    /* ① 还在下载/排队中的任务：先停掉，并把结果从引擎的已停止列表里清干净。
+     * ⚠️ 不清结果的话，taskManager 每 800ms 的 tellStopped 会把它原样读回来，
+     * 界面上那个任务根本不会消失 —— 这就是「点了移除毫无反应」的根因。
+     * 停引擎 + 清结果 + 重试这几步与 purgeTask / readdTask 共用 hardRemove。 */
+    const stopped = await hardRemove(gid, { label: 'remove' })
 
     tasks.forget(gid)
     if (meta && meta.name) await recycleTransferCopy(meta.name, 'remove').catch(() => {})
@@ -1772,11 +1875,11 @@ ipcMain.handle('downloads:remove', async (_e, gid, mode) => {
         fileErr = (e && e.message) || String(e)
       }
     }
-    boot('remove', gid, `stopped=${stopped} purged=${purged} mode=${want || '-'} name=${(meta && meta.name) || ''}`, fileErr ? 'err=' + fileErr : '')
+    boot('remove', gid, `stopped=${stopped} mode=${want || '-'} name=${(meta && meta.name) || ''}`, fileErr ? 'err=' + fileErr : '')
 
-    /* 只要 aria2 的结果清掉了就算成功；停不掉也没关系（本来就已停止） */
+    /* 只要引擎那边没抛（本地引擎 remove 成功 / aria2 的 remove 与清结果都走完）就算摘干净了 */
     return {
-      ok: (purged || stopped) && !fileErr,
+      ok: stopped && !fileErr,
       moved: !!moved,
       wiped,
       name: (moved && moved.name) || (meta && meta.name) || '',
@@ -1830,13 +1933,21 @@ ipcMain.handle('downloads:remove', async (_e, gid, mode) => {
   })
 
   ipcMain.handle('downloads:pauseAll', () =>
-    Promise.all([aria2.pauseAll().catch(() => {}), seg.pauseAll().catch(() => {})]).then(() => {
+    Promise.all([
+      aria2.pauseAll().catch(() => {}),
+      seg.pauseAll().catch(() => {}),
+      hls.pauseAll().catch(() => {}),
+    ]).then(() => {
       tasks.kick()
       return true
     }),
   )
   ipcMain.handle('downloads:resumeAll', () =>
-    Promise.all([aria2.unpauseAll().catch(() => {}), seg.unpauseAll().catch(() => {})]).then(() => {
+    Promise.all([
+      aria2.unpauseAll().catch(() => {}),
+      seg.unpauseAll().catch(() => {}),
+      hls.unpauseAll().catch(() => {}),
+    ]).then(() => {
       tasks.kick()
       return true
     }),
@@ -1931,10 +2042,11 @@ async function applyRuntimeSettings(before, after) {
     trash.setRetention(after.trashRetentionDays)
     purgeTrash('settings')
   }
-  /* 「同时下载数」也要管住分段引擎：aria2 在上面走 changeGlobalOption，它有原生队列；
-     分段引擎有自己的队列（seg.setLimit），改了上限立刻把排队中的任务放出去。 */
+  /* 「同时下载数」也要管住本地引擎：aria2 在上面走 changeGlobalOption，它有原生队列；
+     分段引擎与 HLS 引擎各有自己的队列（setLimit），改了上限立刻把排队中的任务放出去。 */
   if (Number(after.maxConcurrent) !== Number(before.maxConcurrent)) {
     seg.setLimit(after.maxConcurrent)
+    hls.setLimit(after.maxConcurrent)
   }
 }
 
@@ -1996,7 +2108,9 @@ function isNewer(a, b) {
 function checkUpdate(manual) {
   return new Promise((resolve) => {
     const current = app.getVersion()
-    const req = https.request(
+    /* ⚠️ 别叫 req：上面第 18 行从 parsers/util 引进来的 req() 是同名的模块级函数，
+     * 在这里遮蔽它，以后有人在函数里调 req(url, …) 会去调这个 ClientRequest，报错还很难看懂。 */
+    const httpReq = https.request(
       {
         hostname: 'api.github.com',
         path: `/repos/${UPDATE_REPO}/releases/latest`,
@@ -2009,7 +2123,7 @@ function checkUpdate(manual) {
         res.setEncoding('utf8')
         res.on('data', (c) => {
           body += c
-          if (body.length > 512 * 1024) req.destroy()
+          if (body.length > 512 * 1024) httpReq.destroy()
         })
         res.on('end', () => {
           if (res.statusCode !== 200) {
@@ -2036,13 +2150,13 @@ function checkUpdate(manual) {
         })
       },
     )
-    req.on('timeout', () => {
-      req.destroy(new Error('请求超时'))
+    httpReq.on('timeout', () => {
+      httpReq.destroy(new Error('请求超时'))
     })
-    req.on('error', (e) => {
+    httpReq.on('error', (e) => {
       resolve({ ok: false, current, message: (e && e.message) || String(e) })
     })
-    req.end()
+    httpReq.end()
   })
 }
 
@@ -2180,8 +2294,9 @@ if (!gotLock) {
     const trashTimer = setInterval(() => purgeTrash('timer'), 6 * 60 * 60 * 1000)
     if (trashTimer.unref) trashTimer.unref()
 
-    /* 分段引擎的并发上限跟着设置走（0/非法值 = 不限，保留旧行为） */
+    /* 本地引擎的并发上限跟着设置走（0/非法值 = 不限，保留旧行为） */
     seg.setLimit(settings.load().maxConcurrent)
+    hls.setLimit(settings.load().maxConcurrent)
 
     /* 开机自启动：每次启动都把登录项跟设置对齐一次（用户在别处删了登录项也能补回来） */
     applyAutoStart(settings.load())
@@ -2204,6 +2319,8 @@ if (!gotLock) {
       }
     }, 4000)
 
+    /* 上一次记进 boot 日志的队列条数（见 tasks-update 那条去重） */
+    let lastListCount = -1
     tasks.on('update', (list) => {
       /* ⚠️ 这个回调里抛出的异常会顺着 emit 冒进 taskManager 的 _tick()，
        * 把这一轮算好的列表整个丢掉（界面就停在旧列表，看起来像「队列永远是 0」）。
@@ -2223,8 +2340,14 @@ if (!gotLock) {
       } catch (e) {
         boot('update-handler-err', 'send ' + ((e && e.message) || String(e)))
       }
-      /* 队列条数记一笔：以后有人报「队列是空的」，看日志就能分清是没算出来还是没送到界面 */
-      boot('tasks-update', 'n=' + (Array.isArray(list) ? list.length : -1))
+      /* 队列条数记一笔：以后有人报「队列是空的」，看日志就能分清是没算出来还是没送到界面。
+       * 只在**条数变化**时写：这条日志的意义就是「算出来的条数是多少」，
+       * 而下载中每 800ms 进度都在变、指纹一定会变，不去重就是每 800ms 一次同步落盘。 */
+      const nList = Array.isArray(list) ? list.length : -1
+      if (nList !== lastListCount) {
+        lastListCount = nList
+        boot('tasks-update', 'n=' + nList)
+      }
     })
 
     /* 下载完成 → 回收转存副本，别让用户网盘里堆 `xxx(1).zip`；顺便按需打开下载目录。
@@ -2307,8 +2430,11 @@ if (!gotLock) {
     e.preventDefault()
     shutdownDone = true
     tasks.stop()
-    /* 分段引擎要把断点信息落盘、关掉文件句柄，下次启动才能接着下 */
+    /* 本地引擎要把断点信息落盘、关掉文件句柄，下次启动才能接着下 */
     await seg.flush().catch(() => {})
+    await hls.flush().catch(() => {})
+    /* 元信息是攒着写的（见 taskManager._scheduleMetaSave），退出前一定要落一次 */
+    tasks.flushMeta()
     await bridge.stop().catch(() => {})
     await aria2.stop().catch(() => {})
     boot('quit', 'cleanup done')

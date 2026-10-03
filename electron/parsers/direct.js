@@ -63,6 +63,9 @@ module.exports = {
           size,
           isDir: false,
           dir: '',
+          /* 探到的响应类型要带出去：主进程靠它判断这条是不是 HLS 播放列表
+           * （地址没后缀时后缀与类型是仅有的线索，见 main.js 的 playlistKind）。 */
+          mime: ct,
         },
       ],
       resolve: async () => ({ url, headers }),

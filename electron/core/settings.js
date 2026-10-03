@@ -314,7 +314,9 @@ function load() {
         cookies: { ...base.cookies, ...(raw.cookies || {}) },
         segConnections: seg,
       }
-      if (migrated) save({}) /* 落盘一次，之后不再重复判断（用户再改回 96 也不会被覆盖） */
+      /* 落盘一次，把 settingsRev 记下来，之后不再重复判断（用户再改回 96 也不会被覆盖）。
+       * 写盘失败不拦着启动（内存里已经按新 rev 跑了），但别把失败咽掉：下一次启动还会再迁一遍。 */
+      if (migrated && !save({}).ok) console.warn('[settings] 配置迁移没能落盘，下次启动会再迁一次')
     } else {
       cache = { ...base, settingsRev: SETTINGS_REV }
     }

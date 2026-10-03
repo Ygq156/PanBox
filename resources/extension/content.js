@@ -35,16 +35,27 @@
   })()
 
   /* 扩展被重新加载后，旧页面里的内容脚本会失去上下文 —— 那时所有 chrome.* 调用
-   * 都会抛 "Extension context invalidated"。统一在这里挡掉。 */
+   * 都会抛 "Extension context invalidated"。统一在这里挡掉。
+   * 还要加超时：refresh() 靠一个 busy 标志防重入，回复永远不来时 busy 会一直挂着，
+   * 面板从此再也不刷新（用户只看到一份再也不动的列表）。 */
   function ask(msg) {
     return new Promise((resolve) => {
+      let done = false
+      const finish = (v) => {
+        if (done) return
+        done = true
+        resolve(v || null)
+      }
+      const timer = setTimeout(() => finish(null), 8000)
       try {
         chrome.runtime.sendMessage(msg, (r) => {
+          clearTimeout(timer)
           void chrome.runtime.lastError
-          resolve(r || null)
+          finish(r)
         })
       } catch {
-        resolve(null)
+        clearTimeout(timer)
+        finish(null)
       }
     })
   }
@@ -153,6 +164,10 @@
     if (/^application\/(vnd\.ms-powerpoint)/i.test(c)) return 'ppt'
     if (/^application\/(vnd\.openxmlformats-officedocument\.presentationml\.presentation)/i.test(c)) return 'pptx'
     if (/^application\/(x-iso9660-image)/i.test(c)) return 'iso'
+    /* 下载入口（蓝奏那类藏在 `/fn?TOKEN` 页里的分享入口）**不是文件**：
+     * 名字要等 PanBox 打开分享页才知道，这里硬猜一个后缀只会让面板显示
+     * 「fn.bin」这种假名字，所以宁可留空。 */
+    if (kind === 'entry') return ''
     return KIND_EXT[kind] || 'bin'
   }
 
@@ -195,7 +210,8 @@
     n = n.replace(/\.[a-z0-9]{1,6}$/i, '')
     if (!n) n = 'download'
     if (n.length > 70) n = n.slice(0, 70)
-    return n + '.' + ext
+    /* ext 为空 = 「还不知道是什么文件」（见 pickExt 的 entry 分支），别拼出 `名字.` */
+    return ext ? n + '.' + ext : n
   }
 
   function fmtSize(n) {
@@ -775,8 +791,11 @@
           if (merged.length >= 200) break
         }
         /* 直接能下的整段视频排最前（并按体积降序），别让几十个 3KB 的 MSE 分片
-         * 把抖音/B 站那个真正要下的文件淹掉。 */
-        const rank = { media: 0, stream: 1, segment: 2, file: 3 }
+         * 把抖音/B 站那个真正要下的文件淹掉。
+         * ⚠️ 这张表必须和后台 `mediaListView` 里那张**逐项一致**：`entry`（下载入口，
+         * 蓝奏那类站点的真身在 `/fn?TOKEN` 页里）后台给的是 -1、排最前，这里以前漏了
+         * entry，落到 `?? 9` 就成了**排最后** —— 面板把最该点的入口压到两百条底下。 */
+        const rank = { entry: -1, media: 0, stream: 1, segment: 2, file: 3 }
         merged.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || (b.size || 0) - (a.size || 0))
         items = merged
 
@@ -887,17 +906,32 @@
     /* 常驻轮询：不管面板开着还是收起，都对一次网络媒体列表 + 看看地址有没有变。
      * v1.1.0 只在面板展开时每 5 秒刷一次，于是「网页换了内容面板却不刷新」。
      * 面板没展开时没人盯着看，就不必那么勤 —— 4 秒一次足够，也少一点页面里
-     * 的定时开销（列表内容没变时 render 不会再动 DOM）。 */
-    setInterval(
-      () => {
-        if (location.href !== lastHref) {
-          lastHref = location.href
-          onNavigateSoon()
-          return
+     * 的定时开销（列表内容没变时 render 不会再动 DOM）。
+     *
+     * 用「每轮自己排下一次」的 setTimeout 而不是 setInterval：间隔要看**当前**展开状态，
+     * 而 setInterval 的周期在建立时就定死了 —— 之前写成 `open ? 2000 : 4000`，
+     * 展开面板永远不会变勤。顺带每轮都摸一次 DOM，用户没在看的面板少跑一半。 */
+  let pollTimer = 0
+  const poll = () => {
+    pollTimer = setTimeout(() => {
+      try {
+        if (!document.hidden || open) {
+          if (location.href !== lastHref) {
+            lastHref = location.href
+            onNavigateSoon()
+          } else {
+            refresh(false, { dom: false })
+          }
         }
-        refresh(false, { dom: false })
-      },
-      open ? 2000 : 4000,
-    )
+      } finally {
+        /* 用 finally 排下一轮：中间万一抛了，轮询也不会就此断掉 */
+        poll()
+      }
+    }, open ? 2000 : 4000)
   }
+  poll()
+  /* 标签页关掉/插件卸载时收掉定时器：不然每开过一个页面的 iframe 都留一个
+   * 永不回头的定时器（MV3 的 worker 也就一直收不回去）。 */
+  window.addEventListener('pagehide', () => clearTimeout(pollTimer), { once: true })
+}
 })()
