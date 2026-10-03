@@ -3,32 +3,43 @@ import type { ReactNode } from 'react'
 import { api, formatEta, formatSize, formatSpeed } from './api'
 import type { AppInfo, BridgeStatus, ProxyStatus, TrashItem, UpdateInfo, UpdateState } from './api'
 import type { Aria2Status, DownloadTask, ParseEndpoint, ParseResult, Settings } from './types'
+import siteTable from '../electron/parsers/sites.json'
 
 /* ------------------------------------------------------------------ */
 /* 常量                                                                */
 /* ------------------------------------------------------------------ */
 
-const NETDISK_LABEL: Record<string, string> = {
-  lanzou: '蓝奏云',
-  ilanzou: '蓝奏云优享版',
-  quark: '夸克网盘',
-  uc: 'UC网盘',
-  baidu: '百度网盘',
-  xunlei: '迅雷云盘',
-  '123pan': '123云盘',
-  direct: '直链',
-  unknown: '未知',
+/* 站点表：一个站点「叫什么、能干什么」只写这一份（electron/parsers/sites.json），
+ * 主进程与界面都读它。以前这套清单在本文件里有四份（名字、能登录、能手贴凭证、
+ * 能配解析接口），主进程里还有两份（分享链接、认得出但没实现），加一个站要改六处。 */
+type SiteInfo = {
+  label: string
+  share?: boolean
+  supported?: boolean
+  login?: boolean
+  cookie?: boolean
+  endpoint?: boolean
+  seg?: boolean
 }
+const SITES = siteTable.sites as Record<string, SiteInfo>
+const byFlag = (flag: keyof SiteInfo) =>
+  Object.entries(SITES)
+    .filter(([, v]) => v[flag])
+    .map(([k]) => k)
+
+const NETDISK_LABEL: Record<string, string> = Object.fromEntries(
+  Object.entries(SITES).map(([k, v]) => [k, v.label]),
+)
 
 const label = (k: string) => NETDISK_LABEL[k] ?? k
 
 /** 能一键开登录窗抓凭证的网盘，同时也是「网盘账号」下拉的顺序 */
-const LOGIN_TARGETS = ['baidu', 'quark', 'uc', 'xunlei']
+const LOGIN_TARGETS = byFlag('login')
 /* 主进程把凭证打码后才发到界面（防止页面脚本读到原文）。这个串表示「本机已有一份，
  * 界面不回显」——保存时原样传回去，主进程认这个串就保留磁盘上那份。 */
 const COOKIE_MASK = '__PANBOX_KEEP__'
 /** 只能手贴凭证的网盘 */
-const COOKIE_TARGETS = [...LOGIN_TARGETS, 'lanzou', '123pan']
+const COOKIE_TARGETS = [...byFlag('login'), ...byFlag('cookie')]
 
 /** 键顺序无关的 JSON（比「有没有改动」用；两侧对象是不同地方拼出来的，键顺序不保证一致） */
 function stableJson(v: unknown): string {
@@ -44,10 +55,10 @@ function stableJson(v: unknown): string {
 }
 
 /** 走自研分段引擎的网盘。百度不在此列 —— 它是账号级总量限速，加连接只会招 403。 */
-const SEG_TARGETS = ['quark', 'uc', 'direct']
+const SEG_TARGETS = byFlag('seg')
 
 /** 「解析接口」可以勾选的网盘（顶层域名会被自动识别成这些代号） */
-const EP_NETDISKS = ['lanzou', 'ilanzou', 'quark', 'uc', 'baidu', 'xunlei', '123pan', 'direct']
+const EP_NETDISKS = byFlag('endpoint')
 
 /** 解析成功后，结果面板底下的一句话提示（原来每个网盘一段 if，现在一张表） */
 const NETDISK_TIP: Record<string, { warn?: boolean; text: string }> = {

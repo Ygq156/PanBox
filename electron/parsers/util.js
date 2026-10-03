@@ -328,40 +328,25 @@ async function reqJson(url, opts = {}) {
 /* 网盘识别                                                            */
 /* ------------------------------------------------------------------ */
 
-const LANZOU_HOSTS = [
-  'lanzou', 'lanzo', 'lanzn', 'lanzv', 'lanosso', 'lanpv', 'lanwp', 'bakstotre',
-  'ulanzou', 'woozooo', 'dmpdmp', 'lanrar', 'webgetstore', 'lanzoui', 'lanzoux',
-  'lanzouw', 'lanzoue', 'lanzoup', 'lanzoub', 'lanzouc', 'lanzouf', 'lanzoug',
-  'lanzouh', 'lanzouj', 'lanzouk', 'lanzoul', 'lanzoum', 'lanzoun', 'lanzouo',
-  'lanzouq', 'lanzour', 'lanzous', 'lanzout', 'lanzouu', 'lanzouv', 'lanzouy',
-  'lanzouz', 't-is.cn',
-]
+/* 站点表（sites.json）是「一个站点怎么认、能干什么」的唯一出处：
+ * 这里只把它的 match 串编译成正则、按 detect 的先后排好（谁先匹配到算谁的）。 */
+const SITES = require('./sites.json')
 
-const MATCHERS = [
-  { netdisk: 'baidu', re: /(pan\.baidu\.com|yun\.baidu\.com|eyun\.baidu\.com)/i },
-  { netdisk: 'xunlei', re: /(pan\.xunlei\.com|pan-thunder\.com|(^|\/\/)xunlei\.com\/s\/)/i },
-  { netdisk: 'ilanzou', re: /(www\.)?ilanzou\.com/i },
-  /* 蓝奏分享页里的**下载入口**（`/fn?TOKEN` 那条 iframe 的地址）。用户从浏览器里
-   * 把它粘过来时也得认成蓝奏云，而不是掉进「兜底当直链」——它不是文件本体，是一条页。 */
-  { netdisk: 'lanzou', re: /^https?:\/\/[^/?#]+\/fn\?/i },
-  { netdisk: 'quark', re: /(pan\.quark\.cn|drive-pc\.quark\.cn|quark\.cn)/i },
-  { netdisk: 'uc', re: /((fast|drive|pc-api)\.uc\.cn|\buc\.cn\/s\/)/i },
-  { netdisk: 'aliyun', re: /(aliyundrive\.com|alipan\.com)/i },
-  /* 下面是「认得出域名、但没有实现解析器」的网盘。它们出现在 MATCHERS 里**只为**让
-   * pickParser 命中 index.js 的 KNOWN_UNSUPPORTED 分支，回一句「暂不支持××」；
-   * 不列的话会掉进「兜底当直链」分支，拿分享页 URL 去 HEAD，给用户一个莫名其妙的结果。 */
-  { netdisk: 'tianyi', re: /(cloud\.189\.cn|189\.cn\/t\/)/i },
-  { netdisk: 'yidong', re: /(caiyun\.139\.com|139\.com\/m\/i)/i },
-  { netdisk: 'pan115', re: /(115\.com|115cdn\.com|anxia\.com)/i },
-  { netdisk: 'weiyun', re: /(share\.weiyun\.com|weiyun\.com)/i },
-  { netdisk: '123pan', re: /(123pan\.com|123pan\.cn|123panpay\.com|123684\.com|123865\.com|123912\.com|123592\.com)/i },
-  /* 论文站：不是网盘，但同样「一条页面地址要换算成一条文件地址」，
-   * 靠 MATCHERS 认出来才能派给各自的解析器（见 mdpi.js / ssrn.js 顶部注释）。
-   * 域名的边界要卡住：`mdpi.com` 后面只能是 `/ ? #` 或结尾，否则
-   * `notmdpi.com` / `mdpi.com.evil.com` 这种也会被认成它（这是**真的**踩过的坑）。 */
-  { netdisk: 'mdpi', re: /(^|\.)mdpi\.com(?=[/:?#]|$)/i },
-  { netdisk: 'ssrn', re: /(^|\.)ssrn\.com(?=[/:?#]|$)/i },
-]
+/* 两个容易踩的点，改表时别忘：
+ * ① 蓝奏分享页里的**下载入口**（`/fn?TOKEN` 那条 iframe）要认成蓝奏云，不能掉进
+ *    「兜底当直链」——它不是文件本体，是一条页。
+ * ② 论文站（mdpi / ssrn）域名的边界必须卡住：`mdpi.com` 后面只能是 `/ ? #` 或结尾，
+ *    否则 `notmdpi.com` / `mdpi.com.evil.com` 也会被认成它（这是**真的**踩过的坑）。
+ * ③ 认得出域名、但没实现解析器的网盘（阿里云盘等）也必须在表里：漏了就会掉进
+ *    「兜底当直链」，拿分享页地址去 HEAD，给用户一个莫名其妙的结果。 */
+const MATCHERS = SITES.detect.map((netdisk) => {
+  const s = SITES.sites[netdisk]
+  if (!s || !s.match) throw new Error(`sites.json 里 ${netdisk} 没有 match，却在 detect 名单里`)
+  return { netdisk, re: new RegExp(s.match, 'i') }
+})
+
+/** 蓝奏云换过无数次域名，认不出来就按主机名里的一小段特征兜 —— 这份名单也在站点表里。 */
+const LANZOU_HOSTS = (SITES.sites.lanzou && SITES.sites.lanzou.hosts) || []
 
 function detectNetdisk(url) {
   const u = String(url || '').trim()

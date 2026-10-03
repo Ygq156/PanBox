@@ -31,10 +31,20 @@ const PARSERS = {
   custom,
 }
 
-/** 真的是「网盘分享链接」的那些站点：只能叫窗口出来让用户勾选，不能当直链下。
- *  mdpi / ssrn 这类**论文站**不在此列 —— 它们虽然是专门解析器，但一条地址就是
- *  一个文件，走「加入下载队列」那条路（BRIDGE_DIRECT 用的就是下面这个集合）。 */
-const SHARE_NETDISKS = new Set(['lanzou', 'ilanzou', 'quark', 'uc', '123pan', 'baidu', 'xunlei', 'aliyun', 'tianyi', 'yidong', 'pan115', 'weiyun', 'custom'])
+/* 站点清单只在 sites.json 里写一份（界面也读它），这里按需要筛出几个视图：
+ *  share=true 的是「真·网盘分享链接」—— 只能叫窗口出来让用户勾选，不能当直链下。
+ *  mdpi / ssrn 这类**论文站**不算：它们虽然是专门解析器，但一条地址就是一个文件，
+ *  走「加入下载队列」那条路（BRIDGE_DIRECT 用的就是下面这个集合）。
+ *  share 且 supported=false 的是「认得出域名、还没实现」的网盘（阿里云盘等）。 */
+const SITES = require('./sites.json').sites
+const ENTRIES = Object.entries(SITES)
+
+const SHARE_NETDISKS = new Set(ENTRIES.filter(([, v]) => v.share).map(([k]) => k))
+const KNOWN_UNSUPPORTED = Object.fromEntries(
+  ENTRIES.filter(([, v]) => v.share && !v.supported).map(([k, v]) => [k, v.label]),
+)
+/** 这句话给用户看的是「当前支持什么」，所以直接由站点表拼出来 —— 加一个站不用再改文案 */
+const SUPPORTED_LABELS = ENTRIES.filter(([, v]) => v.supported).map(([, v]) => v.label)
 
 /** 会话缓存：解析出来的目录树和「取直链」闭包留在主进程，渲染层只拿到可序列化的部分 */
 const sessions = new Map()
@@ -70,17 +80,6 @@ function gc() {
       .slice(0, sessions.size - SESSION_MAX)
     for (const [k] of oldest) sessions.delete(k)
   }
-}
-
-/* 已经认得出域名、但**没有实现**解析器的网盘。
- * 必须在这里显式拦掉，否则会被下面的「兜底当直链」分支接手，
- * 拿分享页 URL 去 HEAD 一番，给用户一个莫名其妙的结果。 */
-const KNOWN_UNSUPPORTED = {
-  aliyun: '阿里云盘',
-  tianyi: '天翼云盘',
-  yidong: '移动云盘',
-  pan115: '115 网盘',
-  weiyun: '腾讯微云',
 }
 
 function pickParser(url) {
@@ -121,7 +120,7 @@ async function parseShare({ text, password, settings }) {
         netdisk: 'unknown',
         files: [],
         source: url,
-        message: `暂不支持${hit.unsupported}：这个网盘的解析器还没实现（本项目当前支持蓝奏云 / 蓝奏优享 / 夸克 / UC / 百度 / 迅雷 / 123云盘 / 直链）。`,
+        message: `暂不支持${hit.unsupported}：这个网盘的解析器还没实现（本项目当前支持 ${SUPPORTED_LABELS.join(' / ')}）。`,
       })
       continue
     }

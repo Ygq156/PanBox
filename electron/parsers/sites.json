@@ -1,0 +1,145 @@
+{
+  "_": [
+    "站点表：一个站点的「叫什么、怎么认、能干什么」只写在这里，主进程与界面都读这一份。",
+    "sites 的键序 = 界面上的显示顺序；detect 的数组序 = 认站点时的先后（先匹配到的算数）。",
+    "share=分享链接（要开窗口勾选，不能当直链下）；supported=解析器已实现；",
+    "login=能一键开登录窗；cookie=只能手贴凭证；endpoint=可配「解析接口」；seg=走自研分段引擎。"
+  ],
+  "detect": [
+    "baidu",
+    "xunlei",
+    "ilanzou",
+    "lanzou",
+    "quark",
+    "uc",
+    "aliyun",
+    "tianyi",
+    "yidong",
+    "pan115",
+    "weiyun",
+    "123pan",
+    "mdpi",
+    "ssrn"
+  ],
+  "sites": {
+    "baidu": {
+      "label": "百度网盘",
+      "share": true,
+      "supported": true,
+      "login": true,
+      "endpoint": true,
+      "match": "(pan\\.baidu\\.com|yun\\.baidu\\.com|eyun\\.baidu\\.com)"
+    },
+    "quark": {
+      "label": "夸克网盘",
+      "share": true,
+      "supported": true,
+      "login": true,
+      "endpoint": true,
+      "seg": true,
+      "match": "(pan\\.quark\\.cn|drive-pc\\.quark\\.cn|quark\\.cn)"
+    },
+    "uc": {
+      "label": "UC网盘",
+      "share": true,
+      "supported": true,
+      "login": true,
+      "endpoint": true,
+      "seg": true,
+      "match": "((fast|drive|pc-api)\\.uc\\.cn|\\buc\\.cn/s/)"
+    },
+    "xunlei": {
+      "label": "迅雷云盘",
+      "share": true,
+      "supported": true,
+      "login": true,
+      "endpoint": true,
+      "match": "(pan\\.xunlei\\.com|pan-thunder\\.com|(^|//)xunlei\\.com/s/)"
+    },
+    "lanzou": {
+      "label": "蓝奏云",
+      "share": true,
+      "supported": true,
+      "cookie": true,
+      "endpoint": true,
+      "match": "^https?://[^/?#]+/fn\\?",
+      "hosts": [
+        "lanzou", "lanzo", "lanzn", "lanzv", "lanosso", "lanpv", "lanwp", "bakstotre",
+        "ulanzou", "woozooo", "dmpdmp", "lanrar", "webgetstore", "lanzoui", "lanzoux",
+        "lanzouw", "lanzoue", "lanzoup", "lanzoub", "lanzouc", "lanzouf", "lanzoug",
+        "lanzouh", "lanzouj", "lanzouk", "lanzoul", "lanzoum", "lanzoun", "lanzouo",
+        "lanzouq", "lanzour", "lanzous", "lanzout", "lanzouu", "lanzouv", "lanzouy",
+        "lanzouz", "t-is.cn"
+      ]
+    },
+    "ilanzou": {
+      "label": "蓝奏云优享版",
+      "share": true,
+      "supported": true,
+      "endpoint": true,
+      "match": "(www\\.)?ilanzou\\.com"
+    },
+    "123pan": {
+      "label": "123云盘",
+      "share": true,
+      "supported": true,
+      "cookie": true,
+      "endpoint": true,
+      "match": "(123pan\\.com|123pan\\.cn|123panpay\\.com|123684\\.com|123865\\.com|123912\\.com|123592\\.com)"
+    },
+    "direct": {
+      "label": "直链",
+      "supported": true,
+      "endpoint": true,
+      "seg": true
+    },
+    "custom": {
+      "label": "自备解析站",
+      "share": true,
+      "supported": true
+    },
+    "aliyun": {
+      "label": "阿里云盘",
+      "share": true,
+      "supported": false,
+      "match": "(aliyundrive\\.com|alipan\\.com)"
+    },
+    "tianyi": {
+      "label": "天翼云盘",
+      "share": true,
+      "supported": false,
+      "match": "(cloud\\.189\\.cn|189\\.cn/t/)"
+    },
+    "yidong": {
+      "label": "移动云盘",
+      "share": true,
+      "supported": false,
+      "match": "(caiyun\\.139\\.com|139\\.com/m/i)"
+    },
+    "pan115": {
+      "label": "115 网盘",
+      "share": true,
+      "supported": false,
+      "match": "(115\\.com|115cdn\\.com|anxia\\.com)"
+    },
+    "weiyun": {
+      "label": "腾讯微云",
+      "share": true,
+      "supported": false,
+      "match": "(share\\.weiyun\\.com|weiyun\\.com)"
+    },
+    "mdpi": {
+      "label": "MDPI",
+      "supported": true,
+      "match": "(^|\\.)mdpi\\.com(?=[/:?#]|$)"
+    },
+    "ssrn": {
+      "label": "SSRN",
+      "supported": true,
+      "match": "(^|\\.)ssrn\\.com(?=[/:?#]|$)"
+    },
+    "unknown": {
+      "label": "未知"
+    }
+  }
+}

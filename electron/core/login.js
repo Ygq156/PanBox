@@ -1,7 +1,7 @@
 'use strict'
 
 /**
- * 内置登录窗口：为需要凭证的网盘（夸克 / UC / 百度）打开一个独立分区的浏览器窗口，
+ * 内置登录窗口：为需要凭证的网盘（夸克 / UC / 百度 / 迅雷）打开一个独立分区的浏览器窗口，
  * 用户在里面正常登录（扫码或账号密码），登录完成后：
  *   - 命中该网盘的登录态 cookie 特征 → 自动收下并关闭；
  *   - 用户手动关闭窗口 → 也照样收下当前分区里的 cookie（容错路径）。
@@ -184,7 +184,7 @@ async function harvestCookies(ses, site) {
 }
 
 /**
- * @param {'quark'|'uc'|'baidu'} netdisk
+ * @param {'quark'|'uc'|'baidu'|'xunlei'} netdisk
  * @param {BrowserWindow|null} parent
  * @returns {Promise<{ok:boolean, cookie?:string, count?:number, message?:string}>}
  */
@@ -317,7 +317,7 @@ const warmedAt = new Map()
  * 让网盘首页把短效令牌重新种进登录分区，然后回收完整 cookie。
  * 令牌还足够新时直接返回，不打开窗口。
  *
- * @param {'quark'|'uc'|'baidu'} netdisk
+ * @param {'quark'|'uc'|'baidu'|'xunlei'} netdisk
  * @param {{force?:boolean}} [opts]
  * @returns {Promise<null|{header:string, list:any[], loggedIn:boolean, refreshed:boolean}>}
  */
