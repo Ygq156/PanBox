@@ -279,25 +279,17 @@ class Aria2 {
     return this.rpc('aria2.removeDownloadResult', [gid])
   }
 
-  purgeDownloadResult() {
-    return this.rpc('aria2.purgeDownloadResult').catch(() => null)
-  }
-
   changeGlobalOption(opts) {
     return this.rpc('aria2.changeGlobalOption', [opts])
   }
 
-  /** 换掉某个任务的下载地址（fileIndex 从 1 开始）。用于「直链过期 / 想换节点」时重新解析。 */
-  changeUri(gid, fileIndex, delUris = [], addUris = [], position = 1) {
-    const params = [gid, fileIndex, delUris, addUris]
-    if (addUris.length && (delUris.length || position > 1)) params.push(position)
-    return this.rpc('aria2.changeUri', params)
-  }
-
-  /** 改单个任务的选项（header / user-agent 等） */
-  changeOption(gid, opts) {
-    return this.rpc('aria2.changeOption', [gid, opts])
-  }
+  /* 这里原来还有 purgeDownloadResult / changeUri / changeOption 三个包装。
+   * 全仓没有调用者，删掉了：
+   *   - purgeDownloadResult 会清掉**所有**已停止的结果，粒度太粗（我们按 gid 清，见上）；
+   *   - changeUri 本机实测（aria2 1.37）会对正在下载的任务把 aria2 进程搞失联，
+   *     所以「换直链」一律走「移除 + 重新加入」（见 main.js 的 readdTask）；
+   *   - changeOption 用不上 —— 加任务时就把 header/UA 给全了。
+   * 留着只会诱使后来的人走那条已经踩过坑的路。 */
 
   /**
    * 把任务在队列里挪位置（插队用）。

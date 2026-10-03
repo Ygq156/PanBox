@@ -16,6 +16,9 @@
 
 const DEFAULT_PORT = 7799
 const BADGE_MS = 2500
+/* 与 PanBox 说话的每次请求上限。必须比 PanBox 自己「解析站点 + 入队」的耗时长一点
+ * （论文站要绕一次站点取新地址），但绝不允许无限等 —— 见 raw() 的注释。 */
+const RAW_TIMEOUT = 15000
 
 const cfg = { port: DEFAULT_PORT, token: '', intercept: true, panel: true }
 
@@ -145,8 +148,22 @@ function base() {
   return `http://127.0.0.1:${cfg.port}`
 }
 
+/**
+ * 和 PanBox 说话的唯一出口。
+ *
+ * ⚠️ **必须带超时**。没有超时时，一个「还在跑但不应答」的 PanBox（主进程卡住、
+ * 端口被别的进程占着不放）会让这个 fetch 一直挂着 —— 而 onCreated 那条路是
+ * 先 `await chrome.downloads.cancel()` 再投递的，挂住就意味着**用户的下载被取消了，
+ * 而且永远不会还回去**（全插件唯一会丢用户数据的地方）。超时后走正常的失败分支，
+ * 下载会原样交还给浏览器。
+ */
 async function raw(path, init) {
-  const res = await fetch(base() + path, { cache: 'no-store', ...(init || {}) })
+  const opt = { cache: 'no-store', ...(init || {}) }
+  /* AbortSignal.timeout 在 MV3 的 worker 里有；万一没有（老内核）就退回手写定时器 */
+  if (!opt.signal && typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+    opt.signal = AbortSignal.timeout(RAW_TIMEOUT)
+  }
+  const res = await fetch(base() + path, opt)
   const text = await res.text()
   let json = null
   try {
@@ -308,8 +325,13 @@ async function handOver(items, info) {
   /* 投递之前，先把「这一页此刻的浏览器身份」交给 PanBox（不等它返回）。
    * 有些站点（SSRN 这类 Cloudflare 挑战页）只认浏览器自己那份 cf_clearance，
    * 隔几分钟再点面板下载，PanBox 手上那条现场早就过期了 —— 每投递一次就先喂一次，
-   * 现场永远比旧的那份新。失败了也不影响投递本身。 */
-  sendCurrentPageContext(info).catch(() => {})
+   * 现场永远比旧的那份新。失败了也不影响投递本身。
+   *
+   * `info.ctxFresh`：调用方刚刚**自己**喂过一次现场（面板那几条路都是先
+   * `await deliverPageContext(tabId, …)` 再进来）。这时绝不能再喂一次 ——
+   * 理由不只是省一次 POST：这里重喂时 info 若没带 tabId 就会退回「当前活动标签页」，
+   * 于是**另一个标签页**的 cookie/UA/下载入口会把刚才那份正确现场盖掉。 */
+  if (!(info && info.ctxFresh)) sendCurrentPageContext(info).catch(() => {})
   let okCount = 0
   let last = null
   for (const it of items) {
@@ -324,6 +346,9 @@ async function handOver(items, info) {
       userAgent: it.ua || (seen.get(it.url) || {}).ua || navigator.userAgent,
       headers: page ? { Referer: page } : {},
       mime: it.ct || '',
+      /* 面板判出来的分类也带上：PanBox 靠它决定「这条要不要按流媒体协议下」。
+       * 地址没后缀、CDN 又不给类型时，这是唯一还能用的线索。 */
+      kind: it.kind || kindOfUrl(it.url, it.ct),
     })
     if (last && last.ok) okCount += 1
   }
@@ -779,6 +804,14 @@ function rememberMedia(tabId, url, ct, size, name, attach) {
 function dropTab(tabId) {
   mediaByTab.delete(tabId)
   frameItems.delete(tabId)
+  /* 下载入口（`/fn?TOKEN`）也是「属于这一页」的：标签关掉或换页之后那条入口
+   * 已经作废，留在表里只会被投递成失效地址。fnByTab 以前只增不减，
+   * 开一天浏览器会攒下几百个已经关掉的 tabId。 */
+  fnByTab.delete(tabId)
+  /* 删除也必须写回 session 存储：loadCaptured() 会在 worker 醒来时把上次写下的记录
+   * 再灌回来，只删内存的话标签页一关，这些记录下次唤醒就「复活」了 ——
+   * 面板会列出已经关掉的页面里的失效签名地址，投递时还会把它当备选直链。 */
+  scheduleSaveCaptured()
 }
 
 /* 面板看到的那份列表：这一页浏览器真的请求过的（媒体 + 文件）。
@@ -913,6 +946,8 @@ function notifyNavigated(tabId, clear) {
   if (clear) {
     mediaByTab.delete(tabId)
     frameItems.delete(tabId)
+    /* 同 dropTab：清内存不写回存储，SPA 换页后旧记录会从 session 里复活 */
+    scheduleSaveCaptured()
   }
   try {
     chrome.tabs.sendMessage(tabId, { type: 'panbox:navigated', clear: !!clear }).catch(() => {})
@@ -1050,7 +1085,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       /* 先把这一页的现场交过去（cookie / 真 UA / 下载入口），再投地址：
        * 只给一条地址的话，PanBox 手里没有能过反爬的东西，只能报「未找到下载入口」。 */
       const ctxR = await deliverPageContext(tabId, msg.referer || '', msg.title || '')
-      const r = await handOver(items, { pageUrl: msg.referer || '', pageTitle: msg.title || '' })
+      const r = await handOver(items, {
+        pageUrl: msg.referer || '',
+        pageTitle: msg.title || '',
+        tabId,
+        ctxFresh: true,
+      })
       return reply({
         ok: r.okCount > 0,
         count: r.okCount,
@@ -1067,14 +1107,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       const sTab = _sender && _sender.tab ? _sender.tab : null
       const tabId = msg.tabId != null ? msg.tabId : sTab ? sTab.id : -1
       await deliverPageContext(tabId, msg.referer || (sTab && sTab.url) || '', msg.title || '')
-      const r = await handOver([{ url: msg.url, name: baseName(msg.url) }], { pageUrl: msg.referer || '', pageTitle: msg.title || '' })
+      const r = await handOver([{ url: msg.url, name: baseName(msg.url) }], {
+        pageUrl: msg.referer || '',
+        pageTitle: msg.title || '',
+        tabId,
+        ctxFresh: true,
+      })
       return reply({ ok: r.okCount > 0, count: r.okCount, last: r.last })
     }
     if (msg.type === 'sendPage') {
       const [res] = await chrome.scripting.executeScript({ target: { tabId: msg.tabId }, func: collectFileLinks })
       const links = (res && res.result) || []
       if (!links.length) return reply({ ok: false, count: 0, message: '这一页没找到文件链接' })
-      const r = await handOver(links, { pageUrl: msg.referer || '', pageTitle: msg.title || '' })
+      const r = await handOver(links, { pageUrl: msg.referer || '', pageTitle: msg.title || '', tabId: msg.tabId })
       return reply({ ok: r.okCount > 0, count: r.okCount, last: r.last })
     }
     /* 把这一页的现场交给 PanBox：地址 + 该域（含子框架域）浏览器正在用的

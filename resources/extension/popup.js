@@ -8,8 +8,43 @@ function say(text, kind) {
   el.className = kind || ''
 }
 
-function ask(msg) {
-  return new Promise((resolve) => chrome.runtime.sendMessage(msg, resolve))
+/**
+ * 给后台发消息并等回复。
+ *
+ * 两种情况下 `chrome.runtime.sendMessage` 会**同步抛**（不是回调 undefined）：
+ * 后台没有监听者、或者扩展刚被重载 —— 不接住的话 `refresh()` 直接抛，
+ * 弹窗永远停在「正在检测 PanBox…」，用户看着像插件坏了。
+ * 回调那条路也可能永远不来，所以再挂一个兜底定时器。
+ *
+ * 超时按消息分档：`status/pair/set` 是本机一问一答（5 秒足够）；投递类要
+ * 逐条 POST，几十个文件能跑十几秒，给 60 秒 —— 分档是为了「不假死」，
+ * 不是为了催它，短超时用在投递上会让用户看到假的「投递失败」。
+ */
+const SLOW_MSGS = { sendPage: 1, sendUrls: 1, sendUrl: 1, pageContext: 1 }
+
+function ask(msg, timeoutMs) {
+  const limit = timeoutMs || (msg && SLOW_MSGS[msg.type] ? 60000 : 5000)
+  return new Promise((resolve) => {
+    let done = false
+    const finish = (v) => {
+      if (done) return
+      done = true
+      resolve(v)
+    }
+    const timer = setTimeout(() => finish(null), limit)
+    try {
+      chrome.runtime.sendMessage(msg, (r) => {
+        clearTimeout(timer)
+        /* 读一下 lastError：不读的话「扩展上下文失效」这类错误只在控制台里响 */
+        void chrome.runtime.lastError
+        finish(r)
+      })
+    } catch (e) {
+      clearTimeout(timer)
+      void e
+      finish(null)
+    }
+  })
 }
 
 async function activeTab() {

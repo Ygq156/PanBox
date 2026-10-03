@@ -75,8 +75,8 @@ export interface DownloadTask {
   errorMessage?: string
   connections?: number
   filesize?: number
-  /** 哪个引擎在跑：'aria2' 或 'seg'（自研分段下载器） */
-  engine?: 'aria2' | 'seg'
+  /** 哪个引擎在跑：'aria2' / 'seg'（自研分段下载器）/ 'hls'（HLS 边下边合） */
+  engine?: 'aria2' | 'seg' | 'hls'
   /** 实际出口：'direct' 直连 / 'proxy' 走系统代理（分段引擎探测后才知道） */
   route?: 'direct' | 'proxy' | ''
 }
