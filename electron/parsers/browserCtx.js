@@ -54,12 +54,12 @@ function set(payload) {
  * **完全另一家公司**的下载域上（蓝奏：分享页 lanrar.com、下载域 webgetstore.com），
  * 曾经这里要求 cookie 主机必须与页面主机「同站点」，于是这类下载域的现场被整条丢掉 ——
  * 表现就是「插件明明抓到了，PanBox 却像没看见」。 */
-const mapped = list
-  .map((c) => ({
-    host: String((c && c.host) || host).toLowerCase(),
-    cookie: String((c && c.cookie) || '').slice(0, MAX_COOKIE),
-  }))
-  .filter((c) => c.host && c.cookie)
+  const mapped = list
+    .map((c) => ({
+      host: String((c && c.host) || host).toLowerCase(),
+      cookie: String((c && c.cookie) || '').slice(0, MAX_COOKIE),
+    }))
+    .filter((c) => c.host && c.cookie)
   /* 一条 cookie 都没有时，只要这次还带来了「浏览器此刻的身份」（UA / Referer /
  * 请求头），也按本主机存一条空 cookie 的现场：下载域就是靠它才认得出「是同一个人」。 */
   if (!mapped.length && payload && payload.cookie) {

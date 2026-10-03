@@ -56,6 +56,10 @@ PanBox 自带的**分段引擎**开到 **96 连接**（0.8 → 4.4–5.3 MB/s）
   B 站 / YouTube 用 MSE，`<video>` 上是 `blob:` 地址，任何下载器都拿不到，面板会改列抓到的分片。
 - **接管浏览器下载**（默认开启）：浏览器里点任何下载都转进 PanBox；PanBox 没运行就放回浏览器。
 - 投递过来的是**网盘分享链接**时，PanBox 把链接预填进输入框，让你自己勾选。
+- 投递时插件还会把**当前页面的浏览器现场**（真 User-Agent、该主机自己的 cookie、浏览器那次的 Referer）
+  一并交给 PanBox：取分享页、文档、清关页时照着浏览器刚才是怎么发的发，反爬那关就不再靠逐站硬猜。
+  现场**只存在内存里、10 分钟不用就丢**，不写进任何配置或任务记录；**账号接口仍然只用设置里那份凭证** ——
+  浏览器里登录的可能是另一个账号，两套会话不混在一个请求里。
 
 ## 网络出口（下 GitHub / 境外资源必看）
 
@@ -104,9 +108,9 @@ npm run pack                             # 打包 NSIS + portable，产物在 re
 electron/                  主进程（CommonJS）
   main.js                  BrowserWindow + 全部 IPC + 转存副本回收
   preload.js               contextBridge → window.panbox
-  core/                    aria2 segmentDownloader taskManager settings login bridge proxy trash
-  parsers/                 index util esa esaSolve browserCtx lanzou ilanzou clouddrive
-                           quark uc pan123 baidu xunlei direct custom
+  core/                    aria2 segmentDownloader taskManager settings login bridge proxy trash netHosts
+  parsers/                 index sites.json util esa esaSolve browserCtx identity probe transferReclaim
+                           lanzou ilanzou clouddrive quark uc pan123 baidu xunlei mdpi ssrn direct custom
 src/                       渲染层（React + TS）
 resources/extension/       浏览器插件（MV3）
 resources/aria2/           aria2c.exe（自行下载，不入库）
