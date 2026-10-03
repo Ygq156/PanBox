@@ -95,7 +95,13 @@ class TaskManager extends EventEmitter {
     if (this.timer) return
     this.stopped = false
     const loop = async () => {
-      await this._tick().catch(() => {})
+      /* 这里以前是 `.catch(() => {})`：只要 _tick 抛一次（比如某个事件回调按名引用了
+       * 还没求值的 const），错误就没了痕迹，队列只是静悄悄地不再更新。现在留一条日志。 */
+      await this._tick().catch((e) => {
+        if (typeof global.__pbBoot === 'function') {
+          global.__pbBoot('tasks-tick-err', (e && e.message) || String(e), (e && e.stack ? String(e.stack).split('\n')[1] || '' : ''))
+        }
+      })
       if (this.stopped) return
       const busy = this.tasks.some((t) => t.status === 'active' || t.status === 'waiting')
       this.timer = setTimeout(loop, busy ? POLL_MS : IDLE_MS)
