@@ -1,23 +1,30 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, formatEta, formatSize, formatSpeed } from './api'
-import type { AppInfo, UpdateInfo, UpdateState } from './api'
+import type { AppInfo, UpdateState } from './api'
 import type { Aria2Status, DownloadTask, ParseResult, Settings } from './types'
-import { COOKIE_TARGETS, LOGIN_TARGETS, SEG_TARGETS, label } from './sites'
-import { NumBox, NumberRow, Row, Section, Switch, Tip } from './ui/parts'
+import { LOGIN_TARGETS, label } from './sites'
+import { Tip } from './ui/parts'
 import { errText } from './ui/text'
 import { mergeTasks } from './tasks'
-import { EndpointSection } from './settings/EndpointSection'
-import { ProxySection } from './settings/ProxySection'
-import { BridgeSection } from './settings/BridgeSection'
+import { HeaderBar } from './ui/HeaderBar'
+import { ConfirmRemoveModal } from './ui/ConfirmRemoveModal'
+import { ErrorPanel } from './ui/ErrorPanel'
+import { SET_TABS } from './settings/tabs'
+import type { TabId } from './settings/tabs'
+import { GeneralTab } from './settings/tabs/GeneralTab'
+import { DownloadTab } from './settings/tabs/DownloadTab'
+import { NetworkTab } from './settings/tabs/NetworkTab'
+import { AccountTab, COOKIE_MASK } from './settings/tabs/AccountTab'
+import { ExtensionTab } from './settings/tabs/ExtensionTab'
+import { UpdateTab } from './settings/tabs/UpdateTab'
+import type { UpdateCheckState } from './settings/tabs/UpdateTab'
+import { EndpointTab } from './settings/tabs/EndpointTab'
+import { AdvancedTab } from './settings/tabs/AdvancedTab'
 import { TrashModal } from './trash/TrashModal'
 
 /* ------------------------------------------------------------------ */
 /* 常量                                                                */
 /* ------------------------------------------------------------------ */
-
-/* 主进程把凭证打码后才发到界面（防止页面脚本读到原文）。这个串表示「本机已有一份，
- * 界面不回显」——保存时原样传回去，主进程认这个串就保留磁盘上那份。 */
-const COOKIE_MASK = '__PANBOX_KEEP__'
 
 /** 键顺序无关的 JSON（比「有没有改动」用；两侧对象是不同地方拼出来的，键顺序不保证一致） */
 function stableJson(v: unknown): string {
@@ -53,23 +60,6 @@ const NEED_LOGIN_TIP: Record<string, string> = {
 /* 设置弹窗：左侧分类导航 + 右侧一屏一组                                */
 /* ------------------------------------------------------------------ */
 
-/** 分类。组数与每屏条目数是照调研（lx-music / shadcn-admin / Motrix）定的：一屏放得下一组。 */
-const SET_TABS = [
-  { id: 'general', name: '通用' },
-  { id: 'download', name: '下载' },
-  { id: 'net', name: '网络' },
-  { id: 'account', name: '网盘账号' },
-  { id: 'ext', name: '浏览器插件' },
-  { id: 'update', name: '更新' },
-  { id: 'endpoint', name: '解析接口' },
-  { id: 'adv', name: '高级' },
-] as const
-
-type TabId = (typeof SET_TABS)[number]['id']
-
-/** 回收站保留期限的可选档位（天）。0 = 永不自动删；跟主进程 settings.js 的 0~3650 取值域一致。 */
-const RETENTION_CHOICES = [0, 7, 14, 30, 60, 90]
-
 function SettingsModal({
   initial,
   updateNotice,
@@ -93,7 +83,7 @@ function SettingsModal({
   const [loginBusy, setLoginBusy] = useState(false)
   const [loginMsg, setLoginMsg] = useState('')
   const [info, setInfo] = useState<AppInfo | null>(null)
-  const [upd, setUpd] = useState<{ state: 'idle' | 'checking' | 'latest' | 'new' | 'error'; data?: UpdateInfo }>(
+  const [upd, setUpd] = useState<UpdateCheckState>(
     updateNotice
       ? {
           state: 'new',
@@ -216,6 +206,17 @@ function SettingsModal({
     }
   }
 
+  /* 退出登录要立刻落盘：这里清了浏览器分区，配置里那份也一起清掉，
+   * 免得留下一个「分区已登出、配置里还攥着旧凭证」的中间状态。 */
+  const doLogout = async () => {
+    await api.clearLogin(cookieKey)
+    const next = await api.setSettings({ cookies: { ...s.cookies, [cookieKey]: '' } })
+    setS((v) => ({ ...v, cookies: { ...next.cookies } }))
+    setSaved(next)
+    onSaved(next)
+    setLoginMsg(`已清除 ${label(cookieKey)} 的登录状态`)
+  }
+
   const checkUpd = async () => {
     /* 安装版让 electron-updater 自己去比版本；便携版读不了自己的安装信息，只能用 GitHub 接口 */
     if (canAutoUpdate) {
@@ -233,6 +234,12 @@ function SettingsModal({
     } catch (e) {
       setUpd({ state: 'error', data: { ok: false, current: '', message: errText(e) } })
     }
+  }
+
+  /** 「下载更新」按钮：下载没成功就把状态改成出错，否则界面停在原地、像点了没反应 */
+  const downloadUpdate = async () => {
+    const r = await api.updateDownload()
+    if (!r.ok) setAuto({ state: 'error', message: r.message || '下载失败' })
   }
 
   const doReset = async () => {
@@ -285,444 +292,66 @@ function SettingsModal({
 
           <div className="set-pane">
             {tab === 'general' && (
-              <>
-                <Section title="启动">
-                  <Row title="开机自启动" desc={autoStartDesc} err={rowErr.autoStart}>
-                    <Switch checked={!!s.autoStart} onChange={toggleAutoStart} />
-                  </Row>
-                  {!!s.autoStart && (
-                    <Row
-                      indent
-                      title="启动时显示主窗口"
-                    >
-                      <Switch
-                        checked={!!s.startupShowWindow}
-                        onChange={(v) => instant({ startupShowWindow: v }, 'startupShowWindow')}
-                      />
-                    </Row>
-                  )}
-                </Section>
-                <Section title="关闭">
-                  <Row
-                    title="显示托盘图标"
-                    desc={
-                      s.trayIcon === false
-                        ? '关掉后没有托盘入口，关闭窗口会直接退出。'
-                        : '托盘图标可以叫回窗口、打开下载目录、退出程序。'
-                    }
-                    err={rowErr.trayIcon}
-                  >
-                    <Switch
-                      checked={s.trayIcon !== false}
-                      onChange={(v) => instant({ trayIcon: v }, 'trayIcon')}
-                    />
-                  </Row>
-                  <Row
-                    title="关闭窗口后留在后台下载"
-                    desc={s.trayIcon === false ? undefined : '要完全退出：托盘图标右键 →「退出」。'}
-                    err={rowErr.closeToTray}
-                  >
-                    <Switch
-                      checked={s.closeToTray !== false}
-                      disabled={s.trayIcon === false}
-                      onChange={(v) => instant({ closeToTray: v }, 'closeToTray')}
-                    />
-                  </Row>
-                  <Row title="下载完成后打开下载目录">
-                    <Switch
-                      checked={!!s.openFolderWhenDone}
-                      onChange={(v) => instant({ openFolderWhenDone: v }, 'openFolderWhenDone')}
-                    />
-                  </Row>
-                </Section>
-                <Section title="下载位置">
-                  <Row stack title="下载目录">
-                    <div className="row">
-                      <input
-                        type="text"
-                        value={s.downloadDir}
-                        onChange={(e) => patch({ downloadDir: e.target.value })}
-                      />
-                      <button
-                        onClick={async () => {
-                          const dir = await api.pickDir()
-                          if (dir) patch({ downloadDir: dir })
-                        }}
-                      >
-                        选择…
-                      </button>
-                    </div>
-                  </Row>
-                </Section>
-                <Section title="回收站">
-                  <Row stack title="回收站目录" err={rowErr.trashDir}>
-                    <div className="row">
-                      <input
-                        type="text"
-                        value={s.trashDir || ''}
-                        onChange={(e) => patch({ trashDir: e.target.value })}
-                      />
-                      <button
-                        onClick={async () => {
-                          const dir = await api.pickDir('trash')
-                          if (dir) patch({ trashDir: dir })
-                        }}
-                      >
-                        选择…
-                      </button>
-                    </div>
-                  </Row>
-                  <Row
-                    title="自动清理"
-                    desc="超过期限的文件从回收站里彻底删除。"
-                    err={rowErr.trashRetentionDays}
-                  >
-                    <select
-                      className="select"
-                      value={String(RETENTION_CHOICES.includes(Number(s.trashRetentionDays)) ? Number(s.trashRetentionDays) : 30)}
-                      onChange={(e) => instant({ trashRetentionDays: Number(e.target.value) }, 'trashRetentionDays')}
-                    >
-                      {RETENTION_CHOICES.map((d) => (
-                        <option key={d} value={d}>
-                          {d === 0 ? '永不' : `${d} 天`}
-                        </option>
-                      ))}
-                    </select>
-                  </Row>
-                </Section>
-              </>
+              <GeneralTab
+                s={s}
+                autoStartDesc={autoStartDesc}
+                rowErr={rowErr}
+                onInstant={instant}
+                onPatch={patch}
+                onToggleAutoStart={toggleAutoStart}
+              />
             )}
 
             {tab === 'download' && (
-              <>
-                <Section title="aria2（百度 / 迅雷 / 蓝奏云走这条）">
-                  <NumberRow
-                    title="同时下载任务数"
-                    value={s.maxConcurrent}
-                    min={1}
-                    max={20}
-                    onCommit={(n) => instant({ maxConcurrent: n }, 'maxConcurrent')}
-                    err={rowErr.maxConcurrent}
-                  />
-                  <NumberRow
-                    title="单任务分片数（split）"
-                    value={s.split}
-                    min={1}
-                    max={64}
-                    onCommit={(n) => instant({ split: n }, 'split')}
-                    err={rowErr.split}
-                  />
-                  <NumberRow
-                    title="每服务器最大连接数"
-                    value={s.maxConnectionPerServer}
-                    min={1}
-                    max={64}
-                    onCommit={(n) => instant({ maxConnectionPerServer: n }, 'maxConnectionPerServer')}
-                    err={rowErr.maxConnectionPerServer}
-                  />
-                  <Row stack title="最小分片大小">
-                    <input
-                      type="text"
-                      placeholder="1M"
-                      value={s.minSplitSize}
-                      onChange={(e) => patch({ minSplitSize: e.target.value })}
-                    />
-                  </Row>
-                </Section>
-
-                <Section title="分段引擎（夸克 / UC / 直链走这条）">
-                  <Row
-                    stack
-                    title="每个网盘的连接数"
-                    desc="填 0 就改用 aria2。"
-                    err={rowErr.segConnections}
-                  >
-                    <div className="ep-netdisks">
-                      {SEG_TARGETS.map((k) => (
-                        <span key={k} className="seg-conn">
-                          <span className="ep-hint">{label(k)}</span>
-                          <NumBox
-                            value={s.segConnections?.[k] ?? 0}
-                            min={0}
-                            max={256}
-                            onCommit={(n) =>
-                              instant(
-                                { segConnections: { ...(s.segConnections || {}), [k]: n } },
-                                'segConnections',
-                              )
-                            }
-                          />
-                        </span>
-                      ))}
-                    </div>
-                  </Row>
-                  <NumberRow
-                    title="百度网盘并发（默认 1）"
-                    desc="超级会员可调到 4~8；速度变成 0 就是被限了，调回 1。"
-                    value={s.baiduConnections ?? 1}
-                    min={1}
-                    max={16}
-                    onCommit={(n) => instant({ baiduConnections: n }, 'baiduConnections')}
-                    err={rowErr.baiduConnections}
-                  />
-                </Section>
-              </>
+              <DownloadTab s={s} rowErr={rowErr} onInstant={instant} onPatch={patch} />
             )}
 
             {tab === 'net' && (
-              <>
-                <Section title="代理">
-                  <ProxySection s={s} patch={patch} />
-                </Section>
-                <Section title="证书">
-                  <Row
-                    title="忽略证书错误"
-                    desc="打开后不校验证书，只在必要时用。"
-                    err={rowErr.ignoreCert}
-                  >
-                    <Switch checked={!!s.ignoreCert} onChange={(v) => instant({ ignoreCert: v }, 'ignoreCert')} />
-                  </Row>
-                </Section>
-                <Section title="其它">
-                  <Row stack title="自定义 User-Agent">
-                    <input type="text" value={s.userAgent} onChange={(e) => patch({ userAgent: e.target.value })} />
-                  </Row>
-                  <NumberRow
-                    title="aria2 RPC 端口"
-                    value={s.aria2Port}
-                    min={1024}
-                    max={65535}
-                    onCommit={(n) => instant({ aria2Port: n }, 'aria2Port')}
-                    err={rowErr.aria2Port}
-                  />
-                </Section>
-              </>
+              <NetworkTab s={s} rowErr={rowErr} onInstant={instant} onPatch={patch} />
             )}
 
             {tab === 'account' && (
-              <Section title="网盘账号">
-                {/* 四家各自的状态摆在一行里，不用来回切下拉才知道谁登过 */}
-                <div className="acct-chips">
-                  {LOGIN_TARGETS.map((k) => {
-                    const on = !!(s.cookies[k] || '').trim()
-                    return (
-                      <button
-                        key={k}
-                        className={`acct-chip${cookieKey === k ? ' on' : ''}`}
-                        onClick={() => setCookieKey(k)}
-                        title={on ? `${label(k)}：本机已保存凭证` : `${label(k)}：还没有凭证，解析会走游客身份`}
-                      >
-                        <i className={on ? 'dot ok' : 'dot'} />
-                        {label(k)}
-                        <span className="dim">{on ? '已保存' : '未登录'}</span>
-                      </button>
-                    )
-                  })}
-                </div>
-
-                <Row stack title="账号" desc="凭证只存在这台电脑上。">
-                  <div className="acct-form">
-                    <div className="row">
-                      <select className="select" value={cookieKey} onChange={(e) => setCookieKey(e.target.value)}>
-                        {COOKIE_TARGETS.map((k) => (
-                          <option key={k} value={k}>
-                            {label(k)}
-                          </option>
-                        ))}
-                      </select>
-                      {LOGIN_TARGETS.includes(cookieKey) && (
-                        <>
-                          <button disabled={loginBusy} onClick={doLogin}>
-                            {loginBusy ? '请在弹出的窗口里登录…' : `登录${label(cookieKey)}`}
-                          </button>
-                          <button
-                            onClick={async () => {
-                              await api.clearLogin(cookieKey)
-                              /* 退出登录要立刻落盘：这里清了浏览器分区，配置里那份也一起清掉，
-                               * 免得留下一个「分区已登出、配置里还攥着旧凭证」的中间状态。 */
-                              const next = await api.setSettings({ cookies: { ...s.cookies, [cookieKey]: '' } })
-                              setS((v) => ({ ...v, cookies: { ...next.cookies } }))
-                              setSaved(next)
-                              onSaved(next)
-                              setLoginMsg(`已清除 ${label(cookieKey)} 的登录状态`)
-                            }}
-                          >
-                            退出登录
-                          </button>
-                        </>
-                      )}
-                    </div>
-                    <input
-                      type="text"
-                      placeholder={maskedCookie ? '已保存，粘贴新凭证可换账号' : '粘贴凭证'}
-                      value={maskedCookie ? '' : s.cookies[cookieKey] ?? ''}
-                      onChange={(e) => {
-                        const v = e.target.value
-                        /* 清空输入框永远不等于「删凭证」：磁盘上本来有一份就退回那份（打码串），
-                         * 只有本来就什么都没有（或点「退出登录」）才会真的变成空。
-                         * 不然用户打一半反悔、或者手滑全选删掉，就得重新登录一遍。 */
-                        const val = v === '' ? (storedMasked ? COOKIE_MASK : '') : v
-                        patch({ cookies: { ...s.cookies, [cookieKey]: val } })
-                      }}
-                    />
-                    {loginMsg && <div className="desc">{loginMsg}</div>}
-                  </div>
-                </Row>
-              </Section>
+              <AccountTab
+                s={s}
+                cookieKey={cookieKey}
+                loginBusy={loginBusy}
+                loginMsg={loginMsg}
+                maskedCookie={maskedCookie}
+                storedMasked={storedMasked}
+                onPatch={patch}
+                onCookieKey={setCookieKey}
+                onLogin={doLogin}
+                onLogout={doLogout}
+              />
             )}
 
-            {tab === 'ext' && (
-              <Section title="浏览器插件接收通道">
-                <BridgeSection />
-              </Section>
-            )}
+            {tab === 'ext' && <ExtensionTab />}
 
             {tab === 'update' && (
-              <>
-                <Section title="版本">
-                  <Row
-                    title={`PanBox ${info ? info.version : '…'}`}
-                    desc={info ? (info.packaged ? (info.portable ? '便携版' : '安装版') : '开发模式（npm start）') : '读取中…'}
-                  >
-                    <button disabled={checking} onClick={checkUpd}>
-                      {checking ? '正在检查…' : '检查更新'}
-                    </button>
-                  </Row>
-                  <div className="updbox" aria-live="polite">
-                    {canAutoUpdate ? (
-                      <>
-                        {auto.state === 'idle' && <div className="desc">点上面的「检查更新」查一次。</div>}
-                        {auto.state === 'checking' && <div className="desc">正在检查…</div>}
-                        {auto.state === 'latest' && <div className="desc">已是最新版本（{auto.version || (info ? info.version : '')}）。</div>}
-                        {auto.state === 'available' && (
-                          <>
-                            <div className="upd-title">发现新版本 {auto.version}</div>
-                            <div className="desc">装好后程序文件就地替换，设置、任务和登录状态都保留。</div>
-                          </>
-                        )}
-                        {auto.state === 'downloading' && (
-                          <>
-                            <div className="desc">正在下载 {auto.percent ? auto.percent.toFixed(0) : 0}%</div>
-                            <div className="bar">
-                              <i style={{ transform: `scaleX(${(auto.percent || 0) / 100})` }} />
-                            </div>
-                          </>
-                        )}
-                        {auto.state === 'downloaded' && <div className="desc">下载完成，点「重启并安装」。</div>}
-                        {auto.state === 'error' && <div className="desc">更新失败：{auto.message || '未知原因'}</div>}
-                        <div className="row">
-                          {(auto.state === 'available' || auto.state === 'downloading' || auto.state === 'error') && (
-                            <button
-                              className="primary"
-                              disabled={auto.state === 'downloading'}
-                              onClick={async () => {
-                                const r = await api.updateDownload()
-                                if (!r.ok) setAuto({ state: 'error', message: r.message || '下载失败' })
-                              }}
-                            >
-                              {auto.state === 'downloading' ? '正在下载' : '下载更新'}
-                            </button>
-                          )}
-                          {auto.state === 'downloaded' && (
-                            <button className="primary" onClick={() => api.updateInstall()}>
-                              重启并安装
-                            </button>
-                          )}
-                          <button onClick={() => api.openRelease('https://github.com/Ygq156/PanBox/releases/latest')}>打开发布页</button>
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        {upd.state === 'idle' && <div className="desc">点上面的「检查更新」查一次。</div>}
-                        {upd.state === 'checking' && <div className="desc">正在检查…</div>}
-                        {upd.state === 'latest' && (
-                          <div className="desc">已是最新版本（{upd.data?.latest ?? upd.data?.current}）。</div>
-                        )}
-                        {upd.state === 'new' && (
-                          <>
-                            <div className="upd-title">发现新版本 {upd.data?.latest}</div>
-                            <div className="desc">便携版请下载新包替换。</div>
-                            <div className="row">
-                              <button className="primary" onClick={() => api.openRelease(upd.data?.url || '')}>
-                                打开发布页
-                              </button>
-                            </div>
-                          </>
-                        )}
-                        {upd.state === 'error' && (
-                          <>
-                            <div className="upd-title err">检查失败</div>
-                            <div className="desc">可能是访问不到 GitHub（{upd.data?.message || '网络不通'}）。</div>
-                            <div className="row">
-                              <button onClick={checkUpd}>重试</button>
-                              <button onClick={() => api.openRelease('https://github.com/Ygq156/PanBox/releases/latest')}>
-                                打开发布页
-                              </button>
-                            </div>
-                          </>
-                        )}
-                      </>
-                    )}
-                  </div>
-                  <Row
-                    title="自动检查更新"
-                    err={rowErr.autoCheckUpdate}
-                  >
-                    <Switch
-                      checked={s.autoCheckUpdate !== false}
-                      onChange={(v) => instant({ autoCheckUpdate: v }, 'autoCheckUpdate')}
-                    />
-                  </Row>
-                </Section>
-                <Section title="链接">
-                  <Row title="项目主页 / 源码">
-                    <div className="row">
-                      <button onClick={() => api.openRelease('https://github.com/Ygq156/PanBox')}>打开 GitHub</button>
-                      <button onClick={openExtFolder}>插件文件夹</button>
-                    </div>
-                  </Row>
-                </Section>
-              </>
+              <UpdateTab
+                s={s}
+                rowErr={rowErr}
+                info={info}
+                upd={upd}
+                auto={auto}
+                checking={checking}
+                canAutoUpdate={canAutoUpdate}
+                onInstant={instant}
+                onCheck={checkUpd}
+                onDownloadUpdate={downloadUpdate}
+                onOpenExtFolder={openExtFolder}
+              />
             )}
 
-            {tab === 'endpoint' && (
-              <Section title="用户自备的解析接口">
-                <EndpointSection
-                  list={s.parseEndpoints || []}
-                  onChange={(next) => patch({ parseEndpoints: next })}
-                  ack={!!s.endpointAck}
-                  onAck={(v) => patch({ endpointAck: v })}
-                />
-              </Section>
-            )}
+            {tab === 'endpoint' && <EndpointTab s={s} onPatch={patch} />}
 
             {tab === 'adv' && (
-              <Section title="重置">
-                <div className="danger">
-                  <div className="danger-title">恢复默认设置</div>
-                  <div className="danger-desc">
-                    把设置改回出厂值。<b>登录凭证和你自己填的解析接口会保留</b>，不必重新登录四个网盘。
-                  </div>
-                  {confirmReset ? (
-                    <div className="row">
-                      <button className="danger-btn" onClick={doReset}>
-                        确认恢复
-                      </button>
-                      <button onClick={() => setConfirmReset(false)}>取消</button>
-                    </div>
-                  ) : (
-                    <div className="row">
-                      <button onClick={() => setConfirmReset(true)}>恢复默认设置…</button>
-                    </div>
-                  )}
-                </div>
-                <Row
-                  title="浏览器插件版本"
-                  desc="更新程序后，请在 chrome://extensions 里点一次「重新加载」。"
-                >
-                  <button onClick={openExtFolder}>打开插件文件夹</button>
-                </Row>
-              </Section>
+              <AdvancedTab
+                confirmReset={confirmReset}
+                onConfirmReset={setConfirmReset}
+                onReset={doReset}
+                onOpenExtFolder={openExtFolder}
+              />
             )}
           </div>
         </div>
@@ -861,24 +490,6 @@ function ResultPanel({
         >
           开始下载
         </button>
-      </div>
-    </div>
-  )
-}
-
-function ErrorPanel({ result }: { result: ParseResult }) {
-  return (
-    <div className="result error-result">
-      <div className="result-head">
-        <span className="badge gray">{label(result.netdisk)}</span>
-        <span className="title err" title={result.source}>
-          {result.source || '未知链接'}
-        </span>
-        {result.elapsed != null && <span className="badge gray">{(result.elapsed / 1000).toFixed(1)}s</span>}
-      </div>
-      <div className="err-body">
-        {result.message || '解析失败'}
-        {result.needPassword ? '（请在「提取码」框填写后重试）' : ''}
       </div>
     </div>
   )
@@ -1436,32 +1047,16 @@ export default function App() {
 
   return (
     <div className="app">
-      <div className="header">
-        <div className="logo">
-          Pan<span>Box</span>
-        </div>
-        <div className={`dot${aria2.running ? ' on' : ''}`} />
-        <div className="status">
-          {aria2.running ? `aria2 已就绪 ${aria2.version ?? ''}` : 'aria2 未连接'}
-          {stats.activeCount > 0 ? ` · ${stats.activeCount} 个任务下载中 · ${formatSpeed(stats.speed)}` : ''}
-        </div>
-        {/* 版本号常驻标题栏：报障时一眼能说清装的是哪一版，不用再猜 */}
-        {ver ? <div className="ver" title="程序版本">v{ver}</div> : null}
-        {!aria2.running && (
-          <button
-            className="ghost tiny"
-            title="重新拉起 aria2 下载引擎"
-            onClick={async () => setAria2(await api.restartAria2())}
-          >
-            重连引擎
-          </button>
-        )}
-        <div className="grow" />
-        <button className="ghost" onClick={() => setShowSettings(true)}>
-          ⚙ 设置
-          {newVer ? <span className="navdot" /> : null}
-        </button>
-      </div>
+      <HeaderBar
+        aria2Running={aria2.running}
+        aria2Version={aria2.version}
+        activeCount={stats.activeCount}
+        speed={stats.speed}
+        ver={ver}
+        hasNewVer={!!newVer}
+        onAria2={setAria2}
+        onOpenSettings={() => setShowSettings(true)}
+      />
 
       <div className="body">
         <div className="pane-create">
@@ -1557,30 +1152,12 @@ export default function App() {
 
       {/* 移除一个「已下载完成」的任务：磁盘上那份文件要用户自己说怎么处理 */}
       {confirmDel && (
-        <div className="mask" onMouseDown={(e) => e.target === e.currentTarget && setConfirmDel(null)}>
-          <div className="modal confirm">
-            <h2>删除这个文件？</h2>
-            <div className="confirm-body">
-              <div className="confirm-name" title={confirmDel.name}>
-                {confirmDel.name}
-              </div>
-              <div className="confirm-note">
-                放进回收站可以还原；彻底删除会连磁盘上的文件一起删掉。
-              </div>
-            </div>
-            <div className="confirm-foot">
-              <button className="keep" onClick={() => removeTask(confirmDel, 'trash')}>
-                放进回收站
-              </button>
-              <button className="wipe" onClick={() => removeTask(confirmDel, 'purge')}>
-                彻底删除
-              </button>
-              <button className="ghost" onClick={() => setConfirmDel(null)}>
-                取消
-              </button>
-            </div>
-          </div>
-        </div>
+        <ConfirmRemoveModal
+          name={confirmDel.name}
+          onTrash={() => removeTask(confirmDel, 'trash')}
+          onPurge={() => removeTask(confirmDel, 'purge')}
+          onCancel={() => setConfirmDel(null)}
+        />
       )}
     </div>
   )
