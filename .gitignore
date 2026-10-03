@@ -3,6 +3,7 @@ node_modules/
 dist/
 release/
 release-*/
+release-backup/
 
 # 第三方二进制（aria2c.exe 约 5.4 MB，请按 README 自行下载到 resources/aria2/）
 resources/aria2/
