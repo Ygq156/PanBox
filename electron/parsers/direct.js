@@ -1,11 +1,24 @@
 'use strict'
 
-const path = require('node:path')
-const { req } = require('./util')
+const { req, withExt, urlBaseName } = require('./util')
+
+/* 只给「假站点起在本机」的测试用（见 test\verify-name-ext.js）：产品路径永远关闭，
+ * 免得远端响应把我们引去打内网（见 util.js 里 assertOutbound 的注释）。 */
+const ALLOW_LOCAL = !!process.env.PANBOX_DIRECT_BASE || process.env.PANBOX_PROBE_LOCAL === '1'
+
+/**
+ * 名字兜底：服务器没给文件名时，先看地址里有没有把文件名写在查询串上
+ * （`…/download?file=3345768.3355908` 这种很常见），最后才拿路径最后一段。
+ */
+function nameFromUrl(url) {
+  return urlBaseName(url) || 'download.bin'
+}
 
 /**
  * 通用直链解析器：用户直接粘贴 http(s) 文件直链时使用。
- * 名称优先从 Content-Disposition 取，其次从 URL 路径取。
+ * 名称优先从 Content-Disposition 取，其次从 URL 路径取；
+ * 两者都没给后缀时按响应类型补一个（浏览器就是这么定的，
+ * 例如 `…/epdf/10.1145/3345768.3355908` 会存成 `3345768.3355908.pdf`）。
  */
 module.exports = {
   netdisk: 'direct',
@@ -18,9 +31,11 @@ module.exports = {
     let name = ''
     let size = 0
     let headers = {}
+    let ct = ''
     try {
-      const r = await req(url, { method: 'HEAD', timeout: 15000, cookie: ctx.cookie })
+      const r = await req(url, { method: 'HEAD', timeout: 15000, cookie: ctx.cookie, allowLocal: ALLOW_LOCAL })
       const cd = r.headers.get('content-disposition') || ''
+      ct = r.headers.get('content-type') || ''
       let m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
       if (m) {
         try {
@@ -35,14 +50,8 @@ module.exports = {
       /* HEAD 不被支持时忽略，交给 aria2 自己猜 */
     }
 
-    if (!name) {
-      try {
-        const u = new URL(url)
-        name = decodeURIComponent(path.posix.basename(u.pathname)) || 'download.bin'
-      } catch {
-        name = 'download.bin'
-      }
-    }
+    if (!name) name = nameFromUrl(url)
+    name = withExt(name, ct)
 
     return {
       title: name,

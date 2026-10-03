@@ -446,6 +446,152 @@ const UA_QUARK =
 const UA_MOBILE_ANDROID =
   'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Mobile Safari/537.36'
 
+/* ---- 文件名：从响应类型补后缀 --------------------------------------
+ * 浏览器（Chromium 的 net::GetSuggestedFilename）在「服务器没给 content-disposition
+ * 文件名」时，会拿 URL 最后一段当名字，**再用响应类型补一个后缀**。所以
+ * `https://dl.acm.org/doi/epdf/10.1145/3345768.3355908` 在浏览器里存下来是
+ * `3345768.3355908.pdf`。PanBox 以前只做前半步：名字取到了，后缀没了 ——
+ * 用户拿到一个没有后缀的文件，得自己改名。
+ *
+ * 这张表只覆盖「文件本体」类型：text/html、application/json 这类是网页/接口，
+ * 给它们补 .html / .json 只会把「这其实不是文件」这件事藏起来。表里没有的类型
+ * 补 .bin —— 至少比没有后缀强，用户一眼也能看出这不是原生后缀。
+ */
+const WEB_TYPES = new Set([
+  'text/html',
+  'application/xhtml+xml',
+  'text/plain',
+  'text/css',
+  'text/javascript',
+  'application/javascript',
+  'application/json',
+  'text/json',
+  'application/xml',
+  'text/xml',
+])
+const MIME_FOR_APPS = new Map([
+  ['pdf', 'pdf'],
+  ['x-pdf', 'pdf'],
+  ['zip', 'zip'],
+  ['x-zip', 'zip'],
+  ['x-zip-compressed', 'zip'],
+  ['x-7z-compressed', '7z'],
+  ['x-rar-compressed', 'rar'],
+  ['vnd.rar', 'rar'],
+  ['x-tar', 'tar'],
+  ['gzip', 'gz'],
+  ['x-gzip', 'gz'],
+  ['x-bzip2', 'bz2'],
+  ['x-xz', 'xz'],
+  ['x-msdownload', 'exe'],
+  ['x-msdos-program', 'exe'],
+  ['x-msi', 'msi'],
+  ['java-archive', 'jar'],
+  ['vnd.android.package-archive', 'apk'],
+  ['x-apple-diskimage', 'dmg'],
+  ['epub+zip', 'epub'],
+  ['msword', 'doc'],
+  ['vnd.openxmlformats-officedocument.wordprocessingml.document', 'docx'],
+  ['vnd.ms-excel', 'xls'],
+  ['vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xlsx'],
+  ['vnd.ms-powerpoint', 'ppt'],
+  ['vnd.openxmlformats-officedocument.presentationml.presentation', 'pptx'],
+  ['rtf', 'rtf'],
+  ['x-mobipocket-ebook', 'mobi'],
+  ['vnd.amazon.ebook', 'azw'],
+  ['ogg', 'ogg'],
+  ['x-flac', 'flac'],
+  ['x-iso9660-image', 'iso'],
+  ['x-firmware', 'bin'],
+  ['octet-stream', 'bin'],
+  ['x-binary', 'bin'],
+])
+
+/** `application/pdf; charset=utf-8` → `pdf` */
+function contentTypeExt(ct) {
+  const s = String(ct || '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase()
+  if (!s || WEB_TYPES.has(s)) return ''
+  const m = /^([a-z0-9.-]+)\/(.+)$/.exec(s)
+  if (!m) return ''
+  const major = m[1]
+  let sub = m[2]
+  if (major === 'application') {
+    const hit = MIME_FOR_APPS.get(sub)
+    if (hit) return hit
+    /* `image/svg+xml`、`application/vnd.foo+json` 这种带后缀标记的，取 `+` 前那段 */
+    sub = sub.replace(/\+.*$/, '')
+    if (sub.startsWith('x-')) sub = sub.slice(2)
+    return /^[a-z0-9]{1,8}$/.test(sub) ? sub : 'bin'
+  }
+  return sub.replace(/\+.*$/, '').replace(/^x-/, '')
+}
+
+/* 认得出的扩展名。用来判断「名字里是不是已经有后缀了」：
+ * 表里认得的（.pdf、.bin…）当然是；表外的只要不像编号（`a.ndjson`）也算，
+ * 免得给它叠成 `a.ndjson.pdf`。而**纯数字那段不算后缀** —— `3345768.3355908`
+ * 与 `v1.0.6` 的最后一段都是编号，这正是 ACM 那条地址要补 .pdf 的原因。 */
+const KNOWN_EXTS = new Set(
+  (
+    'pdf zip rar 7z tar gz bz2 xz zst exe msi apk ipa dmg iso jar deb rpm appimage ' +
+    'doc docx xls xlsx ppt pptx rtf odt ods epub mobi azw azw3 txt md csv json xml html htm ' +
+    'png jpg jpeg gif bmp webp svg ico tif tiff heic avif ' +
+    'mp3 wav flac aac ogg opus m4a wma ape ' +
+    'mp4 mkv avi mov wmv flv webm m4v mpg mpeg ts m3u8 m4s rmvb ' +
+    'bin dat img cue nrg vhd vmdk pak cab txz tbz lz4 br'
+  ).split(' ')
+)
+
+/** 名字最后那一段像不像后缀：`a.pdf`→true、`3345768.3355908`→false */
+function hasKnownExt(name) {
+  const m = /\.([A-Za-z0-9]{1,8})$/.exec(String(name || ''))
+  if (!m) return false
+  const ext = m[1].toLowerCase()
+  if (KNOWN_EXTS.has(ext)) return true
+  return !/^\d+$/.test(ext)
+}
+
+/**
+ * 名字没有后缀时，按响应类型补一个（浏览器就是这么定文件名的）。
+ * 有后缀的一律不动 —— 站点给的名字优先。
+ */
+function withExt(name, ct) {
+  const s = String(name || '').trim()
+  if (!s || hasKnownExt(s)) return s
+  const ext = contentTypeExt(ct)
+  return ext ? `${s}.${ext}` : s
+}
+
+/**
+ * 从地址里抠出一个「像文件名」的东西：先看查询串（`…/download?file=x.pdf` 很常见），
+ * 再看路径最后一段。取不到就给空串，由调用方决定兜底叫什么。
+ */
+function urlBaseName(url) {
+  let u
+  try {
+    u = new URL(String(url || ''))
+  } catch {
+    return ''
+  }
+  for (const k of ['filename', 'file', 'name', 'download', 'title']) {
+    const v = u.searchParams.get(k)
+    if (!v || !v.trim()) continue
+    try {
+      const d = decodeURIComponent(v).trim()
+      if (d && !d.includes('/')) return d
+    } catch {
+      /* 编码坏了就往下走 */
+    }
+  }
+  try {
+    return decodeURIComponent(require('node:path').posix.basename(u.pathname)) || ''
+  } catch {
+    return ''
+  }
+}
+
 function form(data) {
   return Object.entries(data)
     .filter(([, v]) => v !== undefined && v !== null)
@@ -478,4 +624,8 @@ module.exports = {
   humanSizeToBytes,
   deepFind,
   sleep,
+  contentTypeExt,
+  hasKnownExt,
+  withExt,
+  urlBaseName,
 }

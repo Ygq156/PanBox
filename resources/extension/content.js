@@ -136,6 +136,23 @@
     }
     if (/mpegurl/i.test(c)) return 'm3u8'
     if (/dash\+xml/i.test(c)) return 'mpd'
+    /* PDF 这类「文档」以前落到最后的 'bin'，面板上就叫成 `3345768.bin` —— 名字对不上
+     * 真实文件（ACM 的 `…/epdf/10.1145/3345768.3355908` 就是这种地址）。 */
+    if (/^application\/(pdf|x-pdf)/i.test(c)) return 'pdf'
+    if (/^application\/(zip|x-zip-compressed|x-7z-compressed|x-rar-compressed)/i.test(c)) {
+      return /7z/.test(c) ? '7z' : /rar/.test(c) ? 'rar' : 'zip'
+    }
+    if (/^application\/(x-msdownload|x-msdos-program)/i.test(c)) return 'exe'
+    if (/^application\/(x-tar|gzip|x-gzip)/i.test(c)) return /tar/.test(c) ? 'tar' : 'gz'
+    if (/^application\/(vnd\.android\.package-archive)/i.test(c)) return 'apk'
+    if (/^application\/(epub\+zip)/i.test(c)) return 'epub'
+    if (/^application\/(msword)/i.test(c)) return 'doc'
+    if (/^application\/(vnd\.openxmlformats-officedocument\.wordprocessingml\.document)/i.test(c)) return 'docx'
+    if (/^application\/(vnd\.ms-excel)/i.test(c)) return 'xls'
+    if (/^application\/(vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet)/i.test(c)) return 'xlsx'
+    if (/^application\/(vnd\.ms-powerpoint)/i.test(c)) return 'ppt'
+    if (/^application\/(vnd\.openxmlformats-officedocument\.presentationml\.presentation)/i.test(c)) return 'pptx'
+    if (/^application\/(x-iso9660-image)/i.test(c)) return 'iso'
     return KIND_EXT[kind] || 'bin'
   }
 
@@ -786,7 +803,7 @@
       ui.msg.textContent = '正在交给 PanBox…'
       const r = await ask({
         type: 'sendUrls',
-        items: list.map((x) => ({ url: x.url, name: x.name })),
+        items: list.map((x) => ({ url: x.url, name: x.name, ct: x.ct || '' })),
         referer: location.href,
         title: document.title,
       })
