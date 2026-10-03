@@ -129,4 +129,4 @@ async function withArg1Retry(send, jar, ctxFor) {
   throw new Error(`反爬校验未通过（站点返回 HTTP ${(retried ? rejected : r).status} Error : Time Out），请稍后重试或重新复制分享链接`)
 }
 
-module.exports = { acwScV2, extractArg1, hasChallenge, isChallengeRejected, withArg1Retry, POS_LIST, MASK, solveChallenge }
+module.exports = { acwScV2, extractArg1, hasChallenge, isChallengeRejected, withArg1Retry, solveChallenge }

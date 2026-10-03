@@ -25,9 +25,9 @@ function nameFromUrl(url) {
 module.exports = {
   netdisk: 'direct',
 
-  test(url) {
-    return /^https?:\/\//i.test(url)
-  },
+  /* 认站点只有一张表（electron/parsers/sites.json + util.detectNetdisk），
+   * 解析器上不再挂 test()：以前每个解析器都有一个，生产路径从来不调用，
+   * 后来的人加了站点只改 test() 会以为改完了 —— 那种「两张表」比没有还坏。 */
 
   async open(url, ctx = {}) {
     let name = ''

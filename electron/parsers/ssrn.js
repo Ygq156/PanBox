@@ -199,10 +199,6 @@ function hostOf(url) {
 module.exports = {
   netdisk: 'ssrn',
 
-  test(url) {
-    return !!abstractIdOf(url)
-  },
-
   /* 给「换直链」与插件那条路用：把抓到的投递地址换成此刻可用的真地址 */
   resolveDelivery,
   isDelivery,

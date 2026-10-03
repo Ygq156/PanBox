@@ -536,10 +536,6 @@ function makeParser(key) {
   return {
     netdisk: P.netdisk,
 
-    test(url) {
-      return P.shareRe.test(String(url))
-    },
-
     async open(url, ctx = {}) {
       const m = P.shareRe.exec(String(url))
       if (!m) throw new Error('无法识别分享 ID')
