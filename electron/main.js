@@ -297,6 +297,10 @@ function boot(...a) {
     /* ignore */
   }
 }
+/* 底层模块（taskManager / 下载引擎）也要能往这本日志里写：它们不该反过来 require 主进程，
+ * 于是把写日志这件事挂到 global 上。队列轮询出的错必须留痕 —— 以前那些错被 .catch(()=>{})
+ * 吞掉，界面看起来只是「队列永远是 0」，谁也查不出为什么。 */
+global.__pbBoot = boot
 /* 打包版常从控制台/脚本里启动，启动它的父进程一退出 stdout 管道就断了，之后任何
  * console.* 都会抛 EPIPE —— 未被吞掉就会在 uncaughtException 里自旋。 */
 for (const s of [process.stdout, process.stderr]) {
@@ -343,12 +347,52 @@ function indexHtml() {
 
 /** 浏览器插件（未打包的扩展目录）在哪儿 —— 「设置 → 浏览器插件」上的按钮就打开它 */
 function extensionDir() {
+  /* 便携版优先用 exe 旁边那份固定路径的（浏览器记的就是它） */
+  if (portableExt && fs.existsSync(path.join(portableExt, 'manifest.json'))) return portableExt
   const candidates = isDev
     ? [path.join(__dirname, '..', 'resources', 'extension')]
     : [path.join(process.resourcesPath, 'extension'), path.join(__dirname, '..', 'resources', 'extension')]
   for (const c of candidates) if (fs.existsSync(c)) return c
   return candidates[0]
 }
+
+/** 便携版把程序解压到临时目录，`process.resourcesPath` 每次启动都不一样 —— 照着那个
+ *  路径去「加载已解压的扩展程序」，下次开机原路径就没了，浏览器里那条扩展直接失效。
+ *  所以便携版一启动就把插件抄一份到 exe 旁边固定名字的目录，设置页指向那份。
+ *  非便携版返回 null（装在 Program Files 里，不能往那儿写）。 */
+function portableExeDir() {
+  const d = process.env.PORTABLE_EXECUTABLE_DIR
+  return d && path.isAbsolute(d) ? d : null
+}
+
+function portableExtDir() {
+  const d = portableExeDir()
+  return d ? path.join(d, 'PanBox插件') : null
+}
+
+/** 把插件抄到便携版 exe 旁边（每次都覆盖，插件随版本更新）。返回目标目录或 null。 */
+function syncPortableExtension() {
+  const out = portableExtDir()
+  if (!out) return null
+  const src = extensionDir()
+  /* 目标可能就是源（有人把便携版解到同一层）：那就什么都不用做 */
+  if (path.resolve(src) === path.resolve(out)) return out
+  if (!fs.existsSync(path.join(src, 'manifest.json'))) return null
+  try {
+    /* 整目录递归抄：插件里有多少个文件由插件自己说了算，这里不维护一份清单 */
+    fs.cpSync(src, out, {
+      recursive: true,
+      filter: (s) => path.basename(s) !== 'README.txt',
+    })
+    return out
+  } catch (e) {
+    boot('portable-ext-err', (e && e.message) || String(e))
+    return null
+  }
+}
+
+/* 便携版用的那份插件目录（同步成功后才有；没成功就还是用包内那份临时路径） */
+let portableExt = null
 
 /* ------------------------------------------------------------------ */
 /* 工具                                                                */
@@ -668,6 +712,8 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
             })
             engine = 'seg'
             pick = cands[i]
+            /* 和下面的 add-aria2 对称：日志里必须看得出这条到底交给了哪个引擎 */
+            boot('add-seg', f.name, `host=${hostOf(cands[i].url)} conns=${segConns}`)
             if (i) boot('url-candidate', f.name, `分段引擎改用备用地址 host=${hostOf(cands[i].url)}`)
           } catch (e) {
             /* 不支持 Range（老服务器）、或者探测失败 → 换下一条候选，都不行再回退 aria2 */
@@ -820,7 +866,15 @@ async function bridgeAdd(p) {
          * 留着旧头反而可能把一张「只认签名」的地址带歪。 */
         session[0].headers = { ...got.headers }
         viaParser = 'ssrn'
-        boot('bridge-add-fresh', name, `host=${hostOf(got.url)}`)
+        boot('bridge-add-fresh', name, `host=${hostOf(got.url)} cookie=${got.cookieLen || 0}`)
+      } else {
+        /* 换不出来只能把投递地址交下去，引擎多半会 403 —— 日志里留一句，才分得清
+         * 是「没带浏览器身份」还是「带了但站点还是拒」。 */
+        boot(
+          'bridge-add-fresh-miss',
+          name,
+          `status=${(got && got.status) || 0} cookie=${(got && got.cookieLen) || 0} clearance=${got && got.hasClearance ? 1 : 0}`
+        )
       }
     } catch (e) {
       boot('bridge-add-fresh-err', name, (e && e.message) || String(e))
@@ -1288,7 +1342,11 @@ function registerIpc() {
     return { ok: r.added.length > 0, added: r.added, errors: r.errors }
   })
 
-  ipcMain.handle('downloads:list', () => tasks.list())
+  ipcMain.handle('downloads:list', () => {
+    const list = tasks.list()
+    boot('tasks-list', 'n=' + list.length)
+    return list
+  })
   /* 渲染层丢掉一条解析结果时，顺手把主进程里那份会话缓存也丢掉（否则要等 30 分钟 TTL）。 */
   ipcMain.handle('parse:drop', (_e, sessionId) => {
     if (sessionId) parsers.dropSession(String(sessionId))
@@ -1455,11 +1513,57 @@ async function readdTask(gid, o, fresh) {
   return { gid: ngid, engine: nengine, was: st ? st.status : 'gone', live: !!live }
 }
 
+/* 自动换过链的任务：换完还失败就不再折腾（同一个 gid 只自动重来一次）。
+ * ⚠️ 这一段必须排在「注册 tasks.on('update')」之前执行完：事件回调是在另一个时机被调的，
+ * 但按名引用的东西如果还没求值（const/let 还在 TDZ 里），回调一进去就 ReferenceError ——
+ * 而那个异常会顺着 emit 冒进 _tick()，把这一轮的队列列表整个丢掉（界面就永远停在旧列表）。 */
+var autoRefreshed = new Set()
+
+/** 这条报错像不像「地址过期/被拒」：过期的地址重试多少次都是同样的错，换链才有意义 */
+var looksLikeAddrExpired = function (t) {
+  const code = String((t && t.errorCode) || '')
+  if (!code || code === '0') return false
+  /* aria2：16 = 文件已存在之类，22 = HTTP 响应头异常（403/404 都落这里） */
+  return /^(19|22|23)$/.test(code)
+}
+
+/**
+ * 「直链过期」这种失败自动换一次直链（只换一次，换完还失败就不再折腾）。
+ *
+ * 为什么需要：论文站预签名地址只有 5 分钟，夸克/百度这类网盘直链也会过期；
+ * 一条已经躺在队列里的任务，用户过一会儿点「继续」时地址早就死了，
+ * 引擎只会一遍遍重试同一个死地址，界面上停在 0%。
+ *
+ * @returns 真的发起了换链就返回 true
+ */
+var autoRefreshExpired = async function (list) {
+  const busy = (list || []).some((t) => t.status === 'active' || t.status === 'waiting')
+  if (busy) return false
+  for (const t of list || []) {
+    const gid = String(t.gid || '')
+    if (!gid || t.status !== 'error') continue
+    if (autoRefreshed.has(gid)) continue
+    if (!looksLikeAddrExpired(t)) continue
+    const meta = tasks.info(gid)
+    const o = meta && meta.origin
+    if (!o || !o.source) continue
+    autoRefreshed.add(gid)
+    boot('auto-refresh', o.name, `gid=${gid} code=${t.errorCode || ''}`)
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('downloads:notice', { text: `「${o.name}」的下载地址过期了，已换一条新的接着下` })
+    }
+    const r = await refreshTask(gid).catch(() => null)
+    boot('auto-refresh-done', o.name, r && r.ok ? `ok gid=${r.gid}` : `fail ${(r && r.message) || ''}`)
+    return true
+  }
+  return false
+}
+
 /**
  * 按「来源」重新取一条直链给这个任务换上（界面上那个「换直链」按钮走的就是这条）。
  * @returns `{ok, gid?, message, name?}`
  */
-async function refreshTask(gid) {
+var refreshTask = async function (gid) {
   const meta = tasks.info(gid)
   const o = meta && meta.origin
   if (!o || !o.source) {
@@ -1516,40 +1620,6 @@ async function refreshTask(gid) {
  *
  * @returns 真的发起了换链就返回 true
  */
-async function autoRefreshExpired(list) {
-  const busy = (list || []).some((t) => t.status === 'active' || t.status === 'waiting')
-  if (busy) return false
-  for (const t of list || []) {
-    const gid = String(t.gid || '')
-    if (!gid || t.status !== 'error') continue
-    if (autoRefreshed.has(gid)) continue
-    if (!looksLikeAddrExpired(t)) continue
-    const meta = tasks.info(gid)
-    const o = meta && meta.origin
-    if (!o || !o.source) continue
-    autoRefreshed.add(gid)
-    boot('auto-refresh', o.name, `gid=${gid} code=${t.errorCode || ''}`)
-    if (win && !win.isDestroyed()) {
-      win.webContents.send('downloads:notice', { text: `「${o.name}」的下载地址过期了，已换一条新的接着下` })
-    }
-    const r = await refreshTask(gid).catch(() => null)
-    boot('auto-refresh-done', o.name, r && r.ok ? `ok gid=${r.gid}` : `fail ${(r && r.message) || ''}`)
-    return true
-  }
-  return false
-}
-
-/** 这条报错像不像「地址过期/被拒」：过期的地址重试多少次都是同样的错，换链才有意义 */
-function looksLikeAddrExpired(t) {
-  const code = String((t && t.errorCode) || '')
-  if (!code || code === '0') return false
-  /* aria2：16 = 文件已存在之类，22 = HTTP 响应头异常（403/404 都落这里） */
-  return /^(19|22|23)$/.test(code)
-}
-
-/* 自动换过链的任务：换完还失败就不再折腾（同一个 gid 只自动重来一次） */
-const autoRefreshed = new Set()
-
 ipcMain.handle('downloads:refresh', async (_e, gid) => refreshTask(gid))
 ipcMain.handle('downloads:remove', async (_e, gid, mode) => {
     /* mode（只在「已下载完成的任务」上有意义）：
@@ -2009,6 +2079,11 @@ if (!gotLock) {
      * 有些站点（本机实测 papers.ssrn.com）连挑战页都拿不到，只会超时。 */
     const px = setOutboundProxy(proxy.effective(settings.load()))
     boot('outbound-proxy', px.proxy || '(直连)', px.ok ? 'ok' : '失败：' + (px.message || ''))
+    /* 便携版：把插件抄到 exe 旁边（固定路径），否则浏览器里那条扩展每次开机都失效 */
+    if (portableExeDir()) {
+      portableExt = syncPortableExtension()
+      boot('portable-ext', portableExt || '未同步', 'src=' + extensionDir())
+    }
     registerIpc()
     initAutoUpdater()
     /* 回收站索引跟着用户数据走；回收目录默认也在用户数据目录下（设置里可改），
@@ -2053,9 +2128,26 @@ if (!gotLock) {
     }, 4000)
 
     tasks.on('update', (list) => {
-      resumePreempted(list).catch(() => {})
-      autoRefreshExpired(list).catch(() => {})
-      if (win && !win.isDestroyed()) win.webContents.send('downloads:update', list)
+      /* ⚠️ 这个回调里抛出的异常会顺着 emit 冒进 taskManager 的 _tick()，
+       * 把这一轮算好的列表整个丢掉（界面就停在旧列表，看起来像「队列永远是 0」）。
+       * 所以每件事都各自兜住，谁也不许把异常放出去。 */
+      try {
+        resumePreempted(list).catch(() => {})
+      } catch (e) {
+        boot('update-handler-err', 'resumePreempted ' + ((e && e.message) || String(e)))
+      }
+      try {
+        autoRefreshExpired(list).catch((e) => boot('update-handler-err', 'autoRefreshExpired ' + ((e && e.message) || String(e))))
+      } catch (e) {
+        boot('update-handler-err', 'autoRefreshExpired ' + ((e && e.message) || String(e)))
+      }
+      try {
+        if (win && !win.isDestroyed()) win.webContents.send('downloads:update', list)
+      } catch (e) {
+        boot('update-handler-err', 'send ' + ((e && e.message) || String(e)))
+      }
+      /* 队列条数记一笔：以后有人报「队列是空的」，看日志就能分清是没算出来还是没送到界面 */
+      boot('tasks-update', 'n=' + (Array.isArray(list) ? list.length : -1))
     })
 
     /* 下载完成 → 回收转存副本，别让用户网盘里堆 `xxx(1).zip`；顺便按需打开下载目录。

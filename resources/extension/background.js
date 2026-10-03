@@ -305,6 +305,11 @@ function collectFileLinks() {
 async function handOver(items, info) {
   const referer = (info && info.pageUrl) || ''
   const title = (info && info.pageTitle) || ''
+  /* 投递之前，先把「这一页此刻的浏览器身份」交给 PanBox（不等它返回）。
+   * 有些站点（SSRN 这类 Cloudflare 挑战页）只认浏览器自己那份 cf_clearance，
+   * 隔几分钟再点面板下载，PanBox 手上那条现场早就过期了 —— 每投递一次就先喂一次，
+   * 现场永远比旧的那份新。失败了也不影响投递本身。 */
+  sendCurrentPageContext(info).catch(() => {})
   let okCount = 0
   let last = null
   for (const it of items) {
@@ -355,7 +360,13 @@ buildMenus()
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   await loadCfg()
-  const info2 = { pageUrl: info.pageUrl || (tab && tab.url) || '', pageTitle: (tab && tab.title) || '' }
+  const info2 = {
+    pageUrl: info.pageUrl || (tab && tab.url) || '',
+    pageTitle: (tab && tab.title) || '',
+    /* 右键那一页的 tabId：喂现场要用它，不能用「当前活动标签页」——
+     * 用户可以在别的标签页上点右键。 */
+    tabId: tab && tab.id != null ? tab.id : -1,
+  }
   try {
     if (info.menuItemId === 'panbox-link' && info.linkUrl) {
       await handOver([{ url: info.linkUrl, name: baseName(info.linkUrl) }], info2)
@@ -462,13 +473,19 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
 /**
  * 取「浏览器此刻在这个域上用的 Cookie」。
  * 先看 webRequest 现场抓到的（最真实，含 HttpOnly），没有再用 cookies API 拼。
+ * ⚠️ 先问 cookies API，别只信 `seen`：`seen` 只活在 service worker 的内存里，
+ * 被回收一次就没了（浏览器闲置 30 秒就会回收），而浏览器自己的 cookie 库一直都在。
+ * SSRN 那种站点只认浏览器现场那份 `cf_clearance`，少一个就是 403 —— 现场丢了还能
+ * 从 cookie 库里补回来，这是投递成功率的关键。
  */
 async function cookieFor(url, hint) {
   if (hint && hint.cookie) return hint.cookie
+  const live = await cookieHeader(url)
+  if (live) return live
   for (const [u, v] of seen) {
     if (v.cookie && u === url) return v.cookie
   }
-  return cookieHeader(url)
+  return ''
 }
 
 /** 这一页（含子框架）上，浏览器在各主机上用过的 Cookie，按主机去重后返回 */
@@ -1038,6 +1055,15 @@ async function deliverPageContext(tabId, rawUrl, title) {
   })
   if (r && r.ok) badge('✓', '#34c759')
   return r
+}
+
+/* 投递前顺手喂一次现场（不等结果）。tabId 可能没有（右键菜单那条路），
+ * 那就交给 deliverPageContext 自己去问当前标签页。 */
+function sendCurrentPageContext(info) {
+  const tabId = info && info.tabId != null ? info.tabId : -1
+  const url = (info && info.pageUrl) || ''
+  const title = (info && info.pageTitle) || ''
+  return deliverPageContext(tabId, url, title)
 }
 
 /* worker 每次被唤醒都跑一遍：把还在有效期内的记录读回来。

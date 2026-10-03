@@ -186,11 +186,23 @@ async function resolveDelivery(url, payload = {}) {
         name: nameOf(probe.headers.get('content-disposition'), '', abstractIdOf(url)),
         /* 预签名地址自带签名，头不需要跟着走 */
         headers: {},
+        /* 诊断用（只有长度和一个「关键 cookie 在不在」的布尔，没有值）：
+         * SSRN 的挑战只认浏览器自己那份 cf_clearance，日志里必须看得出这次到底带没带上。 */
+        cookieLen: jar.toString().length,
+        hasClearance: !!jar.get('cf_clearance'),
       }
     }
-    return { ok: false, url: target, name: '', headers }
-  } catch {
-    return { ok: false, url: target, name: '', headers }
+    return {
+      ok: false,
+      url: target,
+      name: '',
+      headers,
+      status: probe.status,
+      cookieLen: jar.toString().length,
+      hasClearance: !!jar.get('cf_clearance'),
+    }
+  } catch (e) {
+    return { ok: false, url: target, name: '', headers, status: 0, err: (e && e.message) || String(e), cookieLen: jar.toString().length }
   }
 }
 
