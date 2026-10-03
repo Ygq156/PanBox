@@ -14,7 +14,7 @@ const parsers = require('./parsers')
 const login = require('./core/login')
 const bridge = require('./core/bridge')
 const proxy = require('./core/proxy')
-const { detectNetdisk, setOutboundProxy, req } = require('./parsers/util')
+const { detectNetdisk, setOutboundProxy, req, withExt, hasKnownExt, contentTypeExt, urlBaseName } = require('./parsers/util')
 const browserCtx = require('./parsers/browserCtx')
 
 /* 安装版可以就地更新：electron-updater 走 NSIS，安装器会静默跑旧卸载器
@@ -418,6 +418,66 @@ function sanitizeName(s) {
   return name
 }
 
+/**
+ * 这个名字缺后缀时，问一下地址「你是什么」。服务器没给 `content-disposition`
+ * 文件名的时候，浏览器就是这么做决定的：URL 最后一段当名字，**响应类型补后缀**
+ * （`…/epdf/10.1145/3345768.3355908` → `3345768.3355908.pdf`）。PanBox 以前只取
+ * 名字不补后缀，用户拿到一个没后缀的文件，得自己改名才能打开。
+ *
+ * 只要响应头，正文一个字节都不读；失败了就算了，名字保持原样。
+ */
+async function ctOf(url, headers) {
+  if (!/^https?:\/\//i.test(url)) return { ct: '', cdName: '' }
+  for (const attempt of [
+    { method: 'HEAD', headers },
+    { method: 'GET', headers: { ...headers, Range: 'bytes=0-0' } },
+  ]) {
+    try {
+      const r = await req(url, { ...attempt, timeout: 12000, noBody: true, allowLocal: allowLocalReq() })
+      if (r.status >= 200 && r.status < 400) {
+        const cd = r.headers.get('content-disposition') || ''
+        const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
+        return { ct: r.headers.get('content-type') || '', cdName: m ? m[1].trim().replace(/^"|"$/g, '') : '' }
+      }
+      if (r.status === 405 || r.status === 501) continue
+      return { ct: '', cdName: '' }
+    } catch {
+      return { ct: '', cdName: '' }
+    }
+  }
+  return { ct: '', cdName: '' }
+}
+
+/**
+ * 提交下载之前把文件名定下来。检查顺序（前面的说了算）：
+ *   ① 插件/解析器给的名字 —— 它问过服务器，比这里猜的准；
+ *   ② 服务器这次自己给的文件名（`content-disposition`）；
+ *   ③ 按响应类型补后缀；
+ *   ④ 名字本身有后缀，就一个字都不动。
+ * 只在「网盘」以外的地址上问 —— 网盘直链的名字由各自的解析器定，地址是一次性签名，
+ * 多问一次白花站点资源还可能提前作废。
+ */
+async function resolveFileName(f, netdisk, headers) {
+  let name = sanitizeName(f.name || '')
+  const url = f.url || ''
+  if (!url || netdisk !== 'direct' || isLocalUrl(url)) return name
+  /* 名字是「地址路径最后一段」那种猜出来的（插件与解析器都这么兜底），
+   * 而地址其实把真名写在查询串上时，用查询串那个（见 util.urlBaseName）。
+   * 真的文件名（服务器给的、有后缀的）一律不动。 */
+  const fromUrl = urlBaseName(url)
+  if (fromUrl && hasKnownExt(fromUrl) && !hasKnownExt(name)) name = sanitizeName(fromUrl)
+  if (name && hasKnownExt(name)) return name
+  const got = await ctOf(url, headers || {})
+  /* 留一句给「下下来没有后缀」这类反馈用：一眼能看出这次有没有问出响应类型 */
+  boot('name-ext', name || '(空)', 'ct=' + (got.ct || '-'))
+  if (got.cdName) {
+    const cd = sanitizeName(got.cdName)
+    /* 服务器自己给的文件名优先，除非它自己也没后缀而我们有类型线索 */
+    if (cd && (hasKnownExt(cd) || !contentTypeExt(got.ct))) return cd
+  }
+  return sanitizeName(withExt(name, got.ct))
+}
+
 function buildHeaders(obj) {
   const out = []
   for (const [k, v] of Object.entries(obj || {})) {
@@ -583,10 +643,16 @@ function hostOf(url) {
   }
 }
 
-/** 本机地址（测试用的假站点）不做预检：那些站点的 HEAD 行为千奇百怪，白折腾 */
+/** 本机地址（测试用的假站点）不做预检：那些站点的 HEAD 行为千奇百怪，白折腾。
+ *  PANBOX_PROBE_LOCAL=1 时连本机地址也问一次 —— 只有端到端测试会开。 */
+function allowLocalReq() {
+  return process.env.PANBOX_PROBE_LOCAL === '1'
+}
+
 function isLocalUrl(url) {
   const h = hostOf(url)
-  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]'
+  const local = h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]'
+  return local && !allowLocalReq()
 }
 
 /**
@@ -643,6 +709,8 @@ async function firstHandable(cands, name) {
 async function addResolved(cfg, { session, netdisk, source, title, sessionId }) {
   const added = []
   const errors = []
+  /* 定稿后的名字（与落盘、队列显示的是同一个），给调用方回话用 */
+  const names = []
   const shareTitle = sanitizeName(title || 'PanBox')
   /* 只有一个文件、且它没有目录归属时，直接落在下载根目录。
    * 否则会出现「下载目录/文件名/文件名」这种多此一举的嵌套——
@@ -650,6 +718,9 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
   const nest = session.length > 1 || session.some((f) => f.dir)
 
   for (const f of session) {
+    /* 名字在这里定稿：缺后缀的按响应类型补上（详见 resolveFileName）。
+     * 定稿之后再算目录、落盘名、队列名，三处都是同一个名字。 */
+    f.name = await resolveFileName(f, netdisk, f.headers)
     const subdir = nest
       ? path.join(cfg.downloadDir, shareTitle, ...(f.dir ? String(f.dir).split(/[\\/]/).filter(Boolean).map(sanitizeName) : []))
       : cfg.downloadDir
@@ -761,12 +832,13 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
        * 用 cleanupRemember 而不是直接 set：同名任务不会互相覆盖记录。 */
       cleanupRemember(f.name, sessionId)
       added.push(gid)
+      names.push(f.name)
     } catch (e) {
       errors.push(`${f.name}: ${e && e.message ? e.message : e}`)
     }
   }
   tasks.kick()
-  return { added, errors }
+  return { added, errors, names }
 }
 
 /* ------------------------------------------------------------------ */
@@ -848,6 +920,9 @@ async function bridgeAdd(p) {
       name = ''
     }
   }
+  /* 插件从响应头里读到过类型就先用上（ACM 那类地址最后一段是个编号，没有后缀）。
+   * 没读到也不要紧：addResolved 提交前会自己问一次。 */
+  name = sanitizeName(withExt(name, (p && p.mime) || ''))
   if (!name) name = 'download.bin'
 
   const session = [{ id: '0', name, size: finalSize || Number((p && p.size) || 0), isDir: false, dir: '', url: finalUrl, headers }]
@@ -887,7 +962,9 @@ async function bridgeAdd(p) {
     title: (p && p.pageTitle) || name,
   })
   if (!r.added.length) return { ok: false, message: r.errors[0] || '加入下载队列失败' }
-  return { ok: true, kind: 'direct', name, gid: r.added[0], message: `已加入下载队列：${name}` }
+  /* 回话用定稿后的名字：面板上显示的和队列里、磁盘上的保持一致 */
+  const done = r.names[0] || name
+  return { ok: true, kind: 'direct', name: done, gid: r.added[0], message: `已加入下载队列：${done}` }
 }
 
 /**
