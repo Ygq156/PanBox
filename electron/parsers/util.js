@@ -249,11 +249,22 @@ async function req(url, opts = {}) {
      * 少数探测型调用方（只看 Location / 类型，不看正文）用它省一次读取；
      * 打开后返回值里的 `body` 就是原始流，读取请用 readTextCapped(res, MAX_RESP_SIZE)。 */
     noBody = false,
+    /* 这条请求要不要带上「浏览器现场」（真 UA、浏览器的 Referer、反爬看的那组头，
+     * 以及**调用方自己没带这台会话时**才补的浏览器 Cookie）。**只给页面/文档请求开**：
+     * 账号 API 继续用设置里那份凭证 —— 浏览器里登的可能是另一个账号。
+     * 注意现场的 UA / Referer / Sec-Fetch-* 会盖掉调用方写死的常量（真 UA 才骗得过反爬），
+     * 所以「服务端明确要求伪装成某个 UA」的那类请求不要开它。 */
+    browser = false,
   } = opts
 
-  const h = { 'User-Agent': DEFAULT_UA, ...headers }
+  let h = { 'User-Agent': DEFAULT_UA, ...headers }
   const ck = jar ? jar.toString(cookie) : cookie
   if (ck) h['Cookie'] = ck
+  /* 延迟 require：identity.js 反过来 require 本文件拿 Jar，写在文件头上会成环。
+   * Cookie 只在调用方自己没带的时候才补：调用方带了这台主机的会话（设置里的账号凭证、
+   * 解析器自己算出来的那串）就整份以调用方为准 —— 两套会话的 cookie 混在一起，
+   * 服务端认哪一个都说不准，反倒可能把现在能用的站搞成「登录态失效」。 */
+  if (browser) h = require('./identity').forRequest(url, h, { cookie: !h.Cookie })
 
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), timeout)

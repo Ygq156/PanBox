@@ -116,7 +116,9 @@ module.exports = {
     }
 
     /* ① init：拿匿名 cookie */
-    const init = await req(`https://pan.baidu.com/share/init?surl=${surl}`, { headers: { ...h, Referer: 'https://pan.baidu.com/' } })
+    /* 这三条都是「浏览器里点开分享页」的那几个请求：带上现场（真 UA + 浏览器在这台主机上的 cookie）。
+       带了 bduss 时调用方自己那份 cookie 会被完整保留，现场只补 UA/Referer（见 util.req 的 browser 开关）。 */
+    const init = await req(`https://pan.baidu.com/share/init?surl=${surl}`, { headers: { ...h, Referer: 'https://pan.baidu.com/' }, browser: true })
     let cookie = mergeCookie(bduss, cookieOf(init))
 
     /* ② 有提取码就校验，成功后服务端下发 BDCLND，没有它分享页只会显示「提取文件」 */
@@ -131,6 +133,7 @@ module.exports = {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: `pwd=${encodeURIComponent(ctx.password)}&vcode=&vcode_str=`,
+        browser: true,
       })
       let vj = {}
       try {
@@ -149,6 +152,7 @@ module.exports = {
     /* ③ 请求分享页，文件列表就在 locals-data 里 */
     const page = await req(`https://pan.baidu.com/s/${shareId}`, {
       headers: { ...h, Referer: 'https://pan.baidu.com/', Cookie: cookie },
+      browser: true,
     })
     const locals = parseLocals(page.text)
 
