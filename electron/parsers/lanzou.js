@@ -20,6 +20,7 @@ const {
   UA_PC_CHROME,
   UA_MOBILE_ANDROID,
   sanitizeFileName,
+  isBinaryBody,
 } = require('./util')
 const { probeUrl, PROBE_TIMEOUT_LONG } = require('./probe')
 const { withArg1Retry, hasChallenge, extractArg1, acwScV2 } = require('./esa')
@@ -59,11 +60,12 @@ const P_FILEMORE = /url\s*:\s*'(\/filemoreajax\.php\?file=\d+)'[\s\S]*?data\s*:\
  * 是 text/html，照旧读出来，所以不能一律不读。 */
 function isFileResponse(r) {
   if (!r) return false
-  if (r.isBinary) return true
   const cd = String(r.headers.get('content-disposition') || '')
   if (/attachment/i.test(cd)) return true
-  const ct = String(r.headers.get('content-type') || '')
-  return !!ct && !/^(?:text\/|application\/(?:xhtml\+xml|json|javascript|xml))/i.test(ct)
+  /* 是不是「二进制本体」只认 util 那一份判据。这里以前另写了一条正则，比 util 少了
+   * `application/xxx+json`、`application/ecmascript`、`x-www-form-urlencoded` 三种
+   * —— 那三种都是**接口的文本回包**，被当成文件收下就等于给用户一个内容不对的成品。 */
+  return isBinaryBody(r.headers)
 }
 
 const AJAX_FALLBACK_ORIGINS = [
