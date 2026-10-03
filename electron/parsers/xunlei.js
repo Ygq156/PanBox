@@ -32,6 +32,7 @@
 
 const crypto = require('node:crypto')
 const { req, reqJson, deepFind, sleep } = require('./util')
+const { pollUntil, sameFile, Reclaimer } = require('./transferReclaim')
 
 const AUTH_BASE = 'https://xluser-ssl.xunlei.com'
 const PAN_BASE = 'https://api-pan.xunlei.com'
@@ -397,14 +398,14 @@ async function open(url, ctx = {}) {
   }))
 
   /** 转存到用户自己网盘的文件，下载完成后要删掉（与夸克/UC 的回收机制同一套） */
-  const transferred = []
+  const rec = new Reclaimer()
 
   return {
     shareId,
     title,
     files,
-    resolve: makeResolver({ shareId, passToken, flat, cred, deviceId, transferred }),
-    removeTransferred: () => removeTransferred(transferred),
+    resolve: makeResolver({ shareId, passToken, flat, cred, deviceId, rec }),
+    removeTransferred: () => removeTransferred(rec.items),
   }
 }
 
@@ -412,7 +413,7 @@ async function open(url, ctx = {}) {
 /* 取直链（需要登录）                                                  */
 /* ------------------------------------------------------------------ */
 
-function makeResolver({ shareId, passToken, flat, cred, deviceId, transferred }) {
+function makeResolver({ shareId, passToken, flat, cred, deviceId, rec }) {
   return async function resolve(id) {
     const e = flat[Number(id)]
     if (!e) throw new Error('文件不存在')
@@ -455,6 +456,8 @@ function makeResolver({ shareId, passToken, flat, cred, deviceId, transferred })
       /* 落到下面的轮询兜底 */
     }
     if (!fid && traceRaw && typeof traceRaw === 'string' && !traceRaw.startsWith('{')) fid = traceRaw
+    /* 这个 fid 是**服务端映射给的证据**还是**靠名字猜的**？两者对「能不能删」的意义完全不同。 */
+    const trusted = !!fid
 
     if (!fid) {
       // 兜底：按文件名在根目录里轮询找新文件
@@ -467,22 +470,14 @@ function makeResolver({ shareId, passToken, flat, cred, deviceId, transferred })
           deviceId,
           cred,
         })
-      const same = (a, b) => {
-        if (a === b) return true
-        const stem = (s) => String(s).replace(/(\.[^.]*)$/, '')
-        const ext = (s) => (/(\.[^.]*)$/.exec(String(s)) || ['', ''])[0]
-        const re = new RegExp(
-          '^' + stem(b).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '( \\(\\d+\\))?' + ext(b).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$',
-        )
-        return re.test(a)
-      }
-      let hit = null
-      for (let i = 0; i < 20 && !hit; i++) {
-        const page = await listFiles()
-        const arr = Array.isArray(page) ? page : page.files || []
-        hit = arr.map(toEntry).find((x) => !x.isDir && same(x.name, e.name))
-        if (!hit) await sleep(600)
-      }
+      const hit = await pollUntil(
+        async () => {
+          const page = await listFiles()
+          const arr = Array.isArray(page) ? page : page.files || []
+          return arr.map(toEntry).find((x) => !x.isDir && sameFile(x.name, e.name)) || null
+        },
+        { attempts: 20, intervalMs: 600 },
+      )
       if (!hit) {
         const st = String(restored.restore_status || '')
         throw new Error(
@@ -492,7 +487,16 @@ function makeResolver({ shareId, passToken, flat, cred, deviceId, transferred })
       }
       fid = hit.id
     }
-    transferred.push({ fid, deviceId, cred })
+    /* 登记待删副本。⚠️ 只认 `trace_file_ids` 给的那个 fid。
+     * 兜底那条路是按文件名在根目录里找**第一个匹配项**，用户本来就有同名文件时，
+     * 命中的会是用户自己的文件 —— 登记了就等于「下载完把用户的东西删掉」。
+     * 宁可把一份副本留在用户网盘里，也不能删错。 */
+    if (trusted) rec.claimKnown(fid, { deviceId, cred })
+    else {
+      console.warn(
+        `[xunlei] 转存后的文件 id 只能按文件名猜（${e.name}），未登记回收（保守：绝不误删用户文件）`,
+      )
+    }
 
     // ③ 取直链
     const detail = await panCall({
@@ -518,7 +522,7 @@ function makeResolver({ shareId, passToken, flat, cred, deviceId, transferred })
 
 /** 删除转存副本（下载完成后调用） */
 async function removeTransferred(items) {
-  const list = (Array.isArray(items) ? items : [items]).filter((x) => x && x.fid)
+  const list = (Array.isArray(items) ? items : [items]).filter((x) => x && x.id)
   if (!list.length) return false
   const { deviceId, cred } = list[0]
   if (!cred || !cred.accessToken) return false
@@ -528,7 +532,7 @@ async function removeTransferred(items) {
     action: 'POST:/drive/v1/files:batchDelete',
     deviceId,
     cred,
-    body: { ids: list.map((x) => x.fid), space: '' },
+    body: { ids: list.map((x) => x.id), space: '' },
   })
   return true
 }
