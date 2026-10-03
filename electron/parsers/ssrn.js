@@ -33,15 +33,22 @@ function siteBase() {
 }
 
 /** 把一条 ssrn.com 上的地址换成「当前生效的站点起点」上的同一条地址。
- *  生产环境起点就是自己，等于原样返回；测试时才真的换。 */
-function onSite(url) {
+ *  生产环境起点就是自己，等于原样返回；测试时才真的换。
+ *  `base` 只给一处的回退用（见 deliveryIsFresh），平时不传。 */
+function onSite(url, base) {
   try {
     const u = new URL(url)
-    const b = new URL(siteBase())
+    const b = new URL(base || siteBase())
     return new URL(u.pathname + u.search, b).toString()
   } catch {
     return url
   }
+}
+
+/** 这条地址是不是 SSRN 的「投递」地址（还需要 302 一次才到真文件）。
+ *  插件抓下来的常常就是这种，而它**会过期**：302 的终点是 5 分钟有效的预签名地址。 */
+function isDelivery(url) {
+  return /\/Delivery\.cfm\//i.test(String(url || ''))
 }
 
 /** 文章页地址 → 稿件号；认不出来返回 '' */
@@ -136,12 +143,82 @@ function pageHeaders(url, fallbackReferer) {
   return browserCtx.headersFor({}, url, fallbackReferer) || {}
 }
 
+/**
+ * 把一条投递地址换成**此刻可用**的真地址（预签名 S3 那条）。
+ *
+ * 为什么必须有这一步：插件抓到的那条 `/sol3/Delivery.cfm/…` 本身是长期地址，但它
+ * 302 的终点是 5 分钟就失效的预签名地址；用户点开面板、看两眼、再点下载，那条抓下来
+ * 的预签名地址往往已经死了，引擎拿到只会得到 403。所以下载前一律重新换一次。
+ *
+ * @param url     投递地址（`/sol3/Delivery.cfm/…`）
+ * @param payload 浏览器身份（`{cookie, headers, referer, userAgent}`），由插件/解析现场给；
+ *                另有 `siteUrl`：**浏览器现场是按哪条地址存的**。只在测试里两者才会不同
+ *                （解析器把主机重写成假站点时，现场仍存在真站那个主机名下）。
+ * @returns `{url, name, headers, ok}`；`ok=false` 时 `url` 仍是可下的一条（但可能需要浏览器身份）
+ */
+async function resolveDelivery(url, payload = {}) {
+  const target = deliveryNeedsSite(url) ? url : onSite(url)
+  const siteUrl = payload.siteUrl || target
+  const withCookie = { ...(payload.headers || {}) }
+  if (payload.referer && !withCookie.Referer) withCookie.Referer = payload.referer
+  if (payload.userAgent && !withCookie['User-Agent']) withCookie['User-Agent'] = payload.userAgent
+  /* cookie 罐**无条件**建：现场里存着的那份（插件交过来放进去的）和调用方这次额外带的
+   * 合并到一起。以前写成「payload 里有 cookie 才建罐」，于是"现场里有身份、这一次没另带"
+   * 就把现场整个丢了 —— 表现是投递请求裸奔过去吃 403。 */
+  const jar = browserCtx.jarFor(siteUrl, payload.cookie)
+  const headers = { ...pageHeaders(siteUrl, siteBase() + '/'), ...withCookie }
+  try {
+    const probe = await req(target, {
+      method: 'GET',
+      /* 不给 fallbackReferer：终点常常已经换到别家公司的主机上（download.ssrn.com 或 S3），
+       * 把论文页地址当 Referer 带过去既是跨站泄露，也不是浏览器会做的事。 */
+      headers: { ...headers, Range: 'bytes=0-0' },
+      jar,
+      timeout: 30000,
+      noBody: true,
+      allowLocal: !!process.env.PANBOX_SSRN_BASE,
+    })
+    if (probe.status >= 200 && probe.status < 300) {
+      const finalUrl = probe.url || target
+      return {
+        ok: true,
+        url: finalUrl,
+        name: nameOf(probe.headers.get('content-disposition'), '', abstractIdOf(url)),
+        /* 预签名地址自带签名，头不需要跟着走 */
+        headers: {},
+      }
+    }
+    return { ok: false, url: target, name: '', headers }
+  } catch {
+    return { ok: false, url: target, name: '', headers }
+  }
+}
+
+/** 已经是真地址了（预签名那条，自带 `X-Amz-Signature` 之类的签名参数）就不要再换一次 ——
+ *  换了反而会把签名参数丢掉。判据是**签名参数**，不是「在不在 ssrn.com 上」：
+ *  测试里那条假地址也不在 ssrn.com 上，但它仍然需要被 302 一次。 */
+function deliveryNeedsSite(url) {
+  return !/[?&](x-amz-signature|x-amz-credential|signature|token)=/i.test(String(url || ''))
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return ''
+  }
+}
+
 module.exports = {
   netdisk: 'ssrn',
 
   test(url) {
     return !!abstractIdOf(url)
   },
+
+  /* 给「换直链」与插件那条路用：把抓到的投递地址换成此刻可用的真地址 */
+  resolveDelivery,
+  isDelivery,
 
   async open(url, ctx = {}) {
     const id = abstractIdOf(url)
@@ -181,33 +258,27 @@ module.exports = {
         /* 先试着把预签名地址换出来：那条地址不带 Cookie、也没有 5 分钟之外的约束，
          * 下载引擎拿着它最省事。换不出来就把投递地址连同浏览器身份一起交下去。 */
         const probeUrl = onSite(delivery)
-        try {
-          const probe = await req(probeUrl, {
-            method: 'GET',
-            /* 这里**不给** fallbackReferer：目标常常已经被 302 换到了另一家公司的主机上
-             * （download.ssrn.com 或 S3），把论文页地址当 Referer 带过去既是跨站泄露，
-             * 也不是浏览器会做的事。同一个主机上的现场（真有的话）仍然会带上。 */
-            headers: { ...pageHeaders(probeUrl), Range: 'bytes=0-0' },
-            jar,
-            timeout: 30000,
-            noBody: true,
-            allowLocal: !!process.env.PANBOX_SSRN_BASE,
-          })
-          if (probe.status >= 200 && probe.status < 300) {
-            /* 探测时跟到的最后一跳就是**真的要下的那条**（预签名 S3 地址）；
-             * 生产环境返回给引擎的是它，测试环境里它落在假站点上，要换回真域名。 */
-            const finalUrl = probe.url || probeUrl
-            const nm = nameOf(probe.headers.get('content-disposition'), title, id)
-            return {
-              url: finalUrl,
-              headers: { 'User-Agent': pageHeaders(probeUrl)['User-Agent'] || '' },
-              name: nm,
-            }
+        /* 现场用重写前的 `delivery` 取：那是浏览器真正待过的主机（测试里主机被换成假站点，
+         * 现场仍存在真站名下；两边都传真站地址，生产环境行为不变）。 */
+        const got = await resolveDelivery(probeUrl, { cookie: ctx.cookie, headers: pageHeaders(delivery), siteUrl: delivery })
+        if (got.ok) {
+          return {
+            url: got.url,
+            /* 预签名地址自带签名，身份一概不用带（带了反而可能被 CDN 判成异常） */
+            headers: {},
+            name: got.name || name,
           }
-        } catch {
-          /* 交给下面的回退 */
         }
-        return { url: delivery, headers: pageHeaders(delivery, url), name }
+        /* 没换出来（挑战没过、或者本来就没身份）：把投递地址连同浏览器身份交下去，
+         * 让引擎自己跟那一次 302。 */
+        return {
+          url: delivery,
+          headers: pageHeaders(delivery, url),
+          name,
+          /* 备用地址：投递地址走不通时，引擎还有这一条可以试（可能是刚才那条预签名
+           * 地址，也可能就是同一条投递地址 —— 重复的那条会被引擎忽略）。 */
+          urls: [{ url: got.url, headers: got.headers }],
+        }
       },
     }
   },

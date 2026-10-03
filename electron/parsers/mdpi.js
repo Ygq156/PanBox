@@ -177,7 +177,7 @@ module.exports = {
     return !!a && known(a.issn)
   },
 
-  async open(url) {
+  async open(url, ctx = {}) {
     const a = parseArticle(url)
     if (!a) throw new Error('这不是 MDPI 的文章页地址（形如 https://www.mdpi.com/1999-5903/15/6/192）')
     const j = JOURNALS[a.issn]
@@ -207,7 +207,34 @@ module.exports = {
       shareId: url,
       files: [{ id: '0', name, size, isDir: false, dir: '' }],
       /* 直链是算出来的、不带任何会话凭证，解析与下载都不需要额外请求头 */
-      resolve: async () => ({ url: pdf, headers: {}, name }),
+      resolve: async () => ({
+        url: pdf,
+        headers: {},
+        name,
+        /* 备用那条是文章页自己的 /pdf：它挂在 Akamai 后面，本机实测会吃 403 或挑战页，
+         * 所以只当兜底，排在 CDN 后面。个别网络出口上 CDN 会被拒，那时这条还能试一次。 */
+        urls: [{ url: `${siteBaseOf(url)}/pdf`, headers: pageHeaders(url) }],
+      }),
     }
   },
+}
+
+/** 文章页上那条 /pdf 的绝对地址（只在兜底候选里用） */
+function siteBaseOf(url) {
+  try {
+    const u = new URL(url)
+    const seg = u.pathname.split('/').filter(Boolean).slice(0, 4)
+    return `${u.origin}/${seg.join('/')}`
+  } catch {
+    return String(url || '').replace(/\/+$/, '')
+  }
+}
+
+/** 这一站上浏览器此刻的身份；没有现场就是空对象（`browserCtx` 只在 Electron 里有） */
+function pageHeaders(url) {
+  try {
+    return require('./browserCtx').headersFor({}, url) || {}
+  } catch {
+    return {}
+  }
 }

@@ -837,6 +837,23 @@ function SettingsModal({
                   </Row>
                 </Section>
                 <Section title="回收站">
+                  <Row stack title="回收站目录" err={rowErr.trashDir}>
+                    <div className="row">
+                      <input
+                        type="text"
+                        value={s.trashDir || ''}
+                        onChange={(e) => patch({ trashDir: e.target.value })}
+                      />
+                      <button
+                        onClick={async () => {
+                          const dir = await api.pickDir('trash')
+                          if (dir) patch({ trashDir: dir })
+                        }}
+                      >
+                        选择…
+                      </button>
+                    </div>
+                  </Row>
                   <Row
                     title="自动清理"
                     desc="超过期限的文件从回收站里彻底删除。"
@@ -1497,6 +1514,8 @@ export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [showSettings, setShowSettings] = useState(false)
   const [showTrash, setShowTrash] = useState(false)
+  /** ✕ 点在一个「已下载完成」的任务上时，先问一句文件怎么处理 */
+  const [confirmDel, setConfirmDel] = useState<{ gid: string; name: string } | null>(null)
   const [text, setText] = useState('')
   const [pwd, setPwd] = useState('')
   const [parsing, setParsing] = useState(false)
@@ -1527,6 +1546,11 @@ export default function App() {
     api.aria2Status().then(setAria2).catch(() => {})
     api.listDownloads().then(setTasks).catch(() => {})
     const off = api.onDownloadsUpdate(setTasks)
+    /* 主进程在后台替用户做的事（直链过期后自动换了一条之类）：用同一处提示条说一句，
+     * 免得任务自己变了个样子而用户不知道发生了什么。 */
+    const offNotice = api.onDownloadsNotice?.((d) => {
+      if (d && d.text) setHint({ kind: 'ok', msg: d.text })
+    })
     /* 浏览器插件投进来一个「网盘分享链接」时，主进程不会擅自决定下哪些文件，
      * 而是把链接送到这里填进输入框，让用户自己勾选。 */
     const offPre = api.onBridgePrefill?.((d) => {
@@ -1547,6 +1571,7 @@ export default function App() {
     const offUpd = api.onUpdateAvailable?.((d) => setNewVer(d))
     return () => {
       off()
+      if (offNotice) offNotice()
       if (offPre) offPre()
       if (offUpd) offUpd()
     }
@@ -1599,6 +1624,28 @@ export default function App() {
     },
     [results, dropSessionsOf],
   )
+
+  /* 从队列里移除一条任务。下到一半的直接移除（本地那点临时文件跟着清掉）；
+   * 已经下完的问一句「文件怎么处理」—— 磁盘上的文件不该被一个 ✕ 悄悄留下或悄悄抹掉。 */
+  const removeTask = useCallback(async (t: { gid: string; name: string; status?: string }, mode?: 'trash' | 'purge') => {
+    if (t.status === 'complete' && !mode) {
+      setConfirmDel({ gid: t.gid, name: t.name })
+      return
+    }
+    /* 必须等 IPC 回来再刷新：移除要先把结果从引擎的停止列表里清掉，
+     * 否则下一次轮询会把它原样读回来，看起来像「点了没反应」。 */
+    try {
+      const r = await api.removeTask(t.gid, mode)
+      if (r && r.ok === false) setHint({ kind: 'err', msg: r.message || '移除失败' })
+      else if (mode === 'trash') setHint({ kind: 'ok', msg: `已把「${r?.name || t.name}」放进回收站，之后可以还原` })
+      else if (mode === 'purge') setHint({ kind: 'ok', msg: `已彻底删除「${r?.name || t.name}」` })
+      setConfirmDel(null)
+      setTasks((await api.listDownloads()) || [])
+    } catch (e) {
+      setHint({ kind: 'err', msg: `移除失败：${String((e as Error)?.message || e)}` })
+      setConfirmDel(null)
+    }
+  }, [])
 
   const doParse = useCallback(async () => {
     const raw = text.trim()
@@ -1970,17 +2017,12 @@ export default function App() {
                       )}
                       <button
                         className="ghost tiny"
-                        title="移除（下到一半的会立刻回收转存副本）"
-                        onClick={async () => {
-                          /* 必须等 IPC 回来再刷新：移除要先把结果从引擎的停止列表里清掉，
-                           * 否则下一次轮询会把它原样读回来，看起来像「点了没反应」。 */
-                          try {
-                            await api.removeTask(t.gid)
-                            setTasks((await api.listDownloads()) || [])
-                          } catch (e) {
-                            setHint({ kind: 'err', msg: `移除失败：${String((e as Error)?.message || e)}` })
-                          }
-                        }}
+                        title={
+                          t.status === 'complete'
+                            ? '移除（会问一句文件怎么处理）'
+                            : '移除（下到一半的会立刻回收转存副本）'
+                        }
+                        onClick={() => removeTask(t)}
                       >
                         ✕
                       </button>
@@ -2004,6 +2046,34 @@ export default function App() {
 
       {showTrash && (
         <TrashModal retentionDays={settings?.trashRetentionDays ?? 30} onClose={() => setShowTrash(false)} />
+      )}
+
+      {/* 移除一个「已下载完成」的任务：磁盘上那份文件要用户自己说怎么处理 */}
+      {confirmDel && (
+        <div className="mask" onMouseDown={(e) => e.target === e.currentTarget && setConfirmDel(null)}>
+          <div className="modal confirm">
+            <h2>删除这个文件？</h2>
+            <div className="confirm-body">
+              <div className="confirm-name" title={confirmDel.name}>
+                {confirmDel.name}
+              </div>
+              <div className="confirm-note">
+                放进回收站可以还原；彻底删除会连磁盘上的文件一起删掉。
+              </div>
+            </div>
+            <div className="confirm-foot">
+              <button className="keep" onClick={() => removeTask(confirmDel, 'trash')}>
+                放进回收站
+              </button>
+              <button className="wipe" onClick={() => removeTask(confirmDel, 'purge')}>
+                彻底删除
+              </button>
+              <button className="ghost" onClick={() => setConfirmDel(null)}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )
