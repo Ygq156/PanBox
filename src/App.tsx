@@ -1,45 +1,23 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
 import { api, formatEta, formatSize, formatSpeed } from './api'
-import type { AppInfo, BridgeStatus, ProxyStatus, TrashItem, UpdateInfo, UpdateState } from './api'
-import type { Aria2Status, DownloadTask, ParseEndpoint, ParseResult, Settings } from './types'
-import siteTable from '../electron/parsers/sites.json'
+import type { AppInfo, UpdateInfo, UpdateState } from './api'
+import type { Aria2Status, DownloadTask, ParseResult, Settings } from './types'
+import { COOKIE_TARGETS, LOGIN_TARGETS, SEG_TARGETS, label } from './sites'
+import { NumBox, NumberRow, Row, Section, Switch, Tip } from './ui/parts'
+import { errText } from './ui/text'
+import { mergeTasks } from './tasks'
+import { EndpointSection } from './settings/EndpointSection'
+import { ProxySection } from './settings/ProxySection'
+import { BridgeSection } from './settings/BridgeSection'
+import { TrashModal } from './trash/TrashModal'
 
 /* ------------------------------------------------------------------ */
 /* 常量                                                                */
 /* ------------------------------------------------------------------ */
 
-/* 站点表：一个站点「叫什么、能干什么」只写这一份（electron/parsers/sites.json），
- * 主进程与界面都读它。以前这套清单在本文件里有四份（名字、能登录、能手贴凭证、
- * 能配解析接口），主进程里还有两份（分享链接、认得出但没实现），加一个站要改六处。 */
-type SiteInfo = {
-  label: string
-  share?: boolean
-  supported?: boolean
-  login?: boolean
-  cookie?: boolean
-  endpoint?: boolean
-  seg?: boolean
-}
-const SITES = siteTable.sites as Record<string, SiteInfo>
-const byFlag = (flag: keyof SiteInfo) =>
-  Object.entries(SITES)
-    .filter(([, v]) => v[flag])
-    .map(([k]) => k)
-
-const NETDISK_LABEL: Record<string, string> = Object.fromEntries(
-  Object.entries(SITES).map(([k, v]) => [k, v.label]),
-)
-
-const label = (k: string) => NETDISK_LABEL[k] ?? k
-
-/** 能一键开登录窗抓凭证的网盘，同时也是「网盘账号」下拉的顺序 */
-const LOGIN_TARGETS = byFlag('login')
 /* 主进程把凭证打码后才发到界面（防止页面脚本读到原文）。这个串表示「本机已有一份，
  * 界面不回显」——保存时原样传回去，主进程认这个串就保留磁盘上那份。 */
 const COOKIE_MASK = '__PANBOX_KEEP__'
-/** 只能手贴凭证的网盘 */
-const COOKIE_TARGETS = [...byFlag('login'), ...byFlag('cookie')]
 
 /** 键顺序无关的 JSON（比「有没有改动」用；两侧对象是不同地方拼出来的，键顺序不保证一致） */
 function stableJson(v: unknown): string {
@@ -53,12 +31,6 @@ function stableJson(v: unknown): string {
     return val
   })
 }
-
-/** 走自研分段引擎的网盘。百度不在此列 —— 它是账号级总量限速，加连接只会招 403。 */
-const SEG_TARGETS = byFlag('seg')
-
-/** 「解析接口」可以勾选的网盘（顶层域名会被自动识别成这些代号） */
-const EP_NETDISKS = byFlag('endpoint')
 
 /** 解析成功后，结果面板底下的一句话提示（原来每个网盘一段 if，现在一张表） */
 const NETDISK_TIP: Record<string, { warn?: boolean; text: string }> = {
@@ -75,362 +47,6 @@ const NEED_LOGIN_TIP: Record<string, string> = {
   uc: '需要登录你自己的 UC 账号。',
   xunlei: '需要登录你自己的迅雷账号。',
   baidu: '需要登录你自己的百度账号。',
-}
-
-/* ------------------------------------------------------------------ */
-/* 小积木                                                              */
-/* ------------------------------------------------------------------ */
-
-/** 结果面板里的一条提示 */
-function Tip({ warn, children }: { warn?: boolean; children: ReactNode }) {
-  return <div className={`result-note${warn ? ' warn' : ''}`}>{children}</div>
-}
-
-/** 设置页里的分组：原来所有字段平铺成一长条，找不到东西 */
-function Section({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <section className="sec">
-      <h3>{title}</h3>
-      <div className="sec-body">{children}</div>
-    </section>
-  )
-}
-
-function Field({
-  label: text,
-  hint,
-  children,
-}: {
-  label: string
-  hint?: ReactNode
-  children: ReactNode
-}) {
-  return (
-    <div className="field">
-      <label>{text}</label>
-      {children}
-      {hint ? <div className="desc">{hint}</div> : null}
-    </div>
-  )
-}
-
-/* ------------------------------------------------------------------ */
-/* 网盘解析接口                                                        */
-/* ------------------------------------------------------------------ */
-
-/**
- * 用户自备的「解析站」接口。PanBox 内置解析走「用你自己的账号转存取直链」，
- * 速度上限就是你自己账号的档位；这类接口用自己的会员账号取链，所以能跑满。
- * 程序只负责转发链接、取出直链、交给下载引擎，**不内置也不推荐任何具体解析站**。
- */
-function EndpointSection({
-  list,
-  onChange,
-  ack,
-  onAck,
-}: {
-  list: ParseEndpoint[]
-  onChange: (next: ParseEndpoint[]) => void
-  ack: boolean
-  onAck: (v: boolean) => void
-}) {
-  const upd = (id: string, p: Partial<ParseEndpoint>) =>
-    onChange(list.map((x) => (x.id === id ? { ...x, ...p } : x)))
-
-  const add = () =>
-    onChange([
-      ...list,
-      {
-        id: `ep-${Date.now().toString(36)}`,
-        name: '',
-        url: '',
-        method: 'GET',
-        body: '',
-        contentType: '',
-        field: '',
-        headers: '',
-        dlHeaders: '',
-        netdisks: [],
-        enabled: true,
-      },
-    ])
-
-  return (
-    <Field
-      label="解析接口（可选，优先于内置解析）"
-      hint={
-        <>
-          接口地址由你自己提供，可用占位：<b>{'{url}'} {'{pwd}'} {'{shareId}'} {'{netdisk}'}</b>。
-          填了提取码时，提取码会随分享链接发给接口；你的网盘凭证<b>不会</b>发往接口。
-        </>
-      }
-    >
-      <div className="endpoint-add">
-        <button onClick={add} disabled={list.length >= 8}>
-          ＋ 添加接口
-        </button>
-        <span className="ep-hint">{list.length}/8</span>
-      </div>
-
-      {list.map((ep) => (
-        <div className="endpoint" key={ep.id}>
-          <div className="endpoint-head">
-            <label className="ep-toggle">
-              <input
-                type="checkbox"
-                checked={ep.enabled !== false}
-                onChange={(e) => upd(ep.id, { enabled: e.target.checked })}
-              />
-              启用
-            </label>
-            <input
-              type="text"
-              placeholder="接口名称"
-              value={ep.name}
-              onChange={(e) => upd(ep.id, { name: e.target.value })}
-            />
-            <select
-              className="select"
-              value={ep.method || 'GET'}
-              onChange={(e) => upd(ep.id, { method: e.target.value as 'GET' | 'POST' })}
-            >
-              <option value="GET">GET</option>
-              <option value="POST">POST</option>
-            </select>
-            <button title="删除这个接口" onClick={() => onChange(list.filter((x) => x.id !== ep.id))}>
-              删除
-            </button>
-          </div>
-
-          <input
-            type="text"
-            placeholder="接口地址，如 https://example.com/api?url={url}"
-            value={ep.url}
-            onChange={(e) => upd(ep.id, { url: e.target.value })}
-          />
-
-          {ep.method === 'POST' && (
-            <div className="row">
-              <textarea
-                rows={2}
-                placeholder={'请求体模板，如 url={url}&pwd={pwd}'}
-                value={ep.body || ''}
-                onChange={(e) => upd(ep.id, { body: e.target.value })}
-              />
-              <input
-                type="text"
-                placeholder="请求内容类型，留空用 application/x-www-form-urlencoded"
-                value={ep.contentType || ''}
-                onChange={(e) => upd(ep.id, { contentType: e.target.value })}
-              />
-            </div>
-          )}
-
-          <div className="row">
-            <input
-              type="text"
-              placeholder="直链字段路径，留空自动识别，如 data.url"
-              value={ep.field || ''}
-              onChange={(e) => upd(ep.id, { field: e.target.value })}
-            />
-          </div>
-
-          <div className="row">
-            <textarea
-              rows={2}
-              placeholder={'请求头 JSON（可选），如 {"Referer":"https://example.com/"}'}
-              value={typeof ep.headers === 'string' ? ep.headers : ep.headers ? JSON.stringify(ep.headers) : ''}
-              onChange={(e) => upd(ep.id, { headers: e.target.value })}
-            />
-            <textarea
-              rows={2}
-              placeholder="下载直链的请求头 JSON（可选）"
-              value={typeof ep.dlHeaders === 'string' ? ep.dlHeaders : ep.dlHeaders ? JSON.stringify(ep.dlHeaders) : ''}
-              onChange={(e) => upd(ep.id, { dlHeaders: e.target.value })}
-            />
-          </div>
-
-          <div className="ep-netdisks">
-            <span className="ep-hint">适用网盘（不勾 = 全部；直链要勾）：</span>
-            {EP_NETDISKS.map((k) => {
-              const cur = ep.netdisks || []
-              const on = cur.includes(k)
-              return (
-                <label key={k} className={`chip ${on ? 'on' : ''}`}>
-                  <input
-                    type="checkbox"
-                    checked={on}
-                    onChange={() => upd(ep.id, { netdisks: on ? cur.filter((x) => x !== k) : [...cur, k] })}
-                  />
-                  {label(k)}
-                </label>
-              )
-            })}
-          </div>
-        </div>
-      ))}
-
-      {/* 有启用中的接口时必须勾选，否则不允许保存 */}
-      <label className={`ep-ack${ack ? '' : ' need'}`}>
-        <input type="checkbox" checked={ack} onChange={(e) => onAck(e.target.checked)} />
-        <span>
-          我确认：只用它下载<b>我自己有权下载</b>的内容，<b>不</b>用于规避网盘会员 / 限速机制，
-          也<b>不</b>用于获取或传播他人受版权保护的资源。PanBox 只做 HTTP 转发，接口地址由我自己提供并自行确认合法性。
-        </span>
-      </label>
-    </Field>
-  )
-}
-
-/* ------------------------------------------------------------------ */
-/* 网络出口                                                            */
-/* ------------------------------------------------------------------ */
-
-/**
- * 实测（同一条 GitHub 66 MB 直链）：直连 CDN 单连接只有 0.03–0.04 MB/s，
- * 而且 github.com 那一跳会间歇性超时；走系统代理 8–11 MB/s。
- * 但代理不是人人都有（NDM 就和 Clash 冲突），所以默认 auto + 自动改走另一条路。
- */
-function ProxySection({ s, patch }: { s: Settings; patch: (p: Partial<Settings>) => void }) {
-  const [st, setSt] = useState<ProxyStatus | null>(null)
-  const mode = s.proxyMode || 'auto'
-
-  useEffect(() => {
-    api
-      .proxyStatus()
-      .then(setSt)
-      .catch(() => {})
-  }, [mode, s.proxy])
-
-  const badge = !st ? '读取中…' : st.system ? `系统代理：${st.system}` : '系统里没有开代理'
-
-  return (
-    <Field
-      label="网络代理（下 GitHub / 境外资源时用）"
-      hint={
-        <>
-          当前实际使用：{st?.effective ? <code>{st.effective}</code> : '直连（不走代理）'}。改完自动重启下载引擎。
-        </>
-      }
-    >
-      <div className="stack">
-        <div className="stack-row">
-          <select className="select" value={mode} onChange={(e) => patch({ proxyMode: e.target.value as Settings['proxyMode'] })}>
-            <option value="auto">跟随 Windows 系统代理（推荐）</option>
-            <option value="custom">手动指定</option>
-            <option value="off">不使用代理</option>
-          </select>
-          {mode === 'auto' && <span className={`badge ${st?.system ? 'ok' : 'gray'}`}>{badge}</span>}
-        </div>
-        {mode === 'custom' && (
-          <input
-            type="text"
-            placeholder="http://127.0.0.1:7890"
-            value={s.proxy || ''}
-            onChange={(e) => patch({ proxy: e.target.value })}
-          />
-        )}
-      </div>
-    </Field>
-  )
-}
-
-/* ------------------------------------------------------------------ */
-/* 浏览器插件                                                          */
-/* ------------------------------------------------------------------ */
-
-/** 插件把网页里的下载任务投给本机 PanBox。这段只负责三件事：通没通、目录在哪、配对令牌。 */
-function BridgeSection() {
-  const [st, setSt] = useState<BridgeStatus | null>(null)
-  const [msg, setMsg] = useState('')
-  const [busy, setBusy] = useState(false)
-
-  const refresh = async () => {
-    try {
-      setSt(await api.bridgeStatus())
-    } catch {
-      /* 主进程没起这条通道时忽略 */
-    }
-  }
-
-  useEffect(() => {
-    refresh()
-  }, [])
-
-  const run = async (fn: () => Promise<string>) => {
-    setBusy(true)
-    try {
-      setMsg(await fn())
-      await refresh()
-    } catch (e) {
-      setMsg(`出错了：${e instanceof Error ? e.message : String(e)}`)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const state = !st ? 'gray' : !st.enabled ? 'gray' : st.running ? 'ok' : 'err'
-  const stateText = !st
-    ? '读取中…'
-    : !st.enabled
-      ? '已关闭'
-      : st.running
-        ? `运行中 · ${st.host}:${st.port}`
-        : `没有起来${st.error ? `：${st.error}` : ''}`
-
-  return (
-    <Field
-      label="浏览器插件（在网页里直接下资源）"
-      hint={
-        <>
-          安装：打开 <code>chrome://extensions</code>（Edge 是 <code>edge://extensions</code>）→ 开发者模式 →
-          加载已解压的扩展程序 → 选「打开插件文件夹」里的目录；装好或更新后点一次「重新加载」。
-        </>
-      }
-    >
-      <div className="stack">
-        <div className="stack-row">
-          <span className={`badge ${state === 'ok' ? 'ok' : state === 'err' ? 'err' : 'gray'}`}>{stateText}</span>
-          <span className="ep-hint">{st ? (st.added > 0 ? `已接收 ${st.added} 个任务` : '还没有收到过任务') : ''}</span>
-        </div>
-
-        <div className="row">
-          <button
-            disabled={busy}
-            onClick={() =>
-              run(async () => {
-                const r = await api.bridgeOpenFolder()
-                return r.ok ? `已打开插件文件夹：${r.dir}` : `打不开：${r.message || '未知原因'}`
-              })
-            }
-          >
-            打开插件文件夹
-          </button>
-          <button disabled={busy} onClick={() => run(async () => ((await api.bridgeStart()) ? '已重新开始监听' : '没起来'))}>
-            重新检测
-          </button>
-          <button
-            disabled={busy}
-            onClick={() =>
-              run(async () => ((await api.bridgeNewToken()) ? '已换新令牌，请到插件「高级」里重新填一次' : '没换成'))
-            }
-          >
-            重新配对
-          </button>
-        </div>
-
-        {st && (
-          <div className="stack-row">
-            <span className="ep-hint">配对令牌</span>
-            <input type="text" readOnly value={st.token} onFocus={(e) => e.currentTarget.select()} />
-          </div>
-        )}
-
-        {!st?.extExists && <div className="hint err">插件文件夹里没找到 manifest.json，可能是安装不完整。</div>}
-        {msg && <div className="hint ok">{msg}</div>}
-      </div>
-    </Field>
-  )
 }
 
 /* ------------------------------------------------------------------ */
@@ -453,122 +69,6 @@ type TabId = (typeof SET_TABS)[number]['id']
 
 /** 回收站保留期限的可选档位（天）。0 = 永不自动删；跟主进程 settings.js 的 0~3650 取值域一致。 */
 const RETENTION_CHOICES = [0, 7, 14, 30, 60, 90]
-
-/** 开关本体。文案一律是「状态陈述」（登录时启动），不要写成「开启 XX」。 */
-function Switch({
-  checked,
-  onChange,
-  disabled,
-}: {
-  checked: boolean
-  onChange: (v: boolean) => void
-  disabled?: boolean
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      className={`switch${checked ? ' on' : ''}`}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-    >
-      <i />
-    </button>
-  )
-}
-
-/** 设置页的一行：左边标题 + 说明，右边控件。说明必须写清「这个开关到底干了什么」。 */
-function Row({
-  title,
-  desc,
-  children,
-  err,
-  indent,
-  stack,
-}: {
-  title: ReactNode
-  desc?: ReactNode
-  children?: ReactNode
-  err?: string
-  indent?: boolean
-  stack?: boolean
-}) {
-  return (
-    <div className={`srow${indent ? ' indent' : ''}${stack ? ' stackrow' : ''}`}>
-      <div className="srow-text">
-        <div className="srow-title">{title}</div>
-        {desc ? <div className="srow-desc">{desc}</div> : null}
-        {err ? <div className="srow-desc err">{err}</div> : null}
-      </div>
-      {children ? <div className="srow-ctl">{children}</div> : null}
-    </div>
-  )
-}
-
-/**
- * 数字输入。刻意**不在 onChange 里写盘**：边打字边保存会把「192」拆成 1、12、192 存三次，
- * 中途那两次是给正在跑的任务换连接数。失焦或回车才提交。
- */
-function NumBox({
-  value,
-  min,
-  max,
-  onCommit,
-}: {
-  value: number
-  min: number
-  max: number
-  onCommit: (n: number) => void
-}) {
-  const [draft, setDraft] = useState(String(value))
-  useEffect(() => setDraft(String(value)), [value])
-  const commit = () => {
-    const n = Number(draft.trim())
-    if (!draft.trim() || !Number.isFinite(n)) {
-      setDraft(String(value))
-      return
-    }
-    const next = Math.max(min, Math.min(max, Math.round(n)))
-    setDraft(String(next))
-    if (next !== value) onCommit(next)
-  }
-  return (
-    <input
-      type="number"
-      min={min}
-      max={max}
-      value={draft}
-      onChange={(e) => setDraft(e.target.value)}
-      onBlur={commit}
-      onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
-    />
-  )
-}
-
-function NumberRow({
-  title,
-  desc,
-  value,
-  min,
-  max,
-  onCommit,
-  err,
-}: {
-  title: ReactNode
-  desc?: ReactNode
-  value: number
-  min: number
-  max: number
-  onCommit: (n: number) => void
-  err?: string
-}) {
-  return (
-    <Row title={title} desc={desc} err={err}>
-      <NumBox value={value} min={min} max={max} onCommit={onCommit} />
-    </Row>
-  )
-}
 
 function SettingsModal({
   initial,
@@ -652,7 +152,7 @@ function SettingsModal({
       onSaved(next)
     } catch (e) {
       setS((v) => ({ ...v, ...before }))
-      setErr(key, e instanceof Error ? e.message : String(e))
+      setErr(key, errText(e))
     }
   }
 
@@ -668,7 +168,7 @@ function SettingsModal({
       setInfo(await api.appInfo())
     } catch (e) {
       setS((v) => ({ ...v, autoStart: !on }))
-      setErr('autoStart', e instanceof Error ? e.message : String(e))
+      setErr('autoStart', errText(e))
     }
   }
 
@@ -686,7 +186,7 @@ function SettingsModal({
     } catch (e: unknown) {
       /* 主进程会校验设置（范围、路径、令牌长度…），把它的原话显示出来，
        * 否则用户只会看到「点了保存没反应」。 */
-      setSaveErr(e instanceof Error ? e.message : String(e))
+      setSaveErr(errText(e))
     } finally {
       setBusy(false)
     }
@@ -710,7 +210,7 @@ function SettingsModal({
         setLoginMsg(r?.message || '未获取到登录凭证')
       }
     } catch (e) {
-      setLoginMsg(e instanceof Error ? e.message : String(e))
+      setLoginMsg(errText(e))
     } finally {
       setLoginBusy(false)
     }
@@ -731,7 +231,7 @@ function SettingsModal({
       else if (r.hasUpdate) setUpd({ state: 'new', data: r })
       else setUpd({ state: 'latest', data: r })
     } catch (e) {
-      setUpd({ state: 'error', data: { ok: false, current: '', message: e instanceof Error ? e.message : String(e) } })
+      setUpd({ state: 'error', data: { ok: false, current: '', message: errText(e) } })
     }
   }
 
@@ -744,8 +244,15 @@ function SettingsModal({
       onSaved(got)
       setSaveErr('')
     } catch (e) {
-      setSaveErr(e instanceof Error ? e.message : String(e))
+      setSaveErr(errText(e))
     }
+  }
+
+  /* openPath 打不开时是「返回原因」而不是抛异常 —— 不看返回值就等于点了没反应 */
+  const openExtFolder = async () => {
+    const r = await api.bridgeOpenFolder()
+    if (!r.ok) setSaveErr(`打不开插件文件夹：${r.message || '未知原因'}`)
+    else setSaveErr('')
   }
 
   /* 只有安装版真能写系统登录项；便携版/开发模式这一行要说明白为啥不生效 */
@@ -1171,7 +678,7 @@ function SettingsModal({
                   <Row title="项目主页 / 源码">
                     <div className="row">
                       <button onClick={() => api.openRelease('https://github.com/Ygq156/PanBox')}>打开 GitHub</button>
-                      <button onClick={() => api.bridgeOpenFolder()}>插件文件夹</button>
+                      <button onClick={openExtFolder}>插件文件夹</button>
                     </div>
                   </Row>
                 </Section>
@@ -1213,7 +720,7 @@ function SettingsModal({
                   title="浏览器插件版本"
                   desc="更新程序后，请在 chrome://extensions 里点一次「重新加载」。"
                 >
-                  <button onClick={() => api.bridgeOpenFolder()}>打开插件文件夹</button>
+                  <button onClick={openExtFolder}>打开插件文件夹</button>
                 </Row>
               </Section>
             )}
@@ -1517,137 +1024,6 @@ const TaskRow = memo(
     a.t.source === b.t.source,
 )
 
-/* ------------------------------------------------------------------ */
-/* 回收站：删掉的下载文件先挪进这里，可以还原                                 */
-/* ------------------------------------------------------------------ */
-
-function TrashModal({ retentionDays, onClose }: { retentionDays: number; onClose: () => void }) {
-  const [items, setItems] = useState<TrashItem[] | null>(null)
-  const [msg, setMsg] = useState('')
-  const [busy, setBusy] = useState(false)
-
-  const load = useCallback(async () => {
-    try {
-      setItems(await api.trashList())
-    } catch (e) {
-      setMsg(`读取失败：${e instanceof Error ? e.message : String(e)}`)
-    }
-  }, [])
-
-  useEffect(() => {
-    load()
-  }, [load])
-
-  const run = async (fn: () => Promise<string>) => {
-    setBusy(true)
-    try {
-      setMsg(await fn())
-      await load()
-    } catch (e) {
-      setMsg(`出错了：${e instanceof Error ? e.message : String(e)}`)
-    }
-    setBusy(false)
-  }
-
-  const total = (items || []).reduce((n, it) => n + (it.size || 0), 0)
-
-  return (
-    <div className="mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal trash">
-        <h2>
-          回收站
-          <button className="x" onClick={onClose} title="关闭">
-            ✕
-          </button>
-        </h2>
-
-        <div className="trash-body">
-          {items === null ? (
-            <div className="empty">读取中…</div>
-          ) : items.length === 0 ? (
-            <div className="empty">
-              回收站是空的。
-              <br />
-              在下载队列里删掉的文件会先放到这里。
-            </div>
-          ) : (
-            items.map((it) => (
-              <div className="trash-row" key={it.id}>
-                <div className="tcell">
-                  <div className="tname" title={it.from}>
-                    {it.name}
-                  </div>
-                  <div className="tsub">
-                    {formatSize(it.size)} · {new Date(it.at).toLocaleString()}
-                    {it.leftDays === null ? '' : ` · ${it.leftDays} 天后自动清理`}
-                  </div>
-                </div>
-                <button
-                  className="tiny"
-                  disabled={busy}
-                  onClick={() =>
-                    run(async () => {
-                      const r = await api.trashRestore(it.id)
-                      return r.ok ? `已还原到 ${r.path || '原位置'}` : `还原失败：${r.message || '未知原因'}`
-                    })
-                  }
-                >
-                  还原
-                </button>
-                <button
-                  className="tiny del"
-                  disabled={busy}
-                  onClick={() =>
-                    run(async () => {
-                      await api.trashDelete(it.id)
-                      return `已彻底删除「${it.name}」`
-                    })
-                  }
-                >
-                  彻底删除
-                </button>
-              </div>
-            ))
-          )}
-        </div>
-
-        <div className="trash-foot">
-          <span className="trash-count">{items ? `${items.length} 个文件 · ${formatSize(total)}` : ''}</span>
-          <span className="trash-count">{retentionDays > 0 ? `超过 ${retentionDays} 天自动清理` : '不自动清理'}</span>
-          {msg && <span className="trash-warn">{msg}</span>}
-          <span className="grow" />
-          <button
-            className="tiny"
-            disabled={busy}
-            onClick={() =>
-              run(async () => {
-                const r = await api.trashOpenDir()
-                /* 打不开就如实说（比如目录被删了、系统没有关联程序），别假装打开了 */
-                if (!r.ok) throw new Error(r.message || '没能打开目录')
-                return `已打开 ${r.dir}`
-              })
-            }
-          >
-            打开目录
-          </button>
-          <button
-            className="tiny del"
-            disabled={busy || !items || items.length === 0}
-            onClick={() =>
-              run(async () => {
-                const n = await api.trashEmpty()
-                return `已彻底删除 ${n} 个文件`
-              })
-            }
-          >
-            清空
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [showSettings, setShowSettings] = useState(false)
@@ -1675,15 +1051,37 @@ export default function App() {
   /** 主进程没回话时的原因：不给出来的话，界面会永远停在「正在启动…」 */
   const [bootErr, setBootErr] = useState('')
 
+  /* 启动时「拉一次快照」和「订阅推送」这两条 IPC 谁先回来没有保证，而主进程只在
+   * 队列指纹变化时才推整表、空闲时不会自愈 —— 所以先订阅、后拉快照，并且一旦收到过
+   * 推送，就不再让更早发出的那份快照把新一点的状态盖回去。
+   * 五处更新都过 mergeTasks：下载中每 800ms 推来的整表虽然内容大半没变，也是全新对象，
+   * 不合并的话队列里每一行都会跟着重渲染。 */
+  const pushedRef = useRef(false)
+  const applyTasks = useCallback((list: DownloadTask[]) => {
+    pushedRef.current = true
+    setTasks((prev) => mergeTasks(prev, list))
+  }, [])
+
+  /* 引擎状态是每 10 秒（还没连上时 2.5 秒）问一次的轮询，内容没变就别塞新对象，
+   * 否则 App 整棵树跟着这个 tick 白重渲染一遍。 */
+  const applyAria2 = useCallback((v: Aria2Status) => {
+    setAria2((prev) => (prev && prev.running === v.running && prev.version === v.version ? prev : v))
+  }, [])
+
   useEffect(() => {
     api.appInfo?.().then((i) => setVer(i?.version || '')).catch(() => {})
     api
       .getSettings()
       .then(setSettings)
       .catch((e) => setBootErr((e && e.message) || String(e || '未知错误')))
-    api.aria2Status().then(setAria2).catch(() => {})
-    api.listDownloads().then(setTasks).catch(() => {})
-    const off = api.onDownloadsUpdate(setTasks)
+    api.aria2Status().then(applyAria2).catch(() => {})
+    const off = api.onDownloadsUpdate(applyTasks)
+    api
+      .listDownloads()
+      .then((list) => {
+        if (!pushedRef.current) setTasks((prev) => mergeTasks(prev, list))
+      })
+      .catch(() => {})
     /* 主进程在后台替用户做的事（直链过期后自动换了一条之类）：用同一处提示条说一句，
      * 免得任务自己变了个样子而用户不知道发生了什么。 */
     const offNotice = api.onDownloadsNotice?.((d) => {
@@ -1713,17 +1111,17 @@ export default function App() {
       if (offPre) offPre()
       if (offUpd) offUpd()
     }
-  }, [])
+  }, [applyAria2, applyTasks])
 
   /* 引擎状态不是高频信息：连上后 10 秒问一次就够（任务进度是主进程推过来的，不用轮询）。
    * 还没连上时 2.5 秒问一次——应用启动的头一两秒 aria2 可能还没起来，
    * 问得太慢会让标题栏一直挂着「aria2 未连接」。 */
   useEffect(() => {
     const t = setInterval(() => {
-      api.aria2Status().then(setAria2).catch(() => {})
+      api.aria2Status().then(applyAria2).catch(() => {})
     }, aria2.running ? 10000 : 2500)
     return () => clearInterval(t)
-  }, [aria2.running])
+  }, [aria2.running, applyAria2])
 
   /* 界面上「当前这批解析结果」对应的会话 id。丢掉结果时顺手通知主进程释放缓存，
    * 不然那些会话要在主进程里挂满 30 分钟 TTL（每个都攥着一份文件树）。 */
@@ -1778,9 +1176,10 @@ export default function App() {
       else if (mode === 'trash') setHint({ kind: 'ok', msg: `已把「${r?.name || t.name}」放进回收站，之后可以还原` })
       else if (mode === 'purge') setHint({ kind: 'ok', msg: `已彻底删除「${r?.name || t.name}」` })
       setConfirmDel(null)
-      setTasks((await api.listDownloads()) || [])
+      const list = (await api.listDownloads()) || []
+      setTasks((prev) => mergeTasks(prev, list))
     } catch (e) {
-      setHint({ kind: 'err', msg: `移除失败：${String((e as Error)?.message || e)}` })
+      setHint({ kind: 'err', msg: `移除失败：${errText(e)}` })
       setConfirmDel(null)
     }
   }, [])
@@ -1802,9 +1201,10 @@ export default function App() {
             }
           : { kind: 'err', msg: r.message || '插队失败' },
       )
-      setTasks((await api.listDownloads()) || [])
+      const list = (await api.listDownloads()) || []
+      setTasks((prev) => mergeTasks(prev, list))
     } catch (e) {
-      setHint({ kind: 'err', msg: `插队失败：${String((e as Error)?.message || e)}` })
+      setHint({ kind: 'err', msg: `插队失败：${errText(e)}` })
     }
     setJumping(null)
   }, [])
@@ -1831,7 +1231,7 @@ export default function App() {
         msg: r.message || (r.ok ? '已换成新的下载地址' : '换直链失败'),
       })
     } catch (e) {
-      setHint({ kind: 'err', msg: String((e as Error)?.message || e) })
+      setHint({ kind: 'err', msg: errText(e) })
     }
     setRefreshing(null)
   }, [])
@@ -1844,9 +1244,10 @@ export default function App() {
           ? { kind: 'ok', msg: `已删除「${r.name || t.name}」，可在回收站还原` }
           : { kind: 'err', msg: r.message || '删除失败' },
       )
-      setTasks((await api.listDownloads()) || [])
+      const list = (await api.listDownloads()) || []
+      setTasks((prev) => mergeTasks(prev, list))
     } catch (e) {
-      setHint({ kind: 'err', msg: `删除失败：${String((e as Error)?.message || e)}` })
+      setHint({ kind: 'err', msg: `删除失败：${errText(e)}` })
     }
   }, [])
 
@@ -1873,7 +1274,7 @@ export default function App() {
         setHint({ kind: 'err', msg: list[0]?.message || '解析失败' })
       }
     } catch (e: unknown) {
-      setHint({ kind: 'err', msg: e instanceof Error ? e.message : String(e) })
+      setHint({ kind: 'err', msg: errText(e) })
     } finally {
       setParsing(false)
     }
@@ -1915,7 +1316,7 @@ export default function App() {
         if (/登录|needCookie|Cookie/i.test(msg) && LOGIN_TARGETS.includes(r.netdisk)) setNeedLogin(r.netdisk)
       }
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e)
+      const msg = errText(e)
       setHint({ kind: 'err', msg })
       if (/登录|needCookie|Cookie/i.test(msg) && LOGIN_TARGETS.includes(r.netdisk)) setNeedLogin(r.netdisk)
     }
@@ -1939,7 +1340,7 @@ export default function App() {
           : { kind: 'ok', msg: `已登录并保存${label(netdisk)}凭证（${r.count ?? 0} 条）。请重新点「下载」。` },
       )
     } catch (e: unknown) {
-      setHint({ kind: 'err', msg: e instanceof Error ? e.message : String(e) })
+      setHint({ kind: 'err', msg: errText(e) })
     }
   }, [])
 
@@ -1960,7 +1361,10 @@ export default function App() {
         {results.map((r, i) =>
           r.ok ? (
             <ResultPanel
-              key={r.sessionId || `r${i}`}
+              /* key 不用下标兜底：卡片里的勾选是它自己的状态，从列表中间删掉一张之后
+               * 按位置复用实例会把勾选串到别的分享上。没有会话 id 时用「站点 + 来源链接」，
+               * 同一次解析里这两样足以区分。 */
+              key={r.sessionId || `${r.netdisk}:${r.source || ''}`}
               result={r}
               needsLogin={!settings?.cookies?.[r.netdisk]}
               onDownload={doDownload}
@@ -1995,6 +1399,21 @@ export default function App() {
         />
       )),
     [tasks, jumping, refreshing, jumpTask, pauseTask, resumeTask, refreshTask, deleteTaskFile, removeTask],
+  )
+
+  /* 设置弹窗本身有几百行 JSX 和 8 个页签分支，但它只认「设置内容」和「有没有新版本」。
+   * memo 成元素之后，下载中每 800ms 的整表推送就不会再拖着它一起重渲染。 */
+  const settingsNode = useMemo(
+    () =>
+      settings ? (
+        <SettingsModal
+          initial={settings}
+          updateNotice={newVer}
+          onClose={() => setShowSettings(false)}
+          onSaved={setSettings}
+        />
+      ) : null,
+    [settings, newVer],
   )
 
   if (!settings) {
@@ -2084,10 +1503,22 @@ export default function App() {
           <div className="list-head">
             <span>下载队列（{tasks.length}）</span>
             <span className="grow" />
-            <button className="tiny" onClick={() => api.pauseAll()}>
+            {/* 主进程用 false 表示「没成功」（引擎没连上之类）。以前这里不看返回值，
+                点了没反应，用户只能猜。 */}
+            <button
+              className="tiny"
+              onClick={async () => {
+                if (!(await api.pauseAll())) setHint({ kind: 'err', msg: '全部暂停失败，稍后再试' })
+              }}
+            >
               全部暂停
             </button>
-            <button className="tiny" onClick={() => api.resumeAll()}>
+            <button
+              className="tiny"
+              onClick={async () => {
+                if (!(await api.resumeAll())) setHint({ kind: 'err', msg: '全部继续失败，稍后再试' })
+              }}
+            >
               全部继续
             </button>
             <button
@@ -2118,14 +1549,7 @@ export default function App() {
         </div>
       </div>
 
-      {showSettings && (
-        <SettingsModal
-        initial={settings}
-        updateNotice={newVer}
-        onClose={() => setShowSettings(false)}
-        onSaved={setSettings}
-      />
-      )}
+      {showSettings && settingsNode}
 
       {showTrash && (
         <TrashModal retentionDays={settings?.trashRetentionDays ?? 30} onClose={() => setShowTrash(false)} />
