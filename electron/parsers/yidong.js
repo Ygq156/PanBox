@@ -397,6 +397,9 @@ async function open(url, ctx = {}) {
         identity.has(`${SHARE_API}/richlifeApp/devapp/IOutLink/getContentInfoFromOutLink`) ||
         identity.has(`${SHARE_API}/richlifeApp/devapp/IOutLink/dlFromOutLinkV3`)
       const hasAuth = !!(token || borrowed)
+      /* 两条路各自失败的原因留一份：以前一 `catch {}` 就扔，用户和我们都只看到
+       * 最后那句「要登录」，分不清是令牌被拒还是响应里换了字段名。 */
+      let lastErr = null
 
       /* ① AList 现在走的那条路：getContentInfoFromOutLink → contentInfo.cdnDownLoadUrl。
        * 实测匿名只回元数据（一个 URL 字段都是空的），带账号才有地址。 */
@@ -433,12 +436,17 @@ async function open(url, ctx = {}) {
               note: '移动云盘只给了预览流（转码），不是原片',
             }
           }
-        } catch {
+        } catch (e) {
           /* 落到下一条；两条都失败再如实报「要登录」 */
+          lastErr = e
         }
       }
 
-      /* ② 老朋友 dlFromOutLinkV3：AList 更早的写法，我们 1.0.16 起在用的那条。 */
+      /* ② 老朋友 dlFromOutLinkV3：实测拿到地址的字段名是 **`redrUrl`**（小写 rl），
+       * 回包形如 {downloadMode:1, taskId:null, redrUrl:"https://…cmecloud.cn/…&X-Amz-Expires=900",
+       *         extInfo:null, hashName:"sha256", hashValue:"…"}。
+       * 1.0.20 只认 `redrURL`/`extInfo.cdnDownloadURL`，服务端明明给了地址我们却当没有 ——
+       * 用户看到的就是「登录了还是下不了」。几种写法都认上，免得再栽在大小写上。 */
       if (hasAuth) {
         try {
           const j = await sharePost(
@@ -454,8 +462,17 @@ async function open(url, ctx = {}) {
             token,
           )
           const d = j.data || {}
+          const ex = d.extInfo || {}
           const u =
-            (d.extInfo && d.extInfo.cdnDownloadURL) || d.redrURL || d.downloadURL || ''
+            d.redrUrl ||
+            d.redrURL ||
+            d.downloadURL ||
+            d.cdnDownloadURL ||
+            ex.cdnDownloadURL ||
+            ex.redrUrl ||
+            ex.redrURL ||
+            ex.downloadURL ||
+            ''
           if (u) {
             return {
               url: u,
@@ -463,18 +480,23 @@ async function open(url, ctx = {}) {
               name: e.name,
             }
           }
-        } catch {
+          lastErr = new Error('移动云盘没在这条接口的响应里给出下载地址')
+        } catch (e) {
           /* 令牌过期、账号不符之类：落到下面如实报，不要拿预览地址顶替 */
+          lastErr = e
         }
       }
 
       /* 走到这里说明：要么根本没收到登录头，要么收到了但服务端仍拒。
        * 这两种的修法完全不同，所以分开说 —— 上一版一律说「要你自己的账号」，
-       * 用户按那句话去登录，问题其实在插件没把登录头交上来。 */
+       * 用户按那句话去登录，问题其实在插件没把登录头交上来。
+       * 有 lastErr 时把接口的原话带上（不含凭证），省得再靠猜。 */
+      const why = lastErr && lastErr.message ? `（接口回：${String(lastErr.message).slice(0, 120)}）` : ''
       const err = new Error(
-        borrowed
+        (borrowed
           ? '移动云盘收到了浏览器现场，但服务端仍然拒了这次取址：在浏览器里打开这个分享页、点一下「刷新」让页面发一次请求，再点扩展里的「把这一页交给 PanBox」；仍不行就到设置 → 移动云盘 里贴 Authorization'
-          : '移动云盘的下载要你自己的账号：在浏览器里登着 139 打开这个分享页（点一下刷新让页面发一次请求），再用扩展「把这一页交给 PanBox」；或到设置 → 移动云盘 里贴 Authorization',
+          : '移动云盘的下载要你自己的账号：在浏览器里登着 139 打开这个分享页（点一下刷新让页面发一次请求），再用扩展「把这一页交给 PanBox」；或到设置 → 移动云盘 里贴 Authorization') +
+          why,
       )
       err.needCookie = true
       throw err

@@ -189,10 +189,14 @@ function SettingsModal({
     try {
       const r = await api.openLogin(cookieKey)
       if (r && r.ok) {
-        /* 凭证由主进程直接落盘，渲染层只刷新一份脱敏副本（拿到的是打码串） */
+        /* 凭证由主进程直接落盘，渲染层只刷新一份脱敏副本（拿到的是打码串）。
+         * 必须同时 onSaved 出去：不然 App 手里那份还是登录前的（下回重开设置弹窗
+         * 用的是它），「网盘账号」里那行会一直显示「未登录」，下载那边的 needLogin
+         * 提示也不会消失 —— 1.0.20 就是这个毛病。 */
         const fresh = await api.getSettings()
         setS(fresh)
         setSaved(fresh)
+        onSaved(fresh)
         setLoginMsg(
           r.loggedIn
             ? `${label(cookieKey)} 已登录并保存（${r.count ?? 0} 条凭证）。`
