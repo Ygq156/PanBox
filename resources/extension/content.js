@@ -107,14 +107,35 @@
     }
   }
 
+  function pathOf(url) {
+    try {
+      return new URL(url).pathname || ''
+    } catch {
+      return ''
+    }
+  }
+
+  /* 响应类型说「这就是个网页」。播放列表的判定要靠它把关，见 kindOf。 */
+  function isHtmlType(ct) {
+    return /^(text\/html|application\/xhtml\+xml)/i.test(String(ct || ''))
+  }
+
   function isHttp(u) {
     return /^https?:/i.test(u || '')
   }
 
   function kindOf(url, ct) {
     const c = String(ct || '')
-    if (STREAM_EXT.test(url)) return 'stream'
+    /* 播放列表的判据以前是「整条地址里有没有 .m3u8/.mpd」，于是影视站的备用线路
+     * `https://播放器站/?url=https://cdn/…/index.m3u8`（真列表藏在查询串里、
+     * 服务器回的是 text/html 的播放器网页）被标成「播放列表」、还照列表命名，
+     * 用户点它只能下到一个小网页。响应类型说「这是网页」时以它为准（返回「其他文件」，
+     * 名字照旧由名字那一套给成 `.html`）；其余按可信度排：
+     * **路径**是不是列表 > 响应类型 > 查询串里的列表后缀。 */
+    if (isHtmlType(c)) return 'file'
+    if (STREAM_EXT.test(pathOf(url))) return 'stream'
     if (/^application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)/i.test(c)) return 'stream'
+    if (STREAM_EXT.test(url)) return 'stream'
     const e = extOf(url)
     if (e === 'ts' || e === 'm4s') return 'segment'
     /* 分片流的初始化段（X 那种 `/vid/avc1/0/0/…mp4`）也是一片，见 rules.js 的说明 */

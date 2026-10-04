@@ -14,6 +14,7 @@ const trash = require('./core/trash')
 /* 用户取消过的下载身份：投递（尤其是分段探测失败后回退 aria2）落地前要核对，
  * 否则会出现「删掉的任务过一会儿自己又开始下」（见 core/cancelGuard.js） */
 const cancelGuard = require('./core/cancelGuard')
+const { looksLikeHtml } = require('./core/htmlFile')
 const parsers = require('./parsers')
 const login = require('./core/login')
 const bridge = require('./core/bridge')
@@ -1125,6 +1126,8 @@ async function taskFile(gid) {
   return { status: String(st.status || ''), path: f.path || '', dir: st.dir || '' }
 }
 
+
+
 /**
  * 把一条任务从引擎里彻底拿掉（不只是暂停）。
  *
@@ -1619,15 +1622,35 @@ if (!gotLock) {
      * ⚠️ 必须用模块级的 `downloadsCleanup`：之前误写成了 `downloads:add` 处理函数里的
      * 局部别名 `cleanupOn`，那个作用域在监听器里根本不存在 → 每 tick 抛 ReferenceError
      * 被吞掉，回收从来没真正跑过。 */
-    tasks.on('complete', (t) => {
+    tasks.on('complete', async (t) => {
       boot('complete', String(t.name))
       recycleTransferCopy(t.name, 'complete')
       /* 用户把「页面地址」当下载地址投进来时（X / YouTube / Pinterest 的页面链接最常这样投），
        * 服务器回的就是网页本身，落盘叫 `xx.html`。不说一句的话，用户只会觉得「下载坏了」——
-       * 这里如实讲清楚它是什么、以及真要下视频该怎么做。complete 每个 gid 只发一次。 */
-      if (/\.html?$/i.test(String(t.name || ''))) {
-        boot('html-not-file', String(t.name))
-        notice(`「${t.name}」是网页本身（HTML），不是视频/文件 —— 多半投的是页面地址。要下视频：先把视频播起来，再用浏览器插件面板选播放列表或分片。`)
+       * 这里如实讲清楚它是什么、以及真要下视频该怎么做。complete 每个 gid 只发一次。
+       *
+       * 但**光看后缀不够**：影视站的播放器把真列表包在 `播放器站/?url=cdn/…/index.m3u8` 里，
+       * 服务器回 text/html，落盘却叫 `dxfbk.m3u8`（面板也就照这个名字显示）——用户点它、
+       * 下到一个 16 KB 的「列表」，改成什么后缀都放不出来。所以再**看一眼产物开头的字节**，
+       * 两种情况都如实说，只是话不一样。 */
+      const namedHtml = /\.html?$/i.test(String(t.name || ''))
+      let bodyHtml = false
+      if (!namedHtml) {
+        try {
+          const f = await taskFile(t.gid)
+          if (f && f.path) bodyHtml = await looksLikeHtml(f.path)
+        } catch (e) {
+          /* 看一眼产物失败（比如刚下完就被移走）不该影响后面那些提示 */
+          boot('html-check-fail', (e && e.message) || String(e))
+        }
+      }
+      if (namedHtml || bodyHtml) {
+        boot('html-not-file', String(t.name), namedHtml ? 'by-name' : 'by-body')
+        notice(
+          namedHtml
+            ? `「${t.name}」是网页本身（HTML），不是视频/文件 —— 多半投的是页面地址。要下视频：先把视频播起来，再用浏览器插件面板选播放列表或分片。`
+            : `「${t.name}」打开是网页（HTML），不是视频 —— 这条地址是个播放器页面，视频藏在它里面。要下这个视频：回面板的「视频 / 播放列表」里换一条列表（通常是 CDN 域名上那条 index.m3u8 / mixed.m3u8）再下一次。`,
+        )
       }
       /* 流媒体引擎也有话要说：这一路只有画面、音轨没取回来、或者声音只能单独存一个文件。
        * 从前这些话只进了 console（打包版没人接），用户拿到一个没声音的文件却不知道原因。 */

@@ -696,8 +696,19 @@ function nameFromDisposition(cd) {
 
 function kindOfUrl(url, ct) {
   const c = String(ct || '')
-  if (/\.(m3u8|mpd)(?:$|[?#])/i.test(url)) return 'stream'
+  /* 响应类型说「这是个网页」时，一切都以它为准：影视站的备用线路
+   * `https://播放器站/?url=https://cdn/…/index.m3u8` 的真列表藏在查询串里、
+   * 服务器回的却是 text/html 的播放器网页 —— 以前只按地址里的 `.m3u8` 判，
+   * 于是它被当成「播放列表」记下来，面板照着列表给它命名，用户点它只能下到一个小网页。 */
+  if (/^(text\/html|application\/xhtml\+xml)/i.test(c)) return 'file'
+  /* 其余按可信度排：**路径**是不是列表 > 响应类型 > 查询串里出现的列表后缀 */
+  try {
+    if (/\.(m3u8|mpd)$/i.test(new URL(url).pathname)) return 'stream'
+  } catch {
+    /* 地址都解析不出来就继续按后面几条判 */
+  }
   if (/^application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)/i.test(c)) return 'stream'
+  if (/\.(m3u8|mpd)(?:$|[?#])/i.test(url)) return 'stream'
   if (/\.(ts|m4s)(?:$|[?#])/i.test(url)) return 'segment'
   /* 分片流的初始化段（X 那种 `/vid/avc1/0/0/…mp4`）也是一片，见 rules.js 的说明 */
   if (PanBoxRules.isInitSegment(url)) return 'segment'
@@ -916,6 +927,22 @@ chrome.webRequest.onHeadersReceived.addListener(
      * 否则 worker 一被回收，用户点过的那个 PDF 就从面板上消失了。 */
     if (PDF_CT_RE.test(ct) || /\.pdf(?:$|[?#])/i.test(d.url)) {
       rememberMedia(d.tabId, d.url, ct || 'application/pdf', len, nameFromDisposition(cd), true)
+      return
+    }
+    /* 这条地址其实是个网页。`onBeforeRequest` 只看地址，可能因为查询串里带 `.m3u8`
+     * （影视站的备用线路：`播放器站/?url=https://cdn/…/index.m3u8`，真列表塞在参数里）
+     * 已经把它当「播放列表」记下了 —— 现在拿到了响应类型，把那条记录改回真实身份，
+     * 面板就会照真实的名字（`.html`）把它放到「其他文件」里，而不是顶着「播放列表」
+     * 的标签骗用户去点、点完只下到一个几 KB 的网页。 */
+    if (/^(text\/html|application\/xhtml\+xml)/i.test(ct)) {
+      const mm = mediaByTab.get(d.tabId)
+      const v = mm && mm.get(d.url)
+      if (v && (v.kind === 'stream' || v.kind === 'segment')) {
+        v.kind = 'file'
+        v.ct = ct
+        v.t = Date.now()
+        scheduleSaveCaptured()
+      }
       return
     }
     /* 图片：只在这里收（响应类型 image/*），**不进上面那个 onBeforeSendHeaders 的
