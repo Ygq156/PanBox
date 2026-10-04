@@ -10,6 +10,7 @@ const quark = require('./quark')
 const uc = require('./uc')
 const pan123 = require('./pan123')
 const baidu = require('./baidu')
+const aliyun = require('./aliyun')
 const xunlei = require('./xunlei')
 const custom = require('./custom')
 const mdpi = require('./mdpi')
@@ -23,6 +24,8 @@ const PARSERS = {
   uc,
   '123pan': pan123,
   baidu,
+  /** 阿里云盘：目录不登录就能列，取直链要用户自己的登录态（见 aliyun.js 顶部注释） */
+  aliyun,
   xunlei,
   /** 论文站：地址里只有文章页，PDF 要另外换算出一条地址来（见各自文件顶部注释） */
   mdpi,

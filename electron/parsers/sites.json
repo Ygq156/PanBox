@@ -101,7 +101,9 @@
     "aliyun": {
       "label": "阿里云盘",
       "share": true,
-      "supported": false,
+      "supported": true,
+      "login": true,
+      "endpoint": true,
       "match": "(aliyundrive\\.com|alipan\\.com)"
     },
     "tianyi": {
@@ -114,7 +116,7 @@
       "label": "移动云盘",
       "share": true,
       "supported": false,
-      "match": "(caiyun\\.139\\.com|139\\.com/m/i)"
+      "match": "(caiyun\\.139\\.com|yun\\.139\\.com|139\\.com/m/i)"
     },
     "pan115": {
       "label": "115 网盘",
