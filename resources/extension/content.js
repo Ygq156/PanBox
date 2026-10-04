@@ -93,6 +93,9 @@
   const FILE_EXT =
     /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|iso|img|exe|msi|apk|ipa|dmg|pkg|deb|rpm|pdf|epub|mobi|azw3|torrent|bin|jar|crx|whl|onnx|safetensors|gguf|part\d*)(?:$|[?#])/i
   const STREAM_EXT = /\.(m3u8|mpd)(?:$|[?#])/i
+  /* 图片：以前面板完全不看 <img>，用户只能右键另存。后缀这一层只是便宜预过滤，
+   * 真正的判据仍是响应类型（后台那份 image/* 收网）。 */
+  const IMAGE_EXT = /\.(png|jpe?g|gif|bmp|webp|avif|heic|heif|svg|ico|tiff?)(?:$|[?#])/i
 
   function extOf(url) {
     try {
@@ -114,8 +117,10 @@
     if (/^application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)/i.test(c)) return 'stream'
     const e = extOf(url)
     if (e === 'ts' || e === 'm4s') return 'segment'
+    if (/^image\//i.test(c)) return 'image'
     if (/^(video|audio)\//i.test(c)) return 'media'
     if (MEDIA_EXT.test(url)) return 'media'
+    if (IMAGE_EXT.test(url)) return 'image'
     return 'file'
   }
 
@@ -130,7 +135,7 @@
   /* 抖音的视频地址长这样：
    *   https://v3-web.douyinvod.com/xxxx/video/tos/cn/tos-cn-ve-15/yyyy/?a=6383&mime_type=video_mp4
    * 路径里没有扩展名，所以名字得靠 Content-Type 补出来，否则存下来的是个没后缀的文件。 */
-  const KIND_EXT = { media: 'mp4', stream: 'm3u8', segment: 'ts', file: 'bin' }
+  const KIND_EXT = { media: 'mp4', stream: 'm3u8', segment: 'ts', image: 'jpg', file: 'bin' }
 
   function pickExt(url, kind, ct) {
     const e = extOf(url)
@@ -215,48 +220,118 @@
     return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB'
   }
 
-  const KIND_LABEL = { stream: '播放列表', segment: '分片', media: '视频/音频', file: '文件', entry: '下载入口' }
+  const KIND_LABEL = {
+    stream: '播放列表',
+    segment: '分片',
+    media: '视频/音频',
+    image: '图片',
+    file: '文件',
+    entry: '下载入口',
+  }
 
   /* ------------------------------------------------------------------ */
   /* 采集（DOM 侧）                                                       */
   /* ------------------------------------------------------------------ */
 
+  function absUrl(u) {
+    try {
+      return new URL(String(u || ''), location.href).href
+    } catch {
+      return ''
+    }
+  }
+
+  function textOf(el) {
+    return el && el.textContent ? String(el.textContent).replace(/\s+/g, ' ').trim().slice(0, 60) : ''
+  }
+
+  /* srcset="a.jpg 400w, b.jpg 800w" → 挑最大的那张；没有描述符就取第一个。
+   * 里面的地址多半是相对路径，得先按页面地址补全。 */
+  function largestFromSrcset(v) {
+    let best = ''
+    let bestW = -1
+    for (const part of String(v || '').split(',')) {
+      const bits = part.trim().split(/\s+/)
+      const u = absUrl(bits[0])
+      if (!u || !isHttp(u)) continue
+      const m = /^(\d+)(w|x)?$/.exec(bits[1] || '')
+      const n = m ? Number(m[1]) : 0
+      if (n > bestW) {
+        bestW = n
+        best = u
+      }
+    }
+    return best
+  }
+
+  /* 一页里的图片最多收这么多张：面板是给人看的，几百张缩略图谁也翻不完 */
+  const IMG_MAX = 60
+
   function domItems() {
     const out = []
     const seen = new Set()
     let blobCount = 0
+    let imgs = 0
 
-    function push(url, label, forceKind) {
-      if (!url) return
+    function push(url, label, forceKind, extra) {
+      if (!url) return null
       if (/^blob:/i.test(url) || /^data:/i.test(url)) {
         blobCount += 1
-        return
+        return null
       }
-      if (!isHttp(url) || seen.has(url)) return
+      if (!isHttp(url) || seen.has(url)) return null
       seen.add(url)
       const kind = forceKind || kindOf(url, '')
-      out.push({
-        url,
-        name: nameOf(url, label, kind, ''),
-        kind,
-        host: hostOf(url),
-        size: 0,
-        ct: '',
-      })
+      const it = { url, name: nameOf(url, label, kind, ''), kind, host: hostOf(url), size: 0, ct: '' }
+      if (extra) Object.assign(it, extra)
+      out.push(it)
+      return it
     }
 
     try {
       for (const el of document.querySelectorAll('video, audio')) {
-        push(el.currentSrc, '', 'media')
-        push(el.getAttribute('src'), '', 'media')
-        for (const s of el.querySelectorAll('source')) push(s.getAttribute('src'), '', 'media')
+        /* 「正在播放」= 有 currentSrc 且没暂停（cat-catch 的 getVideoState 就是这么判的）。
+         * 面板上标出来，用户才知道哪一条对应眼前正在放的那个。 */
+        const playing = !!el.currentSrc && el.paused === false
+        const mark = (it) => {
+          if (it && playing) it.playing = true
+        }
+        mark(push(el.currentSrc, '', 'media'))
+        mark(push(el.getAttribute('src'), '', 'media'))
+        for (const s of el.querySelectorAll('source')) mark(push(s.getAttribute('src'), '', 'media'))
+        /* 封面图也是图：很多站的海报就是视频那一帧 */
+        push(absUrl(el.getAttribute('poster')), '', 'image')
+      }
+      /* 图片：面板以前完全不看 <img>，用户只能右键另存（提过这个意见）。
+       * 名字取 alt / 标题，尺寸取浏览器量出来的自然宽高；CDN 只给了缩略图时
+       * 顺手换成原图地址去下（rules.js 的 origImageUrl），缩略图仍用眼前这张显示。 */
+      for (const im of document.querySelectorAll('img')) {
+        if (imgs >= IMG_MAX) break
+        const shown = absUrl(im.currentSrc || im.getAttribute('src'))
+        const w = im.naturalWidth || 0
+        const h = im.naturalHeight || 0
+        /* 1×1 的埋点与占位图不是「这一页的图片」；已经加载完却量不出尺寸的，
+         * 是坏图（CDN 挡了或地址过期），也别往面板里塞一行。还没加载完的先留着 ——
+         * 懒加载的图 naturalWidth 也是 0，但它是用户真正想要的。 */
+        if (w && h && w * h < 4096) continue
+        if (im.complete && !w && !h) continue
+        const best = largestFromSrcset(im.getAttribute('srcset'))
+        const src = shown || best
+        if (!src) continue
+        const orig = PanBoxRules.origImageUrl(src) || ''
+        const pick = orig || best || src
+        /* 名字仍按地址取（同一串图里的几张 alt 往往一模一样，拿 alt 当文件名
+         * 会互相覆盖），alt 只用来显示 —— 用户认图靠缩略图和这句话。 */
+        const label = im.getAttribute('alt') || im.getAttribute('title') || textOf(im.closest('a'))
+        if (push(pick, '', 'image', { thumb: pick === src ? '' : src, w, h, orig: !!orig, label: label || '' })) imgs += 1
       }
       for (const a of document.querySelectorAll('a[href]')) {
         const href = a.href
         if (!isHttp(href)) continue
         const isDl = a.hasAttribute('download')
-        if (MEDIA_EXT.test(href) || isDl) push(href, a.getAttribute('download') || a.textContent, '')
-        else if (FILE_EXT.test(href)) push(href, a.getAttribute('download') || a.textContent, 'file')
+        if (MEDIA_EXT.test(href) || isDl) push(href, a.getAttribute('download') || textOf(a), '')
+        else if (FILE_EXT.test(href)) push(href, a.getAttribute('download') || textOf(a), 'file')
+        else if (IMAGE_EXT.test(href)) push(href, a.getAttribute('download') || textOf(a), 'image')
         if (out.length >= 120) break
       }
     } catch {
@@ -331,6 +406,8 @@
   border-bottom: 1px solid #21262f;
 }
 .item:hover { background: #1c212b; }
+/* 正在播的那一条：用户一眼就能对上是哪个视频/音频 */
+.item.playing { background: #182a1e; box-shadow: inset 2px 0 0 #3fbf6a; }
 .item .meta { flex: 1; min-width: 0; }
 .item .nm {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #e6e9ef;
@@ -342,6 +419,33 @@
 }
 .tag.stream { background: #3a2b16; color: #ffbe6a; border-color: #5a431f; }
 .tag.segment { background: #2c2440; color: #c0a6ff; border-color: #443a63; }
+.tag.image { background: #1e3324; color: #86d99b; border-color: #2f5a37; }
+/* 分组头：一页里抓到的几十条按「视频/图片/文件/分片」分开，
+   不然几十个 .m4s 会把真正要下的那条淹掉（用户提过这个意见）。 */
+.ghdr {
+  display: block; width: 100%; text-align: left; cursor: default;
+  font: 10.5px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  padding: 5px 9px 3px; color: #8fb6ff; background: #1a1f28;
+  border: 0; border-bottom: 1px solid #21262f;
+}
+button.ghdr { cursor: pointer; }
+button.ghdr:hover { filter: brightness(1.2); }
+/* 缩略图：图片行的左边放它自己，一眼能看出「这条对应页面上哪张图」 */
+.thumb {
+  flex: 0 0 auto; width: 34px; height: 34px; border-radius: 4px;
+  object-fit: cover; background: #232833; border: 1px solid #333a48;
+}
+.badge {
+  flex: 0 0 auto; font-size: 9.5px; padding: 0 4px; border-radius: 3px;
+  border: 1px solid #2f5a37; background: #1e3324; color: #86d99b;
+}
+.badge.orig { border-color: #5a431f; background: #3a2b16; color: #ffbe6a; }
+.search { padding: 6px 9px; border-bottom: 1px solid #262b36; background: #1a1f28; }
+.search[hidden] { display: none; }
+.search input {
+  width: 100%; font: 11px/1.4 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  color: #e6e9ef; background: #232833; border: 1px solid #333a48; border-radius: 5px; padding: 4px 6px;
+}
 .item button {
   flex: 0 0 auto; font: 11px/1 "Segoe UI", sans-serif; cursor: pointer;
   background: #232833; color: #e6e9ef; border: 1px solid #333a48; border-radius: 5px; padding: 4px 8px;
@@ -386,6 +490,7 @@
       '<button class="close" title="收起">—</button>' +
       '</div>' +
       '<div class="note" hidden></div>' +
+      '<div class="search" hidden><input type="search" placeholder="在这一页找到的东西里找…"></div>' +
       '<div class="list"></div>' +
       '<div class="grip" role="separator" tabindex="0" title="按住拖动可调整面板大小"></div>' +
       '<div class="foot"><span class="msg">点条目右边的「下载」即可转到 PanBox</span></div>' +
@@ -403,6 +508,8 @@
       card: el('.card'),
       cnt: el('.cnt'),
       list: el('.list'),
+      search: el('.search'),
+      searchInput: el('.search input'),
       grip: el('.grip'),
       note: el('.note'),
       msg: el('.msg'),
@@ -464,6 +571,8 @@
     let lastDom = 0
     let lastHref = location.href
     let busy = false
+    let query = '' /* 搜索框里那串字（小写），空 = 不过滤 */
+    let segOpen = false /* 分片那一组默认折起来 */
 
     function ensure() {
       if (ui && ui.host.isConnected) return ui
@@ -503,12 +612,33 @@
       ui.grip.addEventListener('pointerdown', startResize)
       ui.grip.addEventListener('keydown', onGripKey)
       window.addEventListener('resize', keepInView)
+      ui.searchInput.addEventListener('input', () => {
+        query = ui.searchInput.value.trim().toLowerCase()
+        render()
+      })
       ui.list.addEventListener('click', (e) => {
+        /* 「N 个分片」那一行是折叠开关，不是文件 */
+        const tg = e.target.closest('button[data-toggle]')
+        if (tg) {
+          segOpen = !segOpen
+          render()
+          return
+        }
         const btn = e.target.closest('button[data-url]')
         if (!btn) return
         const one = items.find((x) => x.url === btn.dataset.url)
         if (one) sendItems([one], false)
       })
+      /* 缩略图挂了（图被 CDN 挡了/已失效）就把它藏起来，别在列表里留一个碎图标。
+       * error 事件不冒泡，只能在捕获阶段接。 */
+      ui.list.addEventListener(
+        'error',
+        (e) => {
+          const t = e.target
+          if (t && t.classList && t.classList.contains('thumb')) t.style.visibility = 'hidden'
+        },
+        true,
+      )
     }
 
     /* ---- 位置：默认左上角，pill（收起态的小按钮）与面板标题栏都能拖，位置记进 storage ---- */
@@ -689,6 +819,53 @@
     /* 列表只在「内容真的变了」时才重建。以前每次刷新都把整段 innerHTML 重写一遍，
      * 于是每 2 秒闪一下：正在看列表的人会被打断，滚动位置也会跳回顶部。 */
     let listSig = ''
+    /* 面板按「这是什么」分组。分片单独一组并且默认折起来 —— 抖音/X 一页能抓到
+     * 几十上百个 3KB 的 .m4s，平铺出来真正要下的那条就找不着了。
+     * ⚠️ 分组的顺序就是原来的 rank 顺序：下载入口 → 视频/播放列表 → 图片 →
+     * 其他文件 → 分片。文件那一组**不能**折，用户点的 .zip/.pdf 就在里面。 */
+    const GROUPS = [
+      { key: 'av', title: '视频 / 播放列表', kinds: ['entry', 'media', 'stream'] },
+      { key: 'image', title: '图片', kinds: ['image'] },
+      { key: 'file', title: '其他文件', kinds: ['file'] },
+      { key: 'segment', title: '分片', kinds: ['segment'] },
+    ]
+
+    function rowHtml(it) {
+      const tag = '<span class="tag ' + it.kind + '">' + (KIND_LABEL[it.kind] || '文件') + '</span>'
+      /* 缩略图：图片行放它自己；换过原图的用缩略图显示（省流量、也一定加载得出来） */
+      const thumbSrc = it.kind === 'image' ? it.thumb || it.url : ''
+      const thumb = thumbSrc
+        ? '<img class="thumb" src="' + esc(thumbSrc) + '" alt="" loading="lazy" referrerpolicy="no-referrer">'
+        : ''
+      const title = it.kind === 'image' && it.label ? it.label : it.name
+      let sub = ''
+      if (it.kind === 'segment') {
+        sub = '这是分片，单独下下来打不开：请在上面「视频 / 播放列表」里选那一条播放列表'
+      } else {
+        const dim = it.w && it.h ? it.w + '×' + it.h : ''
+        sub = [it.host, dim, fmtSize(it.size)].filter(Boolean).join(' · ') || it.host
+      }
+      return (
+        '<div class="item' +
+        (it.playing ? ' playing' : '') +
+        '">' +
+        thumb +
+        tag +
+        '<span class="meta"><span class="nm" title="' +
+        esc(it.name) +
+        '">' +
+        esc(trunc(title, 58)) +
+        '</span><span class="sub">' +
+        esc(trunc(sub, 64)) +
+        '</span></span>' +
+        (it.playing ? '<span class="badge">正在播放</span>' : '') +
+        (it.orig ? '<span class="badge orig" title="下载的是原图，不是眼前这张缩略图">原图</span>' : '') +
+        '<button data-url="' +
+        esc(it.url) +
+        '">下载</button></div>'
+      )
+    }
+
     function render() {
       ensure()
       ui.pillN.textContent = String(items.length)
@@ -698,33 +875,45 @@
         '|' +
         blobCount +
         '|' +
-        items.map((x) => x.url + '|' + x.kind + '|' + x.name + '|' + x.size).join('~')
+        query +
+        '|' +
+        (segOpen ? 1 : 0) +
+        '|' +
+        items.map((x) => x.url + '|' + x.kind + '|' + x.name + '|' + x.size + '|' + (x.playing ? 1 : 0)).join('~')
       if (sig === listSig) return
       listSig = sig
+      /* 搜索框只在东西多到需要找的时候才出现（面板本来就小） */
+      ui.search.hidden = items.length < 10
+      const hit = query
+        ? items.filter((x) => (x.name + ' ' + (x.label || '') + ' ' + x.host + ' ' + (KIND_LABEL[x.kind] || '')).toLowerCase().includes(query))
+        : items
       if (!items.length) {
         ui.list.innerHTML = '<div class="empty">这一页暂时没发现能下的东西</div>'
         ui.note.hidden = true
+      } else if (!hit.length) {
+        ui.list.innerHTML = '<div class="empty">没有对得上的条目（清掉搜索框就能看到全部）</div>'
       } else {
-        ui.list.innerHTML = items
-          .map((it) => {
-            const sub = [it.host, fmtSize(it.size)].filter(Boolean).join(' · ')
-            return (
-              '<div class="item"><span class="tag ' +
-              it.kind +
+        let html = ''
+        for (const g of GROUPS) {
+          const rows = hit.filter((x) => g.kinds.includes(x.kind))
+          if (!rows.length) continue
+          /* 分片折起来：标题那行本身就是开关，右边写清有几个、一共多大 */
+          if (g.key === 'segment') {
+            const total = rows.reduce((n, x) => n + (x.size || 0), 0)
+            const tail = fmtSize(total) ? `（合计 ${fmtSize(total)}）` : ''
+            html +=
+              '<button class="ghdr" data-toggle="seg" title="' +
+              (segOpen ? '收起分片' : '展开分片') +
               '">' +
-              (KIND_LABEL[it.kind] || '文件') +
-              '</span><span class="meta"><span class="nm" title="' +
-              esc(it.name) +
-              '">' +
-              esc(trunc(it.name, 58)) +
-              '</span><span class="sub">' +
-              esc(trunc(sub || it.host, 52)) +
-              '</span></span><button data-url="' +
-              esc(it.url) +
-              '">下载</button></div>'
-            )
-          })
-          .join('')
+              (segOpen ? '▾ ' : '▸ ') +
+              esc(g.title + ' ' + rows.length + ' 个' + tail) +
+              '</button>'
+            if (segOpen) html += rows.map(rowHtml).join('')
+            continue
+          }
+          html += '<div class="ghdr">' + esc(g.title + ' · ' + rows.length) + '</div>' + rows.map(rowHtml).join('')
+        }
+        ui.list.innerHTML = html
         if (blobCount) {
           ui.note.hidden = false
           ui.note.textContent =
@@ -733,7 +922,7 @@
             ' 个 blob: 流媒体（MSE 分片）。' +
             (items.some((x) => x.kind === 'media' && x.size > 200 * 1024)
               ? '已经抓到可直接下载的整段视频，优先下它。'
-              : '地址离开页面就失效，只能下上面抓到的分片。')
+              : '地址离开页面就失效。YouTube 这类把视频切在 blob: 里的站，插件拿不到整段，只能靠上面抓到的分片。')
         } else {
           ui.note.hidden = true
         }
@@ -782,12 +971,38 @@
           })
           if (merged.length >= 200) break
         }
+        /* 图片：DOM 里采到的（带 alt/尺寸/原图改写）优先，浏览器真请求过的补齐
+         * 体积与响应类型 —— 两边的 key 用「眼前这张」的地址对上（换过原图的行，
+         * 它自己的 url 与原图不同，网络上那条记的是缩略图）。 */
+        const netImgs = ((net && net.images) || []).filter((x) => x && x.url)
+        if (netImgs.length) {
+          const byUrl = new Map(netImgs.map((x) => [x.url, x]))
+          for (const it of merged) {
+            if (it.kind !== 'image') continue
+            const n = byUrl.get(it.thumb || it.url)
+            if (!n) continue
+            byUrl.delete(it.thumb || it.url)
+            it.size = Math.max(it.size || 0, Number(n.size) || 0)
+            it.ct = it.ct || n.ct || ''
+          }
+          for (const [url, n] of byUrl) {
+            if (merged.length >= 200) break
+            merged.push({
+              url,
+              name: n.name || nameOf(url, '', 'image', n.ct),
+              kind: 'image',
+              host: hostOf(url),
+              size: Number(n.size) || 0,
+              ct: n.ct || '',
+            })
+          }
+        }
         /* 直接能下的整段视频排最前（并按体积降序），别让几十个 3KB 的 MSE 分片
          * 把抖音/B 站那个真正要下的文件淹掉。
          * ⚠️ 这张表必须和后台 `mediaListView` 里那张**逐项一致**：`entry`（下载入口，
          * 蓝奏那类站点的真身在 `/fn?TOKEN` 页里）后台给的是 -1、排最前，这里以前漏了
          * entry，落到 `?? 9` 就成了**排最后** —— 面板把最该点的入口压到两百条底下。 */
-        const rank = { entry: -1, media: 0, stream: 1, segment: 2, file: 3 }
+        const rank = { entry: -1, media: 0, stream: 1, image: 2, segment: 3, file: 4 }
         merged.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || (b.size || 0) - (a.size || 0))
         items = merged
 

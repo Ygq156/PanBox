@@ -460,13 +460,17 @@ const UA_MOBILE_ANDROID =
  * `3345768.3355908.pdf`。PanBox 以前只做前半步：名字取到了，后缀没了 ——
  * 用户拿到一个没有后缀的文件，得自己改名。
  *
- * 这张表只覆盖「文件本体」类型：text/html、application/json 这类是网页/接口，
- * 给它们补 .html / .json 只会把「这其实不是文件」这件事藏起来。表里没有的类型
+ * 这张表只覆盖「文件本体」类型：application/json、text/css 这类是接口/资源，
+ * 给它们补 .json / .css 只会把「这其实不是文件」这件事藏起来。表里没有的类型
  * 补 .bin —— 至少比没有后缀强，用户一眼也能看出这不是原生后缀。
+ *
+ * 网页（text/html、application/xhtml+xml）从这张表里单拎出来，补 .html：
+ * 用户把「页面地址」当下载地址投进来时（X / YouTube / Pinterest 的页面链接最常
+ * 这么投），以前会落一个没后缀、名字叫 `1` / `video` 的文件，看着像下载坏了，
+ * 改后缀也放不出来。补成 .html 至少一眼能看出「下到的是网页本身，不是视频」，
+ * 主进程还会跟着发一条提示把话说清楚。
  */
 const WEB_TYPES = new Set([
-  'text/html',
-  'application/xhtml+xml',
   'text/plain',
   'text/css',
   'text/javascript',
@@ -520,7 +524,10 @@ function contentTypeExt(ct) {
     .split(';')[0]
     .trim()
     .toLowerCase()
-  if (!s || WEB_TYPES.has(s)) return ''
+  if (!s) return ''
+  /* 网页地址：如实叫 .html，别留一个没后缀的文件让人猜 */
+  if (s === 'text/html' || s === 'application/xhtml+xml') return 'html'
+  if (WEB_TYPES.has(s)) return ''
   const m = /^([a-z0-9.-]+)\/(.+)$/.exec(s)
   if (!m) return ''
   const major = m[1]

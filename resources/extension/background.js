@@ -624,9 +624,23 @@ const PDF_CT_RE = /^application\/(pdf|x-pdf)/i
 
 const MEDIA_TTL = 3 * 60 * 1000 /* 换视频后旧地址会失效；3 分钟足够，也顺便自动淘汰上一个视频 */
 const MEDIA_MAX = 240
+/* 图片单独一张表：一页几十张图是常态，混进 mediaByTab 会把真正的视频/文件挤掉
+ * （那张表按时间淘汰、上限 240）。图片只认响应类型 image/*，不看后缀 ——
+ * CDN 的图片地址常常没有后缀。1×1 的埋点、图标（不到 4KB）不收。 */
+const IMAGE_MAX = 120
+const IMAGE_MIN_BYTES = 4096
 
 const mediaByTab = new Map() /* tabId -> Map<url, {t, kind, ct, size, name, attach}> */
+const imageByTab = new Map() /* tabId -> Map<url, {t, ct, size}> */
 const frameItems = new Map() /* tabId -> Map<frameId, items[]> */
+
+/** 表超过上限时，先按时间淘汰过期的，再从最老的开始删 */
+function pruneMap(m, max, ttl) {
+  if (m.size <= max) return
+  const now = Date.now()
+  for (const [k, v] of m) if (now - v.t > ttl) m.delete(k)
+  while (m.size > max) m.delete(m.keys().next().value)
+}
 
 /** `Content-Disposition: attachment; filename="xxx.exe"` → xxx.exe */
 function nameFromDisposition(cd) {
@@ -700,17 +714,32 @@ function rememberMedia(tabId, url, ct, size, name, attach) {
     if (page) rec.referer = page
     if (lastUA) rec.ua = lastUA
   }
-  if (m.size > MEDIA_MAX) {
-    const now = Date.now()
-    for (const [k, v] of m) if (now - v.t > MEDIA_TTL) m.delete(k)
-    while (m.size > MEDIA_MAX) m.delete(m.keys().next().value)
-  }
+  pruneMap(m, MEDIA_MAX, MEDIA_TTL)
   /* 只有「服务器明说可下载」的才值得写进 session 存储（量小、价值最高） */
   if (attach) scheduleSaveCaptured()
 }
 
+/** 浏览器真请求过的一张图（响应类型 image/*）。面板「图片」那一组读它 */
+function rememberImage(tabId, url, ct, size) {
+  const n = Number(size) || 0
+  if (n && n < IMAGE_MIN_BYTES) return /* 图标、埋点：不是用户想下的图 */
+  let m = imageByTab.get(tabId)
+  if (!m) {
+    m = new Map()
+    imageByTab.set(tabId, m)
+  }
+  const old = m.get(url)
+  m.set(url, {
+    t: Date.now(),
+    ct: ct || (old && old.ct) || '',
+    size: Math.max(n, (old && old.size) || 0),
+  })
+  pruneMap(m, IMAGE_MAX, MEDIA_TTL)
+}
+
 function dropTab(tabId) {
   mediaByTab.delete(tabId)
+  imageByTab.delete(tabId)
   frameItems.delete(tabId)
   /* 下载入口（`/fn?TOKEN`）也是「属于这一页」的：标签关掉或换页之后那条入口
    * 已经作废，留在表里只会被投递成失效地址。fnByTab 以前只增不减，
@@ -768,6 +797,18 @@ function mediaListView(tabId) {
   const rank = { entry: -1, media: 0, stream: 1, segment: 2, file: 3 }
   out.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || (b.size || 0) - (a.size || 0))
   return out.slice(0, 200)
+}
+
+/** 这一页的图片（大的在前，多半就是正文里那些） */
+function imageListView(tabId) {
+  const m = tabId != null && tabId >= 0 ? imageByTab.get(tabId) : null
+  if (!m) return []
+  const now = Date.now()
+  return [...m]
+    .filter(([, v]) => now - v.t <= MEDIA_TTL)
+    .sort((a, b) => (b[1].size || 0) - (a[1].size || 0))
+    .slice(0, IMAGE_MAX)
+    .map(([url, v]) => ({ url, ct: v.ct || '', size: v.size || 0 }))
 }
 
 /** 这一页里「服务器明说可以下载」的地址（新的在前），交给 PanBox 当备选直链 */
@@ -837,6 +878,13 @@ chrome.webRequest.onHeadersReceived.addListener(
       rememberMedia(d.tabId, d.url, ct || 'application/pdf', len, nameFromDisposition(cd), true)
       return
     }
+    /* 图片：只在这里收（响应类型 image/*），**不进上面那个 onBeforeSendHeaders 的
+     * seen 表** —— 一页几十张图会把里面真正要紧的媒体与下载域记录挤掉，而图片要的
+     * 现场头（Referer）跟页面一致，投递时由 deliverPageContext 给的那份就够。 */
+    if (/^image\//i.test(ct)) {
+      rememberImage(d.tabId, d.url, ct, len)
+      return
+    }
     const media =
       MEDIA_CT_RE.test(ct) || (OCTET_RE.test(ct) && (d.type === 'media' || d.type === 'xmlhttprequest' || d.type === 'other'))
     if (!media) return
@@ -853,6 +901,7 @@ function notifyNavigated(tabId, clear) {
   if (tabId == null || tabId < 0) return
   if (clear) {
     mediaByTab.delete(tabId)
+    imageByTab.delete(tabId)
     frameItems.delete(tabId)
     /* 同 dropTab：清内存不写回存储，SPA 换页后旧记录会从 session 里复活 */
     scheduleSaveCaptured()
@@ -982,7 +1031,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     if (msg.type === 'mediaList') {
       const tabId = _sender && _sender.tab ? _sender.tab.id : -1
       await waitCaptured()
-      return reply({ ok: true, items: mediaListView(tabId) })
+      return reply({ ok: true, items: mediaListView(tabId), images: imageListView(tabId) })
     }
     if (msg.type === 'sendUrls') {
       const tabId = _sender && _sender.tab ? _sender.tab.id : -1

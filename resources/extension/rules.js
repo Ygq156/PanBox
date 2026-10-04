@@ -15,11 +15,11 @@
  * 纯函数，不碰 chrome API。`module.exports` 只是让测试能直接 require 这个文件。
  */
 var PanBoxRules = (function () {
-  /* 网页/接口类型不给后缀：它们不是文件，补 .html / .json 只会把
-   * 「这其实不是文件」这件事藏起来。与主进程 util.js 的 WEB_TYPES 逐条一致。 */
+  /* 接口/资源类型不给后缀：它们不是文件，补 .json / .css 只会把
+   * 「这其实不是文件」这件事藏起来。与主进程 util.js 的 WEB_TYPES 逐条一致。
+   * 网页（text/html、application/xhtml+xml）不在表里 —— 见下面 contentTypeExt 里
+   * 那条：网页如实补 .html，用户一眼能看出「下到的是网页本身」。 */
   var WEB_TYPES = new Set([
-    'text/html',
-    'application/xhtml+xml',
     'text/plain',
     'text/css',
     'text/javascript',
@@ -85,13 +85,16 @@ var PanBoxRules = (function () {
     ).split(' ')
   )
 
-  /** `application/pdf; charset=utf-8` → `pdf`；网页/文本类型返回空（它们不是文件） */
+  /** `application/pdf; charset=utf-8` → `pdf`；网页 → `html`；接口/文本类型返回空 */
   function contentTypeExt(ct) {
     var s = String(ct || '')
       .split(';')[0]
       .trim()
       .toLowerCase()
-    if (!s || WEB_TYPES.has(s)) return ''
+    if (!s) return ''
+    /* 网页地址：如实叫 .html，别留一个没后缀的文件让人猜 */
+    if (s === 'text/html' || s === 'application/xhtml+xml') return 'html'
+    if (WEB_TYPES.has(s)) return ''
     var m = /^([a-z0-9.-]+)\/(.+)$/.exec(s)
     if (!m) return ''
     var major = m[1]
@@ -127,10 +130,48 @@ var PanBoxRules = (function () {
     return ext ? s + '.' + ext : s
   }
 
+  /* 图片 CDN 给的常常不是原图：同一张图另有一个「尺寸」参数或路径段。
+   * 两条规则抄 yt-dlp（`yt_dlp/extractor/twitter.py:1250-1262` 用 `?name=orig`）：
+   *   X：`pbs.twimg.com/media/xxx?format=jpg&name=small` → `…&name=orig`，
+   *      也有把尺寸写在文件名后面的 `…xxx.jpg:large` → `…xxx.jpg:orig`；
+   *   Pinterest：`i.pinimg.com/736x/ab/cd/ef/hash.jpg` → `…/originals/ab/cd/ef/hash.jpg`。
+   * 拿不准就返回空串 —— 宁可下用户眼前这张，也别换出一个会 404 的地址。 */
+  function origImageUrl(url) {
+    var s = String(url || '')
+    if (!/^https?:\/\//i.test(s)) return ''
+    try {
+      var u = new URL(s)
+      var host = u.hostname.toLowerCase()
+      if (/(^|\.)twimg\.com$/.test(host)) {
+        if (u.searchParams.has('name')) {
+          u.searchParams.set('name', 'orig')
+          return u.toString()
+        }
+        if (/:(small|medium|large|\d+x\d+)$/i.test(u.pathname)) {
+          u.pathname = u.pathname.replace(/:(small|medium|large|\d+x\d+)$/i, ':orig')
+          return u.toString()
+        }
+        return ''
+      }
+      if (/(^|\.)pinimg\.com$/.test(host)) {
+        var m = /^\/(\d+x\d*|originals)\//i.exec(u.pathname)
+        if (m && m[1].toLowerCase() !== 'originals') {
+          u.pathname = u.pathname.replace(/^\/[^/]+\//, '/originals/')
+          return u.toString()
+        }
+        return ''
+      }
+      return ''
+    } catch (e) {
+      return ''
+    }
+  }
+
   return {
     contentTypeExt: contentTypeExt,
     hasKnownExt: hasKnownExt,
     withExt: withExt,
+    origImageUrl: origImageUrl,
     CT_EXT: CT_EXT,
     KNOWN_EXTS: KNOWN_EXTS,
     WEB_TYPES: WEB_TYPES,

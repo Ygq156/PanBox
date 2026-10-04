@@ -1616,6 +1616,17 @@ if (!gotLock) {
     tasks.on('complete', (t) => {
       boot('complete', String(t.name))
       recycleTransferCopy(t.name, 'complete')
+      /* 用户把「页面地址」当下载地址投进来时（X / YouTube / Pinterest 的页面链接最常这样投），
+       * 服务器回的就是网页本身，落盘叫 `xx.html`。不说一句的话，用户只会觉得「下载坏了」——
+       * 这里如实讲清楚它是什么、以及真要下视频该怎么做。complete 每个 gid 只发一次。 */
+      if (/\.html?$/i.test(String(t.name || ''))) {
+        boot('html-not-file', String(t.name))
+        if (win && !win.isDestroyed()) {
+          win.webContents.send('downloads:notice', {
+            text: `「${t.name}」是网页本身（HTML），不是视频/文件 —— 多半投的是页面地址。要下视频：先把视频播起来，再用浏览器插件面板选播放列表或分片。`,
+          })
+        }
+      }
       if (settings.load().openFolderWhenDone && win && !win.isDestroyed()) {
         const dir = t.dir || settings.load().downloadDir
         /* openPath 不抛异常，失败时返回原因 —— 吞掉的话「下完自动打开目录」这个
