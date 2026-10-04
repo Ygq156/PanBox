@@ -931,6 +931,15 @@ button.ghdr:hover { filter: brightness(1.2); }
             (items.some((x) => x.kind === 'media' && x.size > 200 * 1024)
               ? '已经抓到可直接下载的整段视频，优先下它。'
               : '地址离开页面就失效。YouTube 这类把视频切在 blob: 里的站，插件拿不到整段，只能靠上面抓到的分片。')
+        } else if (
+          !items.some((x) => x.kind === 'stream' || x.kind === 'media') &&
+          items.filter((x) => x.kind === 'segment').length >= 3
+        ) {
+          /* 只有分片、一条播放列表都没抓到：别让用户对着几百个分片猜。
+           * （正常情况不该走到这里 —— 播放列表有自己的保质期，见 background.js 的 STREAM_TTL。） */
+          ui.note.hidden = false
+          ui.note.textContent =
+            '这一页只抓到分片，没抓到播放列表（整段视频那条）。刷新这一页、再让它播一次，播放列表就会出现 —— 分片单独下下来是放不出来的。'
         } else {
           ui.note.hidden = true
         }

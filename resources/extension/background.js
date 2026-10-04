@@ -57,7 +57,7 @@ async function loadCaptured() {
     for (const r of arr) {
       /* 尺寸/名字等字段逐项回填；tabId 在浏览器重启后会变，但 worker 被回收
        * 与 tabId 无关，所以同一会话里它还是对的。 */
-      if (!r || !r.url || now - (r.t || 0) > MEDIA_TTL) continue
+      if (!r || !r.url || now - (r.t || 0) > ttlOf(r, MEDIA_TTL)) continue
       const m = mediaByTab.get(r.tabId)
       if (m) m.set(r.url, { t: r.t, kind: r.kind, ct: r.ct || '', size: r.size || 0, name: r.name || '', attach: !!r.attach })
       else {
@@ -97,16 +97,19 @@ async function saveCaptured() {
   saveDirty = false
   try {
     const now = Date.now()
-    const out = []
+    const rows = []
     for (const [tabId, m] of mediaByTab) {
       for (const [url, v] of m) {
-        if (now - v.t > MEDIA_TTL) continue
-        out.push({ tabId, url, t: v.t, kind: v.kind, ct: v.ct || '', size: v.size || 0, name: v.name || '', attach: !!v.attach })
-        if (out.length >= CAP_MAX) break
+        if (now - v.t > ttlOf(v, MEDIA_TTL)) continue
+        rows.push({ tabId, url, t: v.t, kind: v.kind, ct: v.ct || '', size: v.size || 0, name: v.name || '', attach: !!v.attach })
       }
-      if (out.length >= CAP_MAX) break
     }
-    await chrome.storage.session.set({ [CAP_KEY]: out })
+    /* 快照有上限，留谁很要紧：播放列表（整段视频那条）和下载链接先保住，
+     * 其余的按新旧排。从前是按插入顺序截前 120 条 —— 只保住了最老的，最新的全丢。 */
+    const keep = (r) => (r.kind === 'stream' || r.attach ? 1 : 0)
+    rows.sort((a, b) => keep(b) - keep(a) || (b.t || 0) - (a.t || 0))
+    if (rows.length > CAP_MAX) rows.length = CAP_MAX
+    await chrome.storage.session.set({ [CAP_KEY]: rows })
   } catch {
     /* 同上，存不下就算了 */
   } finally {
@@ -623,7 +626,20 @@ const ATTACH_RE = /^\s*attachment\b/i
 const PDF_CT_RE = /^application\/(pdf|x-pdf)/i
 
 const MEDIA_TTL = 3 * 60 * 1000 /* 换视频后旧地址会失效；3 分钟足够，也顺便自动淘汰上一个视频 */
+/* ⚠️ 播放列表**不能**跟分片用同一个保质期。分片是一边播一边请求的，每一条的 `t`
+ * 都在刷新；播放列表通常**只在开始播放时取一次**，之后再也不请求 —— 拿 3 分钟去
+ * 淘汰它，用户看了几分钟再打开面板，就只剩满满一屏分片，「整段视频」那条不见了
+ * （NDM 那种插件不会丢，用户就是这么对比出来的）。换页/关标签本来就会整表清掉
+ * （见 dropTab），所以给它一个够长的保质期是安全的。 */
+const STREAM_TTL = 60 * 60 * 1000
+/* 一页攒下的播放列表条数上限（自适应码率切换会陆续取好几条）。只防无限堆积。 */
+const STREAM_MAX = 24
 const MEDIA_MAX = 240
+
+/** 一条记录按哪个保质期算：播放列表单独一档，其余还是 MEDIA_TTL */
+function ttlOf(v, fallback) {
+  return v && v.kind === 'stream' ? STREAM_TTL : fallback
+}
 /* 图片单独一张表：一页几十张图是常态，混进 mediaByTab 会把真正的视频/文件挤掉
  * （那张表按时间淘汰、上限 240）。图片只认响应类型 image/*，不看后缀 ——
  * CDN 的图片地址常常没有后缀。1×1 的埋点、图标（不到 4KB）不收。 */
@@ -634,12 +650,33 @@ const mediaByTab = new Map() /* tabId -> Map<url, {t, kind, ct, size, name, atta
 const imageByTab = new Map() /* tabId -> Map<url, {t, ct, size}> */
 const frameItems = new Map() /* tabId -> Map<frameId, items[]> */
 
-/** 表超过上限时，先按时间淘汰过期的，再从最老的开始删 */
+/** 表超过上限时，先按时间淘汰过期的，再从最老的开始删。
+ * ⚠️ 淘汰的先后很要紧：**先删分片**。表是按插入顺序排的，而播放列表通常是最早
+ * 进来的那一条 —— 一页几百个分片冲进来时，「整段视频」那条恰恰最容易被顶掉
+ * （这就是用户看到的「只抓到分片、抓不到完整视频」）。 */
 function pruneMap(m, max, ttl) {
   if (m.size <= max) return
   const now = Date.now()
-  for (const [k, v] of m) if (now - v.t > ttl) m.delete(k)
+  for (const [k, v] of m) if (now - v.t > ttlOf(v, ttl)) m.delete(k)
+  for (const [k, v] of [...m]) {
+    if (m.size <= max) return
+    if (!v || v.kind !== 'stream') m.delete(k)
+  }
   while (m.size > max) m.delete(m.keys().next().value)
+}
+
+/** 播放列表单独限条数（只留最新的 STREAM_MAX 条），别让一页上百条流把它撑爆 */
+function capStreams(m, max) {
+  let n = 0
+  for (const v of m.values()) if (v && v.kind === 'stream') n += 1
+  if (n <= max) return
+  for (const [k, v] of [...m]) {
+    if (n <= max) return
+    if (v && v.kind === 'stream') {
+      m.delete(k)
+      n -= 1
+    }
+  }
 }
 
 /** `Content-Disposition: attachment; filename="xxx.exe"` → xxx.exe */
@@ -717,6 +754,7 @@ function rememberMedia(tabId, url, ct, size, name, attach) {
     if (lastUA) rec.ua = lastUA
   }
   pruneMap(m, MEDIA_MAX, MEDIA_TTL)
+  capStreams(m, STREAM_MAX)
   /* 只有「服务器明说可下载」的才值得写进 session 存储（量小、价值最高） */
   if (attach) scheduleSaveCaptured()
 }
@@ -777,7 +815,7 @@ function mediaListView(tabId) {
   const m = tabId >= 0 ? mediaByTab.get(tabId) : null
   if (m) {
     for (const [url, v] of m) {
-      if (now - v.t > MEDIA_TTL) continue
+      if (now - v.t > ttlOf(v, MEDIA_TTL)) continue
       if (have.has(url)) continue
       have.add(url)
       out.push({ url, kind: v.kind, ct: v.ct || '', size: v.size || 0, name: v.name || '', attach: !!v.attach })
