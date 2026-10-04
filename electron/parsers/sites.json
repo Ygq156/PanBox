@@ -109,13 +109,17 @@
     "tianyi": {
       "label": "天翼云盘",
       "share": true,
-      "supported": false,
-      "match": "(cloud\\.189\\.cn|189\\.cn/t/)"
+      "supported": true,
+      "login": true,
+      "endpoint": true,
+      "match": "(cloud\\.189\\.cn|189\\.cn/t/|content\\.21cn\\.com/h5/subscrip/)"
     },
     "yidong": {
       "label": "移动云盘",
       "share": true,
-      "supported": false,
+      "supported": true,
+      "cookie": true,
+      "endpoint": true,
       "match": "(caiyun\\.139\\.com|yun\\.139\\.com|139\\.com/m/i)"
     },
     "pan115": {

@@ -1,7 +1,7 @@
 'use strict'
 
 /**
- * 内置登录窗口：为需要凭证的网盘（夸克 / UC / 百度 / 迅雷 / 阿里云盘）打开一个独立分区的浏览器窗口，
+ * 内置登录窗口：为需要凭证的网盘（夸克 / UC / 百度 / 迅雷 / 阿里云盘 / 天翼云盘）打开一个独立分区的浏览器窗口，
  * 用户在里面正常登录（扫码或账号密码），登录完成后：
  *   - 命中该网盘的登录态 cookie 特征 → 自动收下并关闭；
  *   - 用户手动关闭窗口 → 也照样收下当前分区里的 cookie（容错路径）。
@@ -210,6 +210,64 @@ const SITES = {
       return { header: blob, list: [{ name: 'access_token', value: got.at || got.rt }], loggedIn: true }
     },
   },
+  tianyi: {
+    name: '天翼云盘',
+    url: 'https://cloud.189.cn/web/main/',
+    domains: ['189.cn'],
+    /* 天翼的直链接口要用户自己的 accessToken。网页版把它放在 localStorage 或 cookie 里
+     * （实测 H5 侧读的是 accessToken；键名有 accessToken / access_token / token 几种），
+     * 登录后两处都扫一遍，抓到的值存成 {accessToken} 的 JSON 塞进 settings.cookies.tianyi。
+     * 解析器侧认这段 JSON（见 electron/parsers/tianyi.js 的 parseCred），
+     * 它拿 accessToken 现算 Signature（Timestamp + md5）。 */
+    async read(ses, win) {
+      if (!win || win.isDestroyed()) return { header: '', list: [], loggedIn: false }
+      const raw = await win.webContents
+        .executeJavaScript(
+          `(() => { const o = {}; for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); o[k] = localStorage.getItem(k) } return JSON.stringify(o) })()`,
+          true,
+        )
+        .catch(() => '{}')
+      let store = {}
+      try {
+        store = JSON.parse(raw || '{}')
+      } catch {
+        /* ignore */
+      }
+      const looksLikeToken = (v) => typeof v === 'string' && v.trim().length >= 16 && !/[{};]/.test(v)
+      const isTokenKey = (k) => /access.?token|^token$|^accesstoken$/i.test(k)
+      const unquote = (v) => (typeof v === 'string' && v[0] === '"' ? v.slice(1, -1) : v)
+      let token = ''
+      for (const [k, v] of Object.entries(store)) {
+        if (!isTokenKey(k)) continue
+        const s = unquote(v)
+        if (looksLikeToken(s)) {
+          token = s
+          break
+        }
+        /* 有些版本把令牌包在一段 JSON 里 */
+        if (typeof s === 'string' && s.trim()[0] === '{') {
+          try {
+            const o = JSON.parse(s)
+            const t = unquote(String((o && (o.accessToken || o.access_token || o.token)) || ''))
+            if (looksLikeToken(t)) {
+              token = t
+              break
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      if (!token) {
+        const list = await harvestCookies(ses, this)
+        const hit = list.find((c) => isTokenKey(c.name) && looksLikeToken(c.value))
+        if (hit) token = hit.value
+      }
+      if (!token) return { header: '', list: [], loggedIn: false }
+      const blob = JSON.stringify({ accessToken: token })
+      return { header: blob, list: [{ name: 'accessToken', value: token }], loggedIn: true }
+    },
+  },
 }
 
 function cookieHeader(list) {
@@ -238,7 +296,7 @@ async function harvestCookies(ses, site) {
 }
 
 /**
- * @param {'quark'|'uc'|'baidu'|'xunlei'|'aliyun'} netdisk
+ * @param {'quark'|'uc'|'baidu'|'xunlei'|'aliyun'|'tianyi'} netdisk
  * @param {BrowserWindow|null} parent
  * @returns {Promise<{ok:boolean, cookie?:string, count?:number, message?:string}>}
  */
@@ -357,6 +415,8 @@ const FRESH = {
   xunlei: { name: '', minTtlSec: 0, warmMs: 0 },
   // 阿里云盘同理：access_token 由解析器自己拿 refresh_token 换，不需要预热窗口
   aliyun: { name: '', minTtlSec: 0, warmMs: 0 },
+  // 天翼云盘：凭证在 localStorage 里，靠重开登录窗拿不到新令牌，也不需要预热
+  tianyi: { name: '', minTtlSec: 0, warmMs: 0 },
 }
 
 /**
@@ -373,7 +433,7 @@ const warmedAt = new Map()
  * 让网盘首页把短效令牌重新种进登录分区，然后回收完整 cookie。
  * 令牌还足够新时直接返回，不打开窗口。
  *
- * @param {'quark'|'uc'|'baidu'|'xunlei'|'aliyun'} netdisk
+ * @param {'quark'|'uc'|'baidu'|'xunlei'|'aliyun'|'tianyi'} netdisk
  * @param {{force?:boolean}} [opts]
  * @returns {Promise<null|{header:string, list:any[], loggedIn:boolean, refreshed:boolean}>}
  */

@@ -11,6 +11,8 @@ const uc = require('./uc')
 const pan123 = require('./pan123')
 const baidu = require('./baidu')
 const aliyun = require('./aliyun')
+const tianyi = require('./tianyi')
+const yidong = require('./yidong')
 const xunlei = require('./xunlei')
 const custom = require('./custom')
 const mdpi = require('./mdpi')
@@ -26,6 +28,10 @@ const PARSERS = {
   baidu,
   /** 阿里云盘：目录不登录就能列，取直链要用户自己的登录态（见 aliyun.js 顶部注释） */
   aliyun,
+  /** 天翼云盘：单文件分享不登录就能列，文件夹分享与取直链要登录（见 tianyi.js 顶部注释） */
+  tianyi,
+  /** 移动云盘：目录不登录就能列，取直链要用户账号（见 yidong.js 顶部注释） */
+  yidong,
   xunlei,
   /** 论文站：地址里只有文章页，PDF 要另外换算出一条地址来（见各自文件顶部注释） */
   mdpi,

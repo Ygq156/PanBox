@@ -6,6 +6,8 @@ export type Netdisk =
   | 'baidu'
   | 'xunlei'
   | 'aliyun'
+  | 'tianyi'
+  | 'yidong'
   | '123pan'
   | 'direct'
   | 'unknown'
