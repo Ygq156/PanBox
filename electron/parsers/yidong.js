@@ -48,6 +48,10 @@ const DEVICE_INFO = '||9|12.27.0|firefox|140.0|||linux unknown|1920X526|zh-CN|||
 
 /** 一次分享最多收这么多条目，避免超大分享把会话内存拖爆 */
 const MAX_FILES = 3000
+/* 目录数 / 总耗时预算：见下面 walk 的注释。 */
+const MAX_DIRS = 400
+const MAX_MS = 45000
+const CONCURRENCY = 5
 
 /* ------------------------------------------------------------------ */
 /* 加密那一层                                                          */
@@ -283,29 +287,74 @@ async function listLevel(linkId, pwd, caID, token, account) {
   return { dirs: d.caLst || [], files: d.coLst || [] }
 }
 
+/* 一次目录 = 一次接口请求。实测每次请求约 0.28-0.30s（本机直连），所以**串行**往下走
+ * 时，一个几千项的分享会一直停在那里：用户那条 `2wFGyEMJ6PCiu` 就是列了十几分钟还没完，
+ * UI 上只显示「正在解析」（1.0.16 实测）。现在改成：
+ *   - 并发 CONCURRENCY 个目录一起列（实测提速≈5 倍，站点没因此回错）
+ *   - 目录数（MAX_DIRS）、文件数（MAX_FILES）和总耗时（MAX_MS）三个预算，超了就收手，
+ *     把已经列到的东西交出去，并在标题里如实说明「只列了一部分」
+ *   - 按 caID 去重，防止站点返回环形结构时无限转圈 */
 async function walk(linkId, pwd, token, account) {
   const out = []
+  const seen = new Set()
   const queue = [{ caID: 'root', dir: '' }]
+  const t0 = Date.now()
+  let dirsDone = 0
+  let truncated = false
+  let firstErr = null
+
   while (queue.length) {
-    const cur = queue.shift()
-    const { dirs, files } = await listLevel(linkId, pwd, cur.caID, token, account)
-    for (const f of files) {
-      out.push({
-        coID: String(f.coID || ''),
-        name: String(f.coName || ''),
-        size: Number(f.coSize) || 0,
-        dir: cur.dir,
-      })
-      if (out.length >= MAX_FILES) return out
+    const batch = []
+    while (queue.length && batch.length < CONCURRENCY) {
+      const cur = queue.shift()
+      const key = String(cur.caID || 'root')
+      if (seen.has(key)) continue
+      seen.add(key)
+      batch.push(cur)
     }
-    for (const d of dirs) {
-      queue.push({
-        caID: d.caID,
-        dir: cur.dir ? `${cur.dir}/${d.caName}` : String(d.caName || ''),
-      })
+    if (!batch.length) break
+
+    const got = await Promise.all(
+      batch.map(async (cur) => {
+        try {
+          return { cur, ...(await listLevel(linkId, pwd, cur.caID, token, account)) }
+        } catch (e) {
+          return { cur, dirs: [], files: [], err: e }
+        }
+      }),
+    )
+
+    for (const g of got) {
+      if (g.err) {
+        if (!firstErr) firstErr = g.err
+        continue
+      }
+      for (const f of g.files) {
+        out.push({
+          coID: String(f.coID || ''),
+          name: String(f.coName || ''),
+          size: Number(f.coSize) || 0,
+          dir: g.cur.dir,
+        })
+      }
+      for (const d of g.dirs) {
+        const name = String(d.caName || '')
+        queue.push({
+          caID: d.caID,
+          dir: g.cur.dir ? `${g.cur.dir}/${name}` : name,
+        })
+      }
     }
+    dirsDone += batch.length
+
+    if (out.length >= MAX_FILES) { truncated = queue.length > 0; break }
+    if (dirsDone >= MAX_DIRS) { truncated = queue.length > 0; break }
+    if (Date.now() - t0 >= MAX_MS) { truncated = queue.length > 0; break }
   }
-  return out
+
+  /* 一个目录都没列成，那就是真错（链接失效、被限速…），照原样抛出去。 */
+  if (!dirsDone && firstErr) throw firstErr
+  return { entries: out, truncated }
 }
 
 /* ------------------------------------------------------------------ */
@@ -318,7 +367,7 @@ async function open(url, ctx = {}) {
   const token = cred ? cred.token : ''
   const account = cred ? cred.account : ''
 
-  const entries = await walk(linkId, pwd, token, account)
+  const { entries, truncated } = await walk(linkId, pwd, token, account)
   if (!entries.length) {
     throw new Error('这个分享里没有文件（可能是个空目录，或者链接已失效）')
   }
@@ -333,7 +382,9 @@ async function open(url, ctx = {}) {
 
   return {
     shareId: linkId,
-    title: '移动云盘分享',
+    /* 目录没列完时把话写在标题上 —— 解析结果只有 title/files 两个字段能被界面看到，
+     * 与其让用户以为「这个分享就这么点东西」，不如说清楚。 */
+    title: truncated ? `移动云盘分享（目录太多，先列到 ${files.length} 个文件）` : '移动云盘分享',
     files,
     resolve: async (id) => {
       const e = entries[Number(id)]
@@ -396,5 +447,8 @@ module.exports = {
     fillAccount,
     accountOf,
     MAX_FILES,
+    MAX_DIRS,
+    MAX_MS,
+    CONCURRENCY,
   },
 }

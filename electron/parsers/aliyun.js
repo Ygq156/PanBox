@@ -166,8 +166,18 @@ function sharesHeaders(shareToken, shareId) {
 }
 
 /**
- * 取一条直链。两条路都试，先试 AList/OpenList 还在用的那条分享直链接口，
+ * 取一条直链。三条路都试：AList/OpenList 还在用的那条分享直链接口（两种 Authorization 写法），
  * 再退到官方前端用的 `/v2/file/get_download_url`。
+ *
+ * 2026-02 实测：**三条路都拿不到地址了**。
+ *   - `/v2/file/get_share_link_download_url`（PDS / `api.alipan.com`）→ HTTP 410 空体；
+ *   - `/v2/file/get_download_url` 带分享上下文 → 403 `User not authorized to operate on the specified APIs share_link`；
+ *   - 转存到自己网盘（`POST /v2/file/copy` 带 x-share-token → 201，确实能转）之后再取，
+ *     `/v2/file/get_download_url` 回 200 但 `url`/`cdn_url` 都是**空串**（八种头变体全一样，两个文件都试过，
+ *     `punish_flag` 全 0，不是审查）。官方网页现在走的是开放平台通道
+ *     `/adrive/v1.0/openFile/getDownloadUrl`（bundle 里 `preferPDSOpenApi` 那一支，open 主机 + open token）。
+ * 所以这里保留三条候选（万一哪天恢复），失败话术如实说明。
+ *
  * @returns {Promise<string>} 下载地址（没有就是空串）
  */
 async function downloadUrl(shareId, shareToken, token, file) {
@@ -212,6 +222,12 @@ async function downloadUrl(shareId, shareToken, token, file) {
     lastMsg = msgOf(j) || String(r.text || '').slice(0, 120) || `HTTP ${r.status}`
     /* 需要重新登录这类，别接着试第二条了 —— 换个接口也是一样的结果 */
     if (/TokenVerifyFailed|AccessTokenInvalid|not login|refresh_token/i.test(lastMsg)) break
+  }
+  /* 410（接口已下线）是当前的常态，话术别说成「没登录」或「重试一下」 */
+  if (/410|不是合法 JSON|not authorized|No Permission/i.test(lastMsg)) {
+    throw new Error(
+      '阿里云盘已经不再向网页端下发分享文件的下载地址（分享直链接口回 410，转存到自己网盘后同样取不到地址），PanBox 现在只能列出文件；下载请用阿里云盘官方客户端',
+    )
   }
   throw new Error(`阿里云盘没给出下载地址（${lastMsg}）`)
 }

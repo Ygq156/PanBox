@@ -214,24 +214,33 @@ const SITES = {
     name: '天翼云盘',
     url: 'https://cloud.189.cn/web/main/',
     domains: ['189.cn'],
-    /* 天翼的直链接口要用户自己的 accessToken。网页版把它放在 localStorage 或 cookie 里
-     * （实测 H5 侧读的是 accessToken；键名有 accessToken / access_token / token 几种），
-     * 登录后两处都扫一遍，抓到的值存成 {accessToken} 的 JSON 塞进 settings.cookies.tianyi。
-     * 解析器侧认这段 JSON（见 electron/parsers/tianyi.js 的 parseCred），
-     * 它拿 accessToken 现算 Signature（Timestamp + md5）。 */
+    /* 天翼要**两样**凭证：
+     *   - `accessToken`：签名的原材料，网页版放在 localStorage 或 cookie 里
+     *     （键名有 accessToken / access_token / token 几种）；
+     *   - **会话 cookie**：下载接口要的 `cookieUserSession` 只在这里，
+     *     只给 accessToken 时服务端回 `cookieUserSession is null or invalid, cookieUserSession=null`。
+     * 所以这里 localStorage 与分区 cookie 都收，存成 `{accessToken, cookie}` 的 JSON
+     * 塞进 settings.cookies.tianyi。解析器侧认这段 JSON（见 electron/parsers/tianyi.js 的 parseCred），
+     * 它拿 accessToken 现算 Signature（Timestamp + md5），并把整条 cookie 一起发出去。 */
+    // 按 URL 作用域收：接口在 cloud.189.cn/api 下，路径 /web/main/ 之外也要带上
+    cookieUrls: ['https://cloud.189.cn/web/main/', 'https://cloud.189.cn/api/'],
     async read(ses, win) {
-      if (!win || win.isDestroyed()) return { header: '', list: [], loggedIn: false }
-      const raw = await win.webContents
-        .executeJavaScript(
-          `(() => { const o = {}; for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); o[k] = localStorage.getItem(k) } return JSON.stringify(o) })()`,
-          true,
-        )
-        .catch(() => '{}')
+      /* 会话 cookie 先收：即使窗口拿不到（win 为空），cookie 照样有用 */
+      const list = await harvestCookies(ses, this)
+      const cookie = cookieHeader(list)
       let store = {}
-      try {
-        store = JSON.parse(raw || '{}')
-      } catch {
-        /* ignore */
+      if (win && !win.isDestroyed()) {
+        const raw = await win.webContents
+          .executeJavaScript(
+            `(() => { const o = {}; for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); o[k] = localStorage.getItem(k) } return JSON.stringify(o) })()`,
+            true,
+          )
+          .catch(() => '{}')
+        try {
+          store = JSON.parse(raw || '{}')
+        } catch {
+          /* ignore */
+        }
       }
       const looksLikeToken = (v) => typeof v === 'string' && v.trim().length >= 16 && !/[{};]/.test(v)
       const isTokenKey = (k) => /access.?token|^token$|^accesstoken$/i.test(k)
@@ -259,13 +268,12 @@ const SITES = {
         }
       }
       if (!token) {
-        const list = await harvestCookies(ses, this)
         const hit = list.find((c) => isTokenKey(c.name) && looksLikeToken(c.value))
         if (hit) token = hit.value
       }
-      if (!token) return { header: '', list: [], loggedIn: false }
-      const blob = JSON.stringify({ accessToken: token })
-      return { header: blob, list: [{ name: 'accessToken', value: token }], loggedIn: true }
+      if (!token && !cookie) return { header: '', list: [], loggedIn: false }
+      const blob = JSON.stringify({ accessToken: token, cookie })
+      return { header: blob, list, loggedIn: !!token }
     },
   },
 }
