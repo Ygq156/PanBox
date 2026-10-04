@@ -240,15 +240,18 @@ async function shareInfo(code, pwd) {
     size: Number(j.fileSize) || 0,
     isFolder: !!j.isFolder,
     mediaType: j.mediaType,
+    /* 列目录必须带「这个分享自己的分享模式」（实测：写死 1 时服务端一律回
+     * `Argument invalid`，用信息接口给的 5 就正常返回文件列表）。 */
+    shareMode: Number(j.shareMode) || 1,
     uuid,
   }
 }
 
-async function listDir(shareId, fileId, pwd, pageNum, token, cookie) {
+async function listDir(shareId, fileId, pwd, pageNum, token, cookie, shareMode) {
   const params = {
     shareId: String(shareId),
     fileId: String(fileId),
-    shareMode: 1,
+    shareMode: Number(shareMode) || 1,
     isFolder: true,
     iconOption: 5,
     orderBy: 'lastOpTime',
@@ -261,23 +264,22 @@ async function listDir(shareId, fileId, pwd, pageNum, token, cookie) {
   const ao = j.fileListAO
   if (!ao) {
     const { code, msg } = errOf(j)
-    /* 没带登录态时，服务端对文件夹分享一律拒（Argument invalid / InvalidSessionKey），
-     * 如实告诉用户这一步要登录，别把服务端的错误码直接甩到界面上。
-     * 例外：扩展交来过 cloud.189.cn 的现场（用户浏览器里登着云盘），那就不是「没登录态」，
-     * 这时把服务端原话带出来，方便判断是会话还是参数的问题。 */
+    /* 参数对了以后，大多数文件夹分享**匿名就能列**（实测公开文件夹分享不带任何凭证也返回列表）。
+     * 走到这儿说明服务端确实拒了：要么登录态失效，要么这分享本身要提取码/被限流。
+     * 有服务端原话就带出来；没有凭证时再把「借浏览器现场」这条路指给用户。 */
+    if (/InvalidSessionKey|sessionKey/i.test(`${code}${msg}`)) {
+      const e = new Error(
+        '天翼云盘的登录态已经失效，重新登录一下（设置 → 天翼云盘 → 登录）',
+      )
+      e.needCookie = true
+      throw e
+    }
     if (!token && !cookie) {
       const borrowed = identity.has(`${API}/share/listShareDir.action`)
       const e = new Error(
         borrowed
           ? `天翼云盘列目录失败：${msg || code || 'HTTP 异常'}`
-          : '天翼云盘的文件夹分享要登录才能列目录（设置 → 天翼云盘 → 登录）；单文件分享不用登录',
-      )
-      e.needCookie = true
-      throw e
-    }
-    if (/InvalidSessionKey|sessionKey/i.test(`${code}${msg}`)) {
-      const e = new Error(
-        '天翼云盘的登录态已经失效，重新登录一下（设置 → 天翼云盘 → 登录）',
+          : `天翼云盘列目录失败：${msg || code || 'HTTP 异常'}（也可以在浏览器里登着云盘打开这个分享页，用扩展把这一页交给 PanBox 再试）`,
       )
       e.needCookie = true
       throw e
@@ -287,15 +289,15 @@ async function listDir(shareId, fileId, pwd, pageNum, token, cookie) {
   return ao
 }
 
-/** 递归收完整个分享（文件夹分享要登录态；单文件分享不走这里） */
-async function walk(shareId, rootFileId, pwd, token, cookie) {
+/** 递归收完整个分享（文件夹分享也常常匿名可列；单文件分享不走这里） */
+async function walk(shareId, rootFileId, pwd, token, cookie, shareMode) {
   const out = []
   const queue = [{ fileId: rootFileId, dir: '' }]
   while (queue.length) {
     const cur = queue.shift()
     let page = 1
     for (;;) {
-      const ao = await listDir(shareId, cur.fileId, pwd, page, token, cookie)
+      const ao = await listDir(shareId, cur.fileId, pwd, page, token, cookie, shareMode)
       for (const f of ao.fileList || []) {
         out.push({
           id: String(f.id || ''),
@@ -358,7 +360,7 @@ async function open(url, ctx = {}) {
     if (!info.fileName) throw new Error('这个天翼云盘分享里没有文件')
     entries = [{ id: info.fileId, name: info.fileName, size: info.size, dir: '' }]
   } else {
-    entries = await walk(info.shareId, info.fileId, pwd, token, cookie)
+    entries = await walk(info.shareId, info.fileId, pwd, token, cookie, info.shareMode)
     if (!entries.length) throw new Error('这个天翼云盘分享里没有文件（可能是空目录）')
   }
 
