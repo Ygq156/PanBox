@@ -393,7 +393,53 @@ async function open(url, ctx = {}) {
       /* 取直链这一步（只有它给的是原片地址）。账号有两个来源，都是用户自己的：
        *   ① 设置里贴的凭证；② 没凭证时借浏览器现场（用户在浏览器里登着的那个 139 会话）。
        * 借用时不额外要账号：`fillAccount` 会从现场那份 Authorization 里把账号解出来。 */
-      if (token || identity.has(`${SHARE_API}/richlifeApp/devapp/IOutLink/dlFromOutLinkV3`)) {
+      const borrowed =
+        identity.has(`${SHARE_API}/richlifeApp/devapp/IOutLink/getContentInfoFromOutLink`) ||
+        identity.has(`${SHARE_API}/richlifeApp/devapp/IOutLink/dlFromOutLinkV3`)
+      const hasAuth = !!(token || borrowed)
+
+      /* ① AList 现在走的那条路：getContentInfoFromOutLink → contentInfo.cdnDownLoadUrl。
+       * 实测匿名只回元数据（一个 URL 字段都是空的），带账号才有地址。 */
+      if (hasAuth) {
+        try {
+          const j = await sharePost(
+            '/richlifeApp/devapp/IOutLink/getContentInfoFromOutLink',
+            {
+              getContentInfoFromOutLinkReq: {
+                contentId: e.coID,
+                linkID: linkId,
+                account: account || '',
+              },
+            },
+            token,
+          )
+          const ci = (j.data && j.data.contentInfo) || {}
+          const u = ci.cdnDownLoadUrl || ci.downloadURL || ''
+          if (u) {
+            return {
+              url: u,
+              headers: { 'User-Agent': UA_139, Referer: 'https://yun.139.com/' },
+              name: e.name,
+            }
+          }
+          /* 没有下载地址但有预览流时**不拿它顶替下载**（预览是转码流，用户要的是原片）：
+           * 只在这一个文件确实是 .m3u8 的时候才当兜底。 */
+          const p = ci.presentURL || ''
+          if (p && /\.m3u8(\?|$)/i.test(p)) {
+            return {
+              url: p,
+              headers: { 'User-Agent': UA_139, Referer: 'https://yun.139.com/' },
+              name: e.name,
+              note: '移动云盘只给了预览流（转码），不是原片',
+            }
+          }
+        } catch {
+          /* 落到下一条；两条都失败再如实报「要登录」 */
+        }
+      }
+
+      /* ② 老朋友 dlFromOutLinkV3：AList 更早的写法，我们 1.0.16 起在用的那条。 */
+      if (hasAuth) {
         try {
           const j = await sharePost(
             '/richlifeApp/devapp/IOutLink/dlFromOutLinkV3',
@@ -418,12 +464,17 @@ async function open(url, ctx = {}) {
             }
           }
         } catch {
-          /* 令牌过期、账号不符之类：落到下面如实报「要登录」，不要拿预览地址顶替 */
+          /* 令牌过期、账号不符之类：落到下面如实报，不要拿预览地址顶替 */
         }
       }
 
+      /* 走到这里说明：要么根本没收到登录头，要么收到了但服务端仍拒。
+       * 这两种的修法完全不同，所以分开说 —— 上一版一律说「要你自己的账号」，
+       * 用户按那句话去登录，问题其实在插件没把登录头交上来。 */
       const err = new Error(
-        '移动云盘的下载要你自己的账号：在浏览器里登着 139 打开这个分享页，再用扩展把这一页交给 PanBox；或到设置 → 移动云盘 里贴 Authorization',
+        borrowed
+          ? '移动云盘收到了浏览器现场，但服务端仍然拒了这次取址：在浏览器里打开这个分享页、点一下「刷新」让页面发一次请求，再点扩展里的「把这一页交给 PanBox」；仍不行就到设置 → 移动云盘 里贴 Authorization'
+          : '移动云盘的下载要你自己的账号：在浏览器里登着 139 打开这个分享页（点一下刷新让页面发一次请求），再用扩展「把这一页交给 PanBox」；或到设置 → 移动云盘 里贴 Authorization',
       )
       err.needCookie = true
       throw err

@@ -418,3 +418,8 @@ module.exports = {
 
 /* 便于调试：只报「有几个主机、什么时间」，绝不吐凭据本身 */
 module.exports.info = () => [...store].map(([host, v]) => ({ host, at: v.at, cookieLen: (v.cookie || '').length }))
+
+/* 交过 Authorization 的主机名（只有主机名，没有值）。桥接日志用它回答
+ * 「这一页到底有没有把登录头交上来」这个问题 —— 移动云盘取直链全看这一条。 */
+module.exports.authHosts = () => [...store].filter(([, v]) => v && v.auth)
+  .map(([host]) => host)

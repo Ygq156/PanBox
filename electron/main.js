@@ -1052,7 +1052,11 @@ async function bridgePage(p) {
   if (!/^https?:\/\//i.test(url)) return { ok: false, message: '只接受 http(s) 页面地址' }
 
   const n = browserCtx.set({ ...p, url })
-  boot('bridge-page', 'hosts=' + n, 'url=' + url.slice(0, 80))
+  /* 把「交上来几个主机」和「其中哪几个带了 Authorization」都写进启动日志：
+   * 移动云盘取直链就差这一条头，出问题时先看这行，不用再猜插件有没有生效。 */
+  boot('bridge-page', 'hosts=' + n,
+    'auth=' + (browserCtx.authHosts ? browserCtx.authHosts().join(',') || '（没有）' : '?'),
+    'url=' + url.slice(0, 80))
 
   const nd = detectNetdisk(url)
   const isShare = parsers.SHARE_NETDISKS.has(nd)

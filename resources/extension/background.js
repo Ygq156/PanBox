@@ -134,6 +134,74 @@ try {
 }
 
 /* ------------------------------------------------------------------ */
+/* 按主机记下「浏览器真的发出去过」的 Authorization                      */
+/* ------------------------------------------------------------------ */
+/* 为什么不能只靠 `seen`：MV3 的 service worker 闲着 30 秒就被回收，`seen` 在内存里，
+ * 一回收就全没了。而用户的操作顺序天然跨过这个窗口 —— 打开分享页 → 页面自己发了几次
+ * 接口请求（那一刻我们看到了 Authorization）→ 用户过一会儿才点「把这一页交给 PanBox」。
+ * 等点的时候 worker 早被回收，交出去的就是空的，程序那边只能看到「没收到登录头」。
+ *
+ * 所以把 host → {auth,t} 也写进 `chrome.storage.session`（只在内存、关浏览器就没，
+ * 长度有时效的令牌本来就该这么放），投递时两个来源合并。
+ * 只在内存里、也不落盘：`session` 就是干这个用的。 */
+const AUTH_KEY = 'authByHost'
+const AUTH_TTL = 10 * 60 * 1000 /* 比 seen 的 5 分钟长一点：留给用户「过一会儿才点」的那段 */
+const AUTH_MAX = 24
+const authStore = new Map() /* host -> {auth, t} */
+
+function trimAuthStore() {
+  const now = Date.now()
+  for (const [h, v] of authStore) if (now - v.t > AUTH_TTL) authStore.delete(h)
+  while (authStore.size > AUTH_MAX) authStore.delete(authStore.keys().next().value)
+}
+
+let authSaveTimer = null
+
+function scheduleSaveAuth() {
+  if (authSaveTimer) return
+  authSaveTimer = setTimeout(() => {
+    authSaveTimer = null
+    saveAuth()
+  }, 600)
+}
+
+async function saveAuth() {
+  try {
+    const rows = {}
+    const now = Date.now()
+    for (const [h, v] of authStore) {
+      if (now - v.t > AUTH_TTL) continue
+      rows[h] = { auth: v.auth, t: v.t }
+    }
+    await chrome.storage.session.set({ [AUTH_KEY]: rows })
+  } catch {
+    /* 存不下就算了，功能本身照旧（只是又回到「回收后可能丢」的老样子） */
+  }
+}
+
+function noteAuthHeader(url, auth) {
+  if (!auth) return
+  const s = String(auth)
+  if (!s || s.length > 1024) return
+  let host = ''
+  try {
+    host = new URL(url).hostname.toLowerCase()
+  } catch {
+    return
+  }
+  if (!host) return
+  const prev = authStore.get(host)
+  /* 同主机保留最新那份，但别为了同一份头反复写存储 */
+  if (prev && prev.auth === s) {
+    prev.t = Date.now()
+    return
+  }
+  authStore.set(host, { auth: s, t: Date.now() })
+  trimAuthStore()
+  scheduleSaveAuth()
+}
+
+/* ------------------------------------------------------------------ */
 /* 与 PanBox 的通道                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -499,6 +567,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       cookie: h.cookie || '',
       headers: keep,
     })
+    /* Authorization 另存一份到 session 存储：见 AUTH_KEY 那段注释，
+     * 只靠 seen 的话 worker 一被回收，用户点「把这一页交给 PanBox」就交不出这个头了。 */
+    if (keep.authorization) noteAuthHeader(d.url, keep.authorization)
     trimSeen()
   },
   { urls: ['http://*/*', 'https://*/*'] },
@@ -743,6 +814,12 @@ function authHeadersForTab(tabId, max = 8) {
       continue
     }
     if (h) list.push({ host: h, auth: String(a), t: v.t })
+  }
+  /* 再把持久化那份（可能来自 worker 上一世）合进来：同一主机以更新的时间为准。 */
+  for (const [h, v] of authStore) {
+    if (!v || !v.auth || now - v.t > AUTH_TTL) continue
+    if (String(v.auth).length > 1024) continue
+    list.push({ host: h, auth: v.auth, t: v.t, persisted: true })
   }
   list.sort((a, b) => b.t - a.t)
   for (const it of list) {
@@ -1209,6 +1286,8 @@ async function deliverPageContext(tabId, rawUrl, title) {
   /* 回收后刚被唤醒时，抓到的文件地址还没从 session 里读回来 ——
    * 不等这一步，投递出去的「备选地址」会是空的。 */
   await waitCaptured()
+  /* Authorization 那一份同理：不等它，刚被唤醒时交出去的就是空的（见 AUTH_KEY 那段）。 */
+  await authReady
   /* 以浏览器里真实的页面地址为准（popup 传来的可能是 Referer） */
   let url = stripHash(rawUrl || '')
   if (!/^https?:/i.test(url)) {
@@ -1274,3 +1353,21 @@ function sendCurrentPageContext(info) {
 /* worker 每次被唤醒都跑一遍：把还在有效期内的记录读回来。
  * 必须放在这里 —— mediaByTab 与 MEDIA_TTL 都在上面才定义好，放前面会拿到 undefined。 */
 capturedReady = loadCaptured().catch(() => {})
+
+/* 同上，把上次记下的 Authorization 也读回来（见 AUTH_KEY 那段注释）。 */
+async function loadAuth() {
+  try {
+    const got = await chrome.storage.session.get({ [AUTH_KEY]: null })
+    const rows = got[AUTH_KEY]
+    if (!rows || typeof rows !== 'object') return
+    const now = Date.now()
+    for (const [h, v] of Object.entries(rows)) {
+      if (!v || !v.auth || now - (v.t || 0) > AUTH_TTL) continue
+      authStore.set(String(h).toLowerCase(), { auth: String(v.auth), t: v.t || now })
+    }
+    trimAuthStore()
+  } catch {
+    /* 读不回来就当没有（功能本身照旧） */
+  }
+}
+const authReady = loadAuth().catch(() => {})

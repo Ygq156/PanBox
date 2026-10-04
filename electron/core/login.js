@@ -1,7 +1,7 @@
 'use strict'
 
 /**
- * 内置登录窗口：为需要凭证的网盘（夸克 / UC / 百度 / 迅雷 / 阿里云盘 / 天翼云盘）打开一个独立分区的浏览器窗口，
+ * 内置登录窗口：为需要凭证的网盘（夸克 / UC / 百度 / 迅雷 / 天翼云盘）打开一个独立分区的浏览器窗口，
  * 用户在里面正常登录（扫码或账号密码），登录完成后：
  *   - 命中该网盘的登录态 cookie 特征 → 自动收下并关闭；
  *   - 用户手动关闭窗口 → 也照样收下当前分区里的 cookie（容错路径）。
@@ -156,60 +156,6 @@ const SITES = {
       return { header: blob, list: [{ name: 'access_token', value: cred.access_token }], loggedIn: true }
     },
   },
-  aliyun: {
-    name: '阿里云盘',
-    url: 'https://www.alipan.com/',
-    domains: ['alipan.com', 'aliyundrive.com'],
-    /* 阿里云盘的直链接口要用户自己的 access_token，网页版把它存在 localStorage 里
-     * （键名各版本不一样：token / credentials / …，值是 `{access_token, refresh_token, …}`），
-     * 所以这里跟迅雷一样读 localStorage，把两个令牌存成一段 JSON 塞进 settings.cookies.aliyun。
-     * 解析器侧认这段 JSON（见 electron/parsers/aliyun.js 的 parseCred）；access_token 过期时
-     * 它自己拿 refresh_token 去换新的，所以不需要预热窗口。 */
-    async read(ses, win) {
-      if (!win || win.isDestroyed()) return { header: '', list: [], loggedIn: false }
-      const raw = await win.webContents
-        .executeJavaScript(
-          `(() => { const o = {}; for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); o[k] = localStorage.getItem(k) } return JSON.stringify(o) })()`,
-          true,
-        )
-        .catch(() => '{}')
-      let store = {}
-      try {
-        store = JSON.parse(raw || '{}')
-      } catch {
-        /* ignore */
-      }
-      /* 只认「像令牌的那段 JSON」：一段 JSON 里至少有 access_token 或 refresh_token。
-       * 先看键名像令牌的（token/cred/auth），都没有再扫全部值。 */
-      const pick = (text) => {
-        if (typeof text !== 'string' || text.trim()[0] !== '{') return null
-        try {
-          const o = JSON.parse(text)
-          const at = String((o && (o.access_token || o.accessToken)) || '')
-          const rt = String((o && (o.refresh_token || o.refreshToken)) || '')
-          if (at || rt) return { at, rt }
-        } catch {
-          /* ignore */
-        }
-        return null
-      }
-      let got = null
-      for (const [k, v] of Object.entries(store)) {
-        if (!/token|cred|auth/i.test(k)) continue
-        got = pick(v)
-        if (got) break
-      }
-      if (!got) {
-        for (const v of Object.values(store)) {
-          got = pick(v)
-          if (got) break
-        }
-      }
-      if (!got) return { header: '', list: [], loggedIn: false }
-      const blob = JSON.stringify({ access_token: got.at, refresh_token: got.rt })
-      return { header: blob, list: [{ name: 'access_token', value: got.at || got.rt }], loggedIn: true }
-    },
-  },
   tianyi: {
     name: '天翼云盘',
     url: 'https://cloud.189.cn/web/main/',
@@ -304,7 +250,7 @@ async function harvestCookies(ses, site) {
 }
 
 /**
- * @param {'quark'|'uc'|'baidu'|'xunlei'|'aliyun'|'tianyi'} netdisk
+ * @param {'quark'|'uc'|'baidu'|'xunlei'|'tianyi'} netdisk
  * @param {BrowserWindow|null} parent
  * @returns {Promise<{ok:boolean, cookie?:string, count?:number, message?:string}>}
  */
@@ -421,8 +367,6 @@ const FRESH = {
   baidu: null,
   // 迅雷没有短效 cookie，凭证在 localStorage 里，每次重读一遍即可
   xunlei: { name: '', minTtlSec: 0, warmMs: 0 },
-  // 阿里云盘同理：access_token 由解析器自己拿 refresh_token 换，不需要预热窗口
-  aliyun: { name: '', minTtlSec: 0, warmMs: 0 },
   // 天翼云盘：凭证在 localStorage 里，靠重开登录窗拿不到新令牌，也不需要预热
   tianyi: { name: '', minTtlSec: 0, warmMs: 0 },
 }
@@ -441,7 +385,7 @@ const warmedAt = new Map()
  * 让网盘首页把短效令牌重新种进登录分区，然后回收完整 cookie。
  * 令牌还足够新时直接返回，不打开窗口。
  *
- * @param {'quark'|'uc'|'baidu'|'xunlei'|'aliyun'|'tianyi'} netdisk
+ * @param {'quark'|'uc'|'baidu'|'xunlei'|'tianyi'} netdisk
  * @param {{force?:boolean}} [opts]
  * @returns {Promise<null|{header:string, list:any[], loggedIn:boolean, refreshed:boolean}>}
  */

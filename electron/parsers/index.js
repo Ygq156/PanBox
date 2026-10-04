@@ -10,7 +10,6 @@ const quark = require('./quark')
 const uc = require('./uc')
 const pan123 = require('./pan123')
 const baidu = require('./baidu')
-const aliyun = require('./aliyun')
 const tianyi = require('./tianyi')
 const yidong = require('./yidong')
 const xunlei = require('./xunlei')
@@ -26,8 +25,6 @@ const PARSERS = {
   uc,
   '123pan': pan123,
   baidu,
-  /** 阿里云盘：目录不登录就能列，取直链要用户自己的登录态（见 aliyun.js 顶部注释） */
-  aliyun,
   /** 天翼云盘：单文件分享不登录就能列，文件夹分享与取直链要登录（见 tianyi.js 顶部注释） */
   tianyi,
   /** 移动云盘：目录不登录就能列，取直链要用户账号（见 yidong.js 顶部注释） */
@@ -44,7 +41,7 @@ const PARSERS = {
  *  share=true 的是「真·网盘分享链接」—— 只能叫窗口出来让用户勾选，不能当直链下。
  *  mdpi / ssrn 这类**论文站**不算：它们虽然是专门解析器，但一条地址就是一个文件，
  *  走「加入下载队列」那条路（BRIDGE_DIRECT 用的就是下面这个集合）。
- *  share 且 supported=false 的是「认得出域名、还没实现」的网盘（阿里云盘等）。 */
+ *  share 且 supported=false 的是「认得出域名、还没实现」的网盘（阿里云盘、115、微云）。 */
 const SITES = require('./sites.json').sites
 const ENTRIES = Object.entries(SITES)
 

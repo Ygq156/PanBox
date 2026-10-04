@@ -101,9 +101,7 @@
     "aliyun": {
       "label": "阿里云盘",
       "share": true,
-      "supported": true,
-      "login": true,
-      "endpoint": true,
+      "supported": false,
       "match": "(aliyundrive\\.com|alipan\\.com)"
     },
     "tianyi": {
