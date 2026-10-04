@@ -185,14 +185,23 @@ async function downloadUrl(shareId, shareToken, token, file) {
   ]
   let lastMsg = ''
   for (const t of tries) {
-    const r = await reqRetry(t.url, {
-      method: 'POST',
-      headers: {
-        ...sharesHeaders(shareToken, shareId),
-        Authorization: t.auth,
-      },
-      body: JSON.stringify(t.body),
-    })
+    let r
+    try {
+      r = await reqRetry(t.url, {
+        method: 'POST',
+        headers: {
+          ...sharesHeaders(shareToken, shareId),
+          Authorization: t.auth,
+        },
+        body: JSON.stringify(t.body),
+      })
+    } catch (e) {
+      /* 一条候选自己失败（实测 `api.alipan.com/v2/file/get_share_link_download_url`
+       * 会回 HTTP 410 + 空体，`reqJson` 抛「接口返回不是合法 JSON」）不能把整条链掐断，
+       * 否则后面两条候选根本没机会试。记下话继续下一条。 */
+      lastMsg = (e && e.message) || String(e)
+      continue
+    }
     const j = r.json || {}
     const dl =
       j.download_url ||

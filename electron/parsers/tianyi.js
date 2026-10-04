@@ -47,6 +47,7 @@
 const crypto = require('crypto')
 
 const { req } = require('./util')
+const identity = require('./identity')
 
 const API = 'https://cloud.189.cn/api/open'
 /** 一次分享最多收这么多条目 */
@@ -133,13 +134,30 @@ function signedHeaders(token, params) {
   return h
 }
 
+/**
+ * 补上「浏览器现场」的 Cookie 与请求头。
+ *
+ * 只在**没有自己凭证**（`token` 为空）时才借：天翼的接口认的是 `cookieUserSession`
+ * （服务端原话 `cookieUserSession is null or invalid, cookieUserSession=null, userId=null`），
+ * 而用户在浏览器里登着云盘时，扩展会把 `cloud.189.cn` 的 Cookie 与请求头交给 PanBox
+ * （browserCtx，按主机、10 分钟）。有凭证就只用自己的那套，两套会话不混 —— identity.js 立的规矩。
+ */
+function withBrowser(url, headers, token) {
+  if (token) return headers
+  const h = identity.forRequest(url, headers, { referer: 'https://cloud.189.cn/web/main/' })
+  /* 现场头会覆盖调用方的同名头（browserCtx.mergeHeaders 的规矩）：正文类型与 Accept 必须还是我们这一种 */
+  if (headers['Content-Type']) h['Content-Type'] = headers['Content-Type']
+  if (headers.Accept) h.Accept = headers.Accept
+  return h
+}
+
 async function apiGet(path, params, token) {
   const qs = Object.keys(params)
     .filter((k) => params[k] !== undefined && params[k] !== null && params[k] !== '')
     .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`)
     .join('&')
   const url = `${API}${path}${qs ? `?${qs}` : ''}`
-  const r = await req(url, { headers: signedHeaders(token, params), timeout: 30000 })
+  const r = await req(url, { headers: withBrowser(url, signedHeaders(token, params), token), timeout: 30000 })
   let j
   try {
     j = JSON.parse(r.text)
@@ -150,14 +168,19 @@ async function apiGet(path, params, token) {
 }
 
 async function apiPostForm(path, form) {
-  const r = await req(`${API}${path}`, {
+  const url = `${API}${path}`
+  const r = await req(url, {
     method: 'POST',
-    headers: {
-      'User-Agent': UA_189,
-      Accept: 'application/json;charset=UTF-8',
-      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-      Referer: 'https://cloud.189.cn/web/main/',
-    },
+    headers: withBrowser(
+      url,
+      {
+        'User-Agent': UA_189,
+        Accept: 'application/json;charset=UTF-8',
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        Referer: 'https://cloud.189.cn/web/main/',
+      },
+      '',
+    ),
     body: new URLSearchParams(form).toString(),
     timeout: 30000,
   })
@@ -228,10 +251,15 @@ async function listDir(shareId, fileId, pwd, pageNum, token) {
   if (!ao) {
     const { code, msg } = errOf(j)
     /* 没带登录态时，服务端对文件夹分享一律拒（Argument invalid / InvalidSessionKey），
-     * 如实告诉用户这一步要登录，别把服务端的错误码直接甩到界面上。 */
+     * 如实告诉用户这一步要登录，别把服务端的错误码直接甩到界面上。
+     * 例外：扩展交来过 cloud.189.cn 的现场（用户浏览器里登着云盘），那就不是「没登录态」，
+     * 这时把服务端原话带出来，方便判断是会话还是参数的问题。 */
     if (!token) {
+      const borrowed = identity.has(`${API}/share/listShareDir.action`)
       const e = new Error(
-        '天翼云盘的文件夹分享要登录才能列目录（设置 → 天翼云盘 → 登录）；单文件分享不用登录',
+        borrowed
+          ? `天翼云盘列目录失败：${msg || code || 'HTTP 异常'}`
+          : '天翼云盘的文件夹分享要登录才能列目录（设置 → 天翼云盘 → 登录）；单文件分享不用登录',
       )
       e.needCookie = true
       throw e
@@ -335,9 +363,12 @@ async function open(url, ctx = {}) {
     resolve: async (id) => {
       const e = byId.get(String(id))
       if (!e) throw new Error('文件索引无效')
-      if (!token) {
+      /* 没有自己凭证时，还可以借「浏览器现场」：用户浏览器里登着云盘，扩展会把
+       * cloud.189.cn 的 Cookie 交过来，接口要的那个 cookieUserSession 就在里面。 */
+      const borrow = identity.has(`${API}/file/getFileDownloadUrl.action`)
+      if (!token && !borrow) {
         const err = new Error(
-          '天翼云盘的分享要下载，得先用你的账号登录一下（设置 → 天翼云盘 → 登录）',
+          '天翼云盘的下载要你自己的账号：在浏览器里登着云盘打开这个分享页，再用扩展把这一页交给 PanBox；或到设置 → 天翼云盘 里登录',
         )
         err.needCookie = true
         throw err

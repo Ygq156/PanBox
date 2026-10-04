@@ -720,6 +720,38 @@ function kindOfUrl(url, ct) {
 /* 这个标签页此刻的地址（下载域记录里要写「从哪一页点的」）。
  * 这里只能问 `seen`（onBeforeSendHeaders 每次请求都记了一条）——
  * 扩展的 webRequest 回调是同步的，等不了 chrome.tabs.get 的异步结果。 */
+/* 这个标签页里浏览器**真的发出去过**的 Authorization，按主机去重（最近优先，最多 8 台）。
+ *
+ * 为什么要单独交这一个头：`pageRequestHeaders` 只交**页面自己主机**的那套头，而有些网盘的
+ * 接口在另一台主机上、凭据又只认 `Authorization`（移动云盘：页面 yun.139.com、接口
+ * share-kd-njs.yun.139.com，头里是 `Basic base64("pc:账号:令牌")`）。不把它的值单独交过去，
+ * PanBox 就永远拿不到那份登录态 —— 用户「在浏览器里登了、却不会取凭证」卡的就是这里。
+ * cookie 不走这条（cookie 本来就按主机全交给 PanBox 了），只交 Authorization 的值。 */
+function authHeadersForTab(tabId, max = 8) {
+  const out = {}
+  const now = Date.now()
+  const list = []
+  for (const [u, v] of seen) {
+    if (now - v.t > TTL) continue
+    if (tabId != null && tabId >= 0 && v.tabId !== tabId) continue
+    const a = v.headers && v.headers.authorization
+    if (!a || String(a).length > 1024) continue
+    let h = ''
+    try {
+      h = new URL(u).hostname.toLowerCase()
+    } catch {
+      continue
+    }
+    if (h) list.push({ host: h, auth: String(a), t: v.t })
+  }
+  list.sort((a, b) => b.t - a.t)
+  for (const it of list) {
+    if (out[it.host] === undefined) out[it.host] = it.auth
+    if (Object.keys(out).length >= max) break
+  }
+  return out
+}
+
 function pageUrlOf(tabId) {
   if (tabId == null || tabId < 0) return ''
   let best = ''
@@ -1212,6 +1244,9 @@ async function deliverPageContext(tabId, rawUrl, title) {
     referer: ctx.referer || rh.referer || '',
     userAgent: rh.ua || ctx.ua || navigator.userAgent,
     requestHeaders: rh.headers,
+    /* 浏览器这一页**真的发出去过**的 Authorization（按主机分开，见 authHeadersForTab）：
+     * 接口主机与页面主机不同、凭据只在头里的站点（移动云盘）就靠这一条。 */
+    authByHost: authHeadersForTab(tabId),
     cookies,
     /* 这一页浏览器**真的请求到过**的文件地址（Content-Disposition 认出来的
      * 那些）。解析器推不出来的、一次性签名的下载地址就在这里面 —— PanBox

@@ -36,6 +36,7 @@ const crypto = require('crypto')
 const zlib = require('node:zlib')
 
 const { req } = require('./util')
+const identity = require('./identity')
 
 const SHARE_API = 'https://share-kd-njs.yun.139.com/yun-share'
 /** 密钥就是这 16 个 ASCII 字符（OpenList 里绕了一圈 hex.EncodeToString 再解码，结果一样） */
@@ -200,10 +201,50 @@ function apiHeaders(token) {
 /* 接口                                                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 一次请求要用的头。
+ *
+ * 有自己凭证（设置里贴的 Authorization）就用自己的那套，**完全不看浏览器现场** ——
+ * 这是 identity.js 立的规矩：两套会话混在一起会把本来能用的站搞坏。
+ * 没有凭证才是移动云盘的常态，这时候借「浏览器现场」：用户在浏览器里登着 139，
+ * 扩展会把那一页的请求头（含 `Authorization: Basic …`，见 resources/extension/background.js
+ * 的 onBeforeSendHeaders）交给 PanBox，按主机存在 browserCtx 里（10 分钟），
+ * 直接用就行，不用用户手抄任何令牌。
+ */
+function requestHeaders(url, token) {
+  const h = apiHeaders(token)
+  if (token) return h
+  const merged = identity.forRequest(url, h, { referer: 'https://yun.139.com/' })
+  /* 现场头会覆盖调用方同名头（browserCtx.mergeHeaders 的规矩），这里只保证正文还是加密 JSON */
+  merged['Content-Type'] = 'application/json;charset=UTF-8'
+  return merged
+}
+
+/**
+ * 请求体里那个 `account`：能解出来就填上。
+ * `Authorization: Basic base64("pc:账号:令牌")` 里就带着账号（accountOf 干的活），
+ * 匿名列表时是空串（服务端认），借浏览器现场时正好能补上。
+ */
+function fillAccount(body, account) {
+  if (!account) return body
+  for (const k of Object.keys(body)) {
+    const v = body[k]
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      if (!v.account) v.account = account
+      return body
+    }
+  }
+  return body
+}
+
 async function sharePost(pathname, body, token) {
-  const r = await req(`${SHARE_API}${pathname}`, {
+  const url = `${SHARE_API}${pathname}`
+  const headers = requestHeaders(url, token)
+  const auth = String(headers.Authorization || headers.authorization || '')
+  fillAccount(body, accountOf(token || auth))
+  const r = await req(url, {
     method: 'POST',
-    headers: apiHeaders(token),
+    headers,
     body: encryptBody(body),
     timeout: 30000,
   })
@@ -298,8 +339,10 @@ async function open(url, ctx = {}) {
       const e = entries[Number(id)]
       if (!e) throw new Error('文件索引无效')
 
-      /* 有登录态就走取直链那一步（这一步才给的是原片地址） */
-      if (token) {
+      /* 取直链这一步（只有它给的是原片地址）。账号有两个来源，都是用户自己的：
+       *   ① 设置里贴的凭证；② 没凭证时借浏览器现场（用户在浏览器里登着的那个 139 会话）。
+       * 借用时不额外要账号：`fillAccount` 会从现场那份 Authorization 里把账号解出来。 */
+      if (token || identity.has(`${SHARE_API}/richlifeApp/devapp/IOutLink/dlFromOutLinkV3`)) {
         try {
           const j = await sharePost(
             '/richlifeApp/devapp/IOutLink/dlFromOutLinkV3',
@@ -329,7 +372,7 @@ async function open(url, ctx = {}) {
       }
 
       const err = new Error(
-        '移动云盘的分享要下载，得先用你的账号登录一下（设置 → 移动云盘 → 登录）',
+        '移动云盘的下载要你自己的账号：在浏览器里登着 139 打开这个分享页，再用扩展把这一页交给 PanBox；或到设置 → 移动云盘 里贴 Authorization',
       )
       err.needCookie = true
       throw err
@@ -344,5 +387,14 @@ module.exports = {
   parseShareUrl,
   parseCred,
   SHARE_RE,
-  _internal: { sortedStringify, encryptBody, decryptBody, apiHeaders, accountOf, MAX_FILES },
+  _internal: {
+    sortedStringify,
+    encryptBody,
+    decryptBody,
+    apiHeaders,
+    requestHeaders,
+    fillAccount,
+    accountOf,
+    MAX_FILES,
+  },
 }

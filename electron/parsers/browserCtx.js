@@ -69,13 +69,39 @@ function set(payload) {
     mapped.push({ host, cookie: '' })
   }
 
+  /* 跨主机的 API 凭据：插件把浏览器**真的发出去过**的 Authorization 按主机交过来
+   * （`authByHost`）。有些网盘的接口主机跟页面主机不是一台（移动云盘：页面在
+   * yun.139.com，接口在 share-kd-njs.yun.139.com，凭据在 `Authorization: Basic …` 头里），
+   * 而 pageRequestHeaders 只交页面自己主机的头 —— 没有这条，那份凭据就传不过来。
+   * 只收 Authorization 的**值**，按主机存，绝不跨主机取用。 */
+  const authMap = {}
+  const authIn = payload && payload.authByHost && typeof payload.authByHost === 'object' ? payload.authByHost : {}
+  for (const [h, v] of Object.entries(authIn)) {
+    const host2 = String(h || '').toLowerCase()
+    const val = String(v == null ? '' : v).slice(0, 1024)
+    if (!host2 || !val) continue
+    if (Object.keys(authMap).length >= 8) break
+    authMap[host2] = val
+  }
+  /* 只有 Authorization、连 cookie 都没有的主机（就是上面那种接口主机）也得建条目 */
+  for (const h of Object.keys(authMap)) {
+    if (!mapped.some((c) => c.host === h)) mapped.push({ host: h, cookie: '' })
+  }
+
   const at = Date.now()
   /* 浏览器此刻真的在用的那套头（Accept / Sec-Fetch-* / Sec-CH-UA 这一组）。
    * 反爬看的就是它，所以插件会一起交过来；只留白名单之外的，长度也压住。 */
   const headers = pickHeaders(payload && payload.requestHeaders)
   let n = 0
   for (const c of mapped) {
-    store.set(c.host, { cookie: c.cookie, referer, userAgent, headers, at })
+    store.set(c.host, {
+      cookie: c.cookie,
+      referer,
+      userAgent,
+      headers,
+      auth: authMap[c.host] || '',
+      at,
+    })
     n += 1
   }
   /* 顺手清过期的，再按时间淘汰，避免长期运行攒一堆凭据 */
@@ -290,6 +316,10 @@ function headersFor(headers, url, fallbackReferer) {
    * 换了个人来取它就拒。用户看到的就是「浏览器和 NDM 能下，PanBox 下不了」。 */
   const ua = (v && own && v.userAgent) || anyUserAgent()
   if (ua) out['User-Agent'] = ua
+  /* 跨主机的 API 凭据（`authByHost`，只有 Authorization 的值）：**精确主机**命中才带，
+   * 同一站点的兄弟主机也不行 —— 凭据是会把站点之间串起来的东西，与 cookie 一个规矩。 */
+  const exact = store.get(host)
+  if (exact && exact.auth && !out.Authorization && !out.authorization) out.Authorization = exact.auth
   if (!out.Referer && fallbackReferer) out.Referer = fallbackReferer
   return out
 }
