@@ -117,6 +117,8 @@
     if (/^application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)/i.test(c)) return 'stream'
     const e = extOf(url)
     if (e === 'ts' || e === 'm4s') return 'segment'
+    /* 分片流的初始化段（X 那种 `/vid/avc1/0/0/…mp4`）也是一片，见 rules.js 的说明 */
+    if (PanBoxRules.isInitSegment(url)) return 'segment'
     if (/^image\//i.test(c)) return 'image'
     if (/^(video|audio)\//i.test(c)) return 'media'
     if (MEDIA_EXT.test(url)) return 'media'

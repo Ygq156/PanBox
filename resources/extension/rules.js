@@ -167,11 +167,31 @@ var PanBoxRules = (function () {
     }
   }
 
+  /* 分片流里「开头那一段」：X 的初始化段长得像个小 mp4
+   * （`https://video.twimg.com/amplify_video/<id>/vid/avc1/0/0/480x270/xxx.mp4`，
+   * 实测只有 903 字节），单独下下来任何播放器都放不出来，可它又带着 `.mp4` 后缀与
+   * `video/mp4` 类型，面板会把它当「视频/音频」摆出来。它跟 `.m4s` 是一类东西，
+   * 该进「分片」那一组。
+   * 判据是路径里的 `/0/0/`：X 用「序号/起始毫秒」编路径，初始化段这两段都是 0
+   * （真分片是 `/0/3000/` 这种）。只认 twimg 的地址 —— 别家站点未必这么编。 */
+  function isInitSegment(url) {
+    var s = String(url || '')
+    if (!/\.mp4(?:$|[?#])/i.test(s)) return false
+    try {
+      var u = new URL(s)
+      if (!/(^|\.)video\.twimg\.com$/i.test(u.hostname)) return false
+      return /\/(?:vid|aud)\/[^/]+\/0\/0\//i.test(u.pathname)
+    } catch (e) {
+      return false
+    }
+  }
+
   return {
     contentTypeExt: contentTypeExt,
     hasKnownExt: hasKnownExt,
     withExt: withExt,
     origImageUrl: origImageUrl,
+    isInitSegment: isInitSegment,
     CT_EXT: CT_EXT,
     KNOWN_EXTS: KNOWN_EXTS,
     WEB_TYPES: WEB_TYPES,

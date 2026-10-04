@@ -662,6 +662,8 @@ function kindOfUrl(url, ct) {
   if (/\.(m3u8|mpd)(?:$|[?#])/i.test(url)) return 'stream'
   if (/^application\/(x-mpegurl|vnd\.apple\.mpegurl|dash\+xml)/i.test(c)) return 'stream'
   if (/\.(ts|m4s)(?:$|[?#])/i.test(url)) return 'segment'
+  /* 分片流的初始化段（X 那种 `/vid/avc1/0/0/…mp4`）也是一片，见 rules.js 的说明 */
+  if (PanBoxRules.isInitSegment(url)) return 'segment'
   if (/^(video|audio)\//i.test(c)) return 'media'
   if (MEDIA_RE.test(url)) return 'media'
   return 'file'

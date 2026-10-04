@@ -1608,6 +1608,12 @@ if (!gotLock) {
       }
     })
 
+    /** 给界面发一条提示行（渲染层按原话显示，见 `src/App.tsx` 里的 `downloads:notice`） */
+    function notice(text) {
+      if (!win || win.isDestroyed()) return
+      win.webContents.send('downloads:notice', { text: String(text) })
+    }
+
     /* 下载完成 → 回收转存副本，别让用户网盘里堆 `xxx(1).zip`；顺便按需打开下载目录。
      * 这个事件每个 gid 只发一次，所以不用像以前那样在每个 tick 里扫全表。
      * ⚠️ 必须用模块级的 `downloadsCleanup`：之前误写成了 `downloads:add` 处理函数里的
@@ -1621,11 +1627,15 @@ if (!gotLock) {
        * 这里如实讲清楚它是什么、以及真要下视频该怎么做。complete 每个 gid 只发一次。 */
       if (/\.html?$/i.test(String(t.name || ''))) {
         boot('html-not-file', String(t.name))
-        if (win && !win.isDestroyed()) {
-          win.webContents.send('downloads:notice', {
-            text: `「${t.name}」是网页本身（HTML），不是视频/文件 —— 多半投的是页面地址。要下视频：先把视频播起来，再用浏览器插件面板选播放列表或分片。`,
-          })
-        }
+        notice(`「${t.name}」是网页本身（HTML），不是视频/文件 —— 多半投的是页面地址。要下视频：先把视频播起来，再用浏览器插件面板选播放列表或分片。`)
+      }
+      /* 流媒体引擎也有话要说：这一路只有画面、音轨没取回来、或者声音只能单独存一个文件。
+       * 从前这些话只进了 console（打包版没人接），用户拿到一个没声音的文件却不知道原因。 */
+      const en = localEngine(t.gid)
+      const st = en ? en.tellStatus(t.gid) : null
+      if (st && st.note) {
+        boot('hls-note', String(st.note))
+        notice(`「${t.name}」：${st.note}`)
       }
       if (settings.load().openFolderWhenDone && win && !win.isDestroyed()) {
         const dir = t.dir || settings.load().downloadDir

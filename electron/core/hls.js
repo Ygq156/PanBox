@@ -202,20 +202,22 @@ function parsePlaylist(text, baseUrl) {
   return { type: 'media', segments, map, live: !endList, totalDur }
 }
 
-/** `CODECS` 里出现这些名字，就说明这一路流自己带着声音 */
-const AUDIO_CODEC_RE = /(mp4a|ac-3|ec-3|opus|flac|alac|mp3|dtsc)/i
-
 /**
  * 这一路流是不是「只有画面」。
  *
- * 三个条件**同时**成立才能下这个结论（判据同 yt-dlp `extractor/common.py`）：
- * 挂了音频组、写了 `CODECS`、而 `CODECS` 里没有任何音频编码。
- * 少任何一条都不算 —— 有音频组却没写 `CODECS` 的流其实是完整的，
- * 真按「音频在别处」处理就会把好好的视频当残废，反而下不到声音。
+ * 两条同时成立才算：这一路挂了音频组，而且那个组里**真有一条带 `URI` 的音轨**。
+ * 挂了音频组就说明声音走那条音轨、画面这条列表里没有声音（HLS 的规矩）；
+ * 音轨没有 `URI` 则是「声音跟画面在同一条流里」，不算纯画面。
+ *
+ * 这里**不能看 `CODECS` 里写没写音频编码**（曾经的写法就是这么错的）：
+ * X 的主列表写的是 `CODECS="mp4a.40.2,avc1.4D401E"` + `AUDIO="audio-32000"`，
+ * 而它指向的那条列表里全是 `/vid/` 分片、一个 `/aud/` 都没有 —— 按 `CODECS` 判
+ * 就会以为「这一路自带声音」，于是从不去取音轨，用户拿到一个没有声音的文件
+ * （2026-10-04 用真推文实测确认）。
  */
-function videoOnly(v) {
-  const codecs = String((v && v.codecs) || '')
-  return !!(v && v.audio && codecs && !AUDIO_CODEC_RE.test(codecs))
+function videoOnly(master, variant) {
+  if (!variant || !variant.audio) return false
+  return !!audioRendition(master, variant)
 }
 
 /**
@@ -241,11 +243,11 @@ function audioRendition(master, variant) {
  * 想省流量的人可以在界面上取消重下低码率那一路（各路的地址都在 `variants` 里）。
  * `maxHeight` 给了就只挑不超过它的最高一路。
  *
- * 「自带声音」优先于「码率更高」：X（Twitter）这类站点的高码率那一路往往是纯画面，
- * 声音在另一条列表里。只按码率挑就会挑中它，用户拿到一个没有声音的文件 ——
- * 所以先按「这一路带不带声音」分层，层内再按原来的码率规则挑。
+ * 「自带声音」优先于「码率更高」：自带声音的那一路是一个完整文件，不必再指望
+ * 第二条列表取回来。X（Twitter）这类站点码率最高的那一路往往只有画面，
+ * 只按码率挑就会挑中它 —— 虽然现在音轨能单独取回来，但能少一个环节就少一个环节。
  */
-function pickVariant(variants, { maxHeight = 0 } = {}) {
+function pickVariant(variants, { maxHeight = 0, master = null } = {}) {
   const list = (variants || []).filter((v) => v && v.url)
   if (!list.length) return null
   const height = (v) => Number(String(v.resolution || '').split('x')[1]) || 0
@@ -255,7 +257,7 @@ function pickVariant(variants, { maxHeight = 0 } = {}) {
     .slice()
     .sort(
       (a, b) =>
-        (videoOnly(a) ? 1 : 0) - (videoOnly(b) ? 1 : 0) ||
+        (videoOnly(master, a) ? 1 : 0) - (videoOnly(master, b) ? 1 : 0) ||
         (b.bandwidth || 0) - (a.bandwidth || 0) ||
         height(b) - height(a),
     )[0]
@@ -555,6 +557,15 @@ class HlsDownloader extends EventEmitter {
            * 宁可多给一个文件，也不能让用户以为下载器把声音弄丢了。 */
           t.audio.path = path.join(t.dir, audioFileName(t))
           await this._concatTo(t, t.audio, t.audio.path)
+          t.note = `声音单独存成了「${path.basename(t.audio.path)}」——这一路的声音与画面封装格式不同，没有合成一个文件`
+        } else {
+          /* 没有第二条音轨可合，那这一路自己带没带声音就只能看实物：读产物开头的 `moov`。
+           * 用户挑的若是「画面那条列表」（X 这种音画分家的站，面板里两条列表长得一样），
+           * 从前的结局是一个没声音的文件 + 一声不吭；这里如实说清，并告诉他怎么办。
+           * `t.note` 已经有一句更具体的（比如「音轨那条 404 了」）就别覆盖它。 */
+          if (!t.note && (await this._probeSound(t.finalPath)) === false) {
+            t.note = '这个文件里只有画面 —— 这一路流没带上声音。若这页还有一条音轨列表（或主列表），选那条再下一次就能带上声音'
+          }
         }
       }
       if (t.note) console.log(`[hls] ${t.name}：${t.note}`)
@@ -591,7 +602,7 @@ class HlsDownloader extends EventEmitter {
     const master = pl.type === 'master' ? pl : null
     let variant = null
     if (master) {
-      variant = pickVariant(master.variants, { maxHeight: t.maxHeight })
+      variant = pickVariant(master.variants, { maxHeight: t.maxHeight, master })
       if (!variant) throw new Error('主列表里没有可用的流')
       const r = await fetchText(variant.url, common)
       pl = parsePlaylist(r.text, r.url)
@@ -613,7 +624,9 @@ class HlsDownloader extends EventEmitter {
     t.playlistUrl = url
     t.audio = null
     t.note = ''
-    if (master && variant && videoOnly(variant)) await this._prepareAudio(t, master, variant, common)
+    if (master && variant && videoOnly(master, variant)) {
+      await this._prepareAudio(t, audioRendition(master, variant), common)
+    }
     t.muxable = !!(t.audio && t.fmp4 && t.audio.fmp4)
     t.name = outName(t.name, { ext: extForSegments(t.segs, t.fmp4), url: t.url })
     t.finalPath = path.join(t.dir, t.name)
@@ -621,18 +634,13 @@ class HlsDownloader extends EventEmitter {
   }
 
   /**
-   * 把「声音那条列表」也取回来。
+   * 把「声音那条列表」也取回来（`rend` 由调用方用 `audioRendition` 找好）。
    *
    * 取不到**不算失败**：画面照样能下（只是没声音），所以这里只记一条 `note`，
    * 由 `_run` 如实写进日志 —— 用户看到的应该是「这条流的声音在别处」，
    * 而不是一个默默无声的文件。
    */
-  async _prepareAudio(t, master, variant, common) {
-    const rend = audioRendition(master, variant)
-    if (!rend) {
-      t.note = '这条流只有画面：声音在另一条音频列表里，而主列表没给出它的地址'
-      return
-    }
+  async _prepareAudio(t, rend, common) {
     try {
       const r = await fetchText(rend.uri, common)
       const pl = parsePlaylist(r.text, r.url)
@@ -700,8 +708,12 @@ class HlsDownloader extends EventEmitter {
     }
     if (tr.map) {
       const mp = this._segPath(tr, -1)
-      const have = await fsp.stat(mp).then((s) => s.size > 0).catch(() => false)
-      if (!have) await this._fetchOne(t, { url: tr.map.url, range: tr.map.range, seq: 0, key: null }, mp, signal)
+      const prev = await fsp.stat(mp).then((s) => s.size).catch(() => 0)
+      const n = prev > 0 ? prev : await this._fetchOne(t, { url: tr.map.url, range: tr.map.range, seq: 0, key: null }, mp, signal)
+      /* 初始化段也是产物的一部分（`_concatTo` 把它写在最前面），体积必须算进去：
+       * 从前只数分片，报给界面的体积比磁盘上的真文件小整整一个初始化段。 */
+      tr.bytes += n
+      tr.samples.push({ at: Date.now(), bytes: tr.bytes })
       tr.mapDone = true
     }
     let cursor = 0
@@ -805,6 +817,29 @@ class HlsDownloader extends EventEmitter {
   }
 
   /**
+   * 产物里到底有没有声音轨 —— 读文件开头那点字节，找 `moov` 里的 `hdlr` 处理器类型。
+   *
+   * 返回 `true` 有声音、`false` 只有画面、`null` 看不出来（不是 fMP4，比如整条是 MPEG-TS）。
+   * 这是「主列表说不说实话」的唯一可靠判据：文件名、后缀、`CODECS` 都只是别人的说法。
+   */
+  async _probeSound(file) {
+    let fh = null
+    try {
+      fh = await fsp.open(file, 'r')
+      /* 初始化段就在文件最前面（`_concatTo` 先写 map），`moov` 不会跑出这 256KB */
+      const buf = Buffer.alloc(262144)
+      const { bytesRead } = await fh.read(buf, 0, buf.length, 0)
+      const init = fmp4.readInit(buf.subarray(0, bytesRead))
+      if (!init || !init.traks.length) return null
+      return init.traks.some((k) => k.handler === 'soun')
+    } catch {
+      return null /* 读不出来就什么都不断言，别拿一句猜的话去打扰用户 */
+    } finally {
+      if (fh) await fh.close().catch(() => {})
+    }
+  }
+
+  /**
    * 把画面与声音两条 fMP4 轨合并成一个能直接播的文件。
    *
    * 只做 fMP4：两条轨的初始化段能并成一份、分片能按解码时间交错（见 `core/fmp4.js`）。
@@ -812,7 +847,17 @@ class HlsDownloader extends EventEmitter {
    * 而现在还在用 TS 分离音轨的站点已经很少（X、CMAF 系都是 fMP4）。合不了就如实存成两个文件。
    */
   async _mux(t) {
-    const init = fmp4.mergeInit(await fsp.readFile(this._segPath(t, -1)), await fsp.readFile(this._segPath(t.audio, -1)))
+    const videoInit = await fsp.readFile(this._segPath(t, -1))
+    /* 主列表的元数据不一定老实（X 的 `CODECS` 里就写着 `mp4a`）。拿画面这条轨自己的
+     * 初始化段验明正身：`moov` 里已经有声音轨，就说明声音本来就在这一路里，
+     * 再合一条音轨只会变成两条音轨、白白多一份体积。 */
+    if (fmp4.readInit(videoInit).traks.some((k) => k.handler === 'soun')) {
+      const extra = t.audio ? t.audio.bytes : 0
+      await this._concatTo(t, t, t.finalPath)
+      t.bytes = Math.max(0, t.bytes - extra)
+      return
+    }
+    const init = fmp4.mergeInit(videoInit, await fsp.readFile(this._segPath(t.audio, -1)))
     const fragments = []
     for (const [tr, info] of [
       [t, init.video],
