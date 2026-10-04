@@ -39,6 +39,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const { fetchBytes, fetchText, sleep } = require('./httpStream')
+const fmp4 = require('./fmp4')
 
 /** 同时下载的分片数。HLS 分片很小（几秒一个），8 条足够把大多数 CDN 跑满 */
 const DEFAULT_CONNS = 8
@@ -98,7 +99,8 @@ function parseByteRange(str, prevEnd) {
 
 /**
  * 解析一个 m3u8。返回：
- * - 主列表：`{ type:'master', variants:[{ url, bandwidth, resolution, codecs }] }`
+ * - 主列表：`{ type:'master', variants:[{ url, bandwidth, resolution, codecs, audio }], media:[…] }`
+ *   （`audio` 是这一路流挂的音频组号，`media` 是 `#EXT-X-MEDIA` 声明的各条独立轨）
  * - 媒体列表：`{ type:'media', segments:[{ url, dur, title, seq, key, range }], map, live, totalDur }`
  *
  * `key` 挂在**每个分片**上而不是整份列表上：标准允许中途换密钥（`#EXT-X-KEY` 可以出现多次），
@@ -109,6 +111,7 @@ function parsePlaylist(text, baseUrl) {
   if (!/#EXTM3U/.test(src.slice(0, 4096))) throw new Error('这不是 m3u8 播放列表')
   const lines = src.split(/\r?\n/)
   const variants = []
+  const media = []
   const segments = []
   let pendingInf = null
   let pendingVariant = null
@@ -127,6 +130,24 @@ function parsePlaylist(text, baseUrl) {
       const up = line.toUpperCase()
       if (up.startsWith('#EXT-X-STREAM-INF:')) {
         pendingVariant = parseAttrs(line.slice(line.indexOf(':') + 1))
+      } else if (up.startsWith('#EXT-X-MEDIA:')) {
+        /* 独立轨道（`TYPE=AUDIO` 就是「画面在这一路、声音在另一路」的来源）。
+         * 没有 `URI` 的也要记：那说明这条轨就在同一路流里，不是分离的，
+         * 而且它出现与否正好能用来判断「这一路流到底带不带声音」。 */
+        const a = parseAttrs(line.slice(line.indexOf(':') + 1))
+        const kind = String(a.TYPE || '').toUpperCase()
+        if (kind) {
+          media.push({
+            type: kind,
+            groupId: a['GROUP-ID'] || '',
+            name: a.NAME || '',
+            lang: a.LANGUAGE || '',
+            uri: a.URI ? absUrl(a.URI, baseUrl) : '',
+            def: String(a.DEFAULT || '').toUpperCase() === 'YES',
+            autoselect: String(a.AUTOSELECT || '').toUpperCase() === 'YES',
+            channels: a.CHANNELS || '',
+          })
+        }
       } else if (up.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
         mediaSequence = Number(line.slice(line.indexOf(':') + 1)) || 0
       } else if (up.startsWith('#EXTINF:')) {
@@ -155,6 +176,8 @@ function parsePlaylist(text, baseUrl) {
         bandwidth: Number(pendingVariant.BANDWIDTH) || 0,
         resolution: pendingVariant.RESOLUTION || '',
         codecs: pendingVariant.CODECS || '',
+        /* 这一路流把声音放在哪个组里（空 = 它自己带着声音） */
+        audio: pendingVariant.AUDIO || '',
       })
       pendingVariant = null
       continue
@@ -175,8 +198,41 @@ function parsePlaylist(text, baseUrl) {
     pendingRange = null
   }
 
-  if (variants.length) return { type: 'master', variants }
+  if (variants.length) return { type: 'master', variants, media }
   return { type: 'media', segments, map, live: !endList, totalDur }
+}
+
+/** `CODECS` 里出现这些名字，就说明这一路流自己带着声音 */
+const AUDIO_CODEC_RE = /(mp4a|ac-3|ec-3|opus|flac|alac|mp3|dtsc)/i
+
+/**
+ * 这一路流是不是「只有画面」。
+ *
+ * 三个条件**同时**成立才能下这个结论（判据同 yt-dlp `extractor/common.py`）：
+ * 挂了音频组、写了 `CODECS`、而 `CODECS` 里没有任何音频编码。
+ * 少任何一条都不算 —— 有音频组却没写 `CODECS` 的流其实是完整的，
+ * 真按「音频在别处」处理就会把好好的视频当残废，反而下不到声音。
+ */
+function videoOnly(v) {
+  const codecs = String((v && v.codecs) || '')
+  return !!(v && v.audio && codecs && !AUDIO_CODEC_RE.test(codecs))
+}
+
+/**
+ * 选中那一路流的声音在哪条列表里。返回 `null` 表示「取不到独立音轨」。
+ *
+ * 只认有 `URI` 的：`URI` 为空说明这条音轨跟画面在同一条流里，不需要另外下
+ * （hls-downloader 的解析器也是这么跳过的）。
+ * 组号对不上时宁可返回 null 也不去凑合别的组 —— 配错音轨比没声音更糟。
+ */
+function audioRendition(master, variant) {
+  const list = ((master && master.media) || []).filter((m) => m.type === 'AUDIO' && m.uri)
+  if (!list.length) return null
+  const gid = String((variant && variant.audio) || '')
+  if (!gid) return null
+  const pool = list.filter((m) => m.groupId === gid)
+  if (!pool.length) return null
+  return pool.slice().sort((a, b) => (b.def ? 1 : 0) - (a.def ? 1 : 0) || (b.autoselect ? 1 : 0) - (a.autoselect ? 1 : 0))[0]
 }
 
 /**
@@ -184,6 +240,10 @@ function parsePlaylist(text, baseUrl) {
  * 默认挑码率最高的一路 —— 下载器的语义是「存下来」，能存最好的一路就存最好的；
  * 想省流量的人可以在界面上取消重下低码率那一路（各路的地址都在 `variants` 里）。
  * `maxHeight` 给了就只挑不超过它的最高一路。
+ *
+ * 「自带声音」优先于「码率更高」：X（Twitter）这类站点的高码率那一路往往是纯画面，
+ * 声音在另一条列表里。只按码率挑就会挑中它，用户拿到一个没有声音的文件 ——
+ * 所以先按「这一路带不带声音」分层，层内再按原来的码率规则挑。
  */
 function pickVariant(variants, { maxHeight = 0 } = {}) {
   const list = (variants || []).filter((v) => v && v.url)
@@ -191,7 +251,14 @@ function pickVariant(variants, { maxHeight = 0 } = {}) {
   const height = (v) => Number(String(v.resolution || '').split('x')[1]) || 0
   const ok = maxHeight > 0 ? list.filter((v) => !height(v) || height(v) <= maxHeight) : list
   const pool = ok.length ? ok : list
-  return pool.slice().sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0) || height(b) - height(a))[0]
+  return pool
+    .slice()
+    .sort(
+      (a, b) =>
+        (videoOnly(a) ? 1 : 0) - (videoOnly(b) ? 1 : 0) ||
+        (b.bandwidth || 0) - (a.bandwidth || 0) ||
+        height(b) - height(a),
+    )[0]
 }
 
 /** 分片的 AES-128 IV：给了就用给的，没给按标准用「媒体序号」当 128 位大端整数 */
@@ -259,6 +326,14 @@ function extForSegments(segs, fmp4) {
   return s === 'm4s' ? '.mp4' : '.' + s
 }
 
+/** 音画合不起来时，声音单独存的名字（`x.mp4` → `x.audio.aac`），一眼能看出它配哪个文件 */
+function audioFileName(t) {
+  const base = String(t.name || '').replace(/\.[A-Za-z0-9]{1,6}$/, '') || 'audio'
+  /* 这里不能用 `outName`：它会把 `x.audio` 里的 `.audio` 当成后缀换掉，
+   * 结果两个文件同名叫 `x.mp4`，后写的那个把先写的覆盖掉（真发生过）。 */
+  return `${base}.audio${extForSegments(t.audio.segs, t.audio.fmp4)}`
+}
+
 /* ------------------------------------------------------------------ */
 /* 下载器                                                              */
 /* ------------------------------------------------------------------ */
@@ -311,6 +386,12 @@ class HlsDownloader extends EventEmitter {
       map: null,
       live: false,
       fmp4: false,
+      /** 独立音轨（`null` = 这一路流自带声音，或主列表没给音轨地址） */
+      audio: null,
+      /** 两条轨都是 fMP4 时才谈得上合并（见 `_mux`） */
+      muxable: false,
+      /** 给用户看的实话：下出来为什么可能没声音 */
+      note: '',
       keyCache: new Map(),
       ac: null,
       tmpDir: '',
@@ -458,9 +539,25 @@ class HlsDownloader extends EventEmitter {
     try {
       await this._prepare(t, signal)
       if (t.status !== 'active') return /* 准备阶段被暂停/移除 */
-      await this._downloadSegments(t, signal)
+      await this._downloadTrack(t, t, signal)
       if (t.status !== 'active') return
-      await this._concat(t)
+      if (t.audio) {
+        await this._downloadTrack(t, t.audio, signal)
+        /* 体积按两条轨一起算：界面上的「大小」才对得上最终那个文件 */
+        t.bytes += t.audio.bytes
+        if (t.status !== 'active') return
+      }
+      if (t.muxable) await this._mux(t)
+      else {
+        await this._concatTo(t, t, t.finalPath)
+        if (t.audio) {
+          /* 合不起来（画面是 fMP4、声音是 TS 这种）：声音单独存一份，名字里标出 `.audio`。
+           * 宁可多给一个文件，也不能让用户以为下载器把声音弄丢了。 */
+          t.audio.path = path.join(t.dir, audioFileName(t))
+          await this._concatTo(t, t.audio, t.audio.path)
+        }
+      }
+      if (t.note) console.log(`[hls] ${t.name}：${t.note}`)
       /* 先清临时分片、再报「完成」：否则监听 complete 的一方马上去看磁盘，
        * 还会看见一个正在被删的 `.panbox-hls-<gid>` 目录（本机测试约 1/5 概率复现）。 */
       await this._dropTmp(t)
@@ -487,16 +584,20 @@ class HlsDownloader extends EventEmitter {
   /** 取列表、选流、建立分片清单与临时目录 */
   async _prepare(t, signal) {
     const common = { headers: t.headers, proxy: t.proxy, insecure: t.insecure, signal, timeout: LIST_TIMEOUT }
+    /* 临时目录提前建：音轨的分片也要落在它下面（见 `_prepareAudio`） */
+    t.tmpDir = path.join(t.dir, `.panbox-hls-${t.gid}`)
     let { text, url } = await fetchText(t.url, common)
     let pl = parsePlaylist(text, url)
-    if (pl.type === 'master') {
-      const v = pickVariant(pl.variants, { maxHeight: t.maxHeight })
-      if (!v) throw new Error('主列表里没有可用的流')
-      const r = await fetchText(v.url, common)
+    const master = pl.type === 'master' ? pl : null
+    let variant = null
+    if (master) {
+      variant = pickVariant(master.variants, { maxHeight: t.maxHeight })
+      if (!variant) throw new Error('主列表里没有可用的流')
+      const r = await fetchText(variant.url, common)
       pl = parsePlaylist(r.text, r.url)
       url = r.url
-      t.bandwidth = v.bandwidth
-      t.resolution = v.resolution
+      t.bandwidth = variant.bandwidth
+      t.resolution = variant.resolution
     }
     if (pl.type !== 'media') throw new Error('播放列表里没有分片')
     if (!pl.segments.length) throw new Error(pl.live ? '这是直播列表，当前还没有可下的分片' : '播放列表里没有分片')
@@ -510,29 +611,80 @@ class HlsDownloader extends EventEmitter {
     t.total = pl.segments.length
     t.fmp4 = !!pl.map
     t.playlistUrl = url
-    t.tmpDir = path.join(t.dir, `.panbox-hls-${t.gid}`)
+    t.audio = null
+    t.note = ''
+    if (master && variant && videoOnly(variant)) await this._prepareAudio(t, master, variant, common)
+    t.muxable = !!(t.audio && t.fmp4 && t.audio.fmp4)
     t.name = outName(t.name, { ext: extForSegments(t.segs, t.fmp4), url: t.url })
     t.finalPath = path.join(t.dir, t.name)
     await fsp.mkdir(t.tmpDir, { recursive: true })
   }
 
-  /** 分片文件名：序号补零，方便肉眼查临时目录。初始化段单独一个名字（它不是分片） */
-  _segPath(t, i) {
-    if (i < 0) return path.join(t.tmpDir, 'init-segment')
-    return path.join(t.tmpDir, `seg-${String(i).padStart(6, '0')}`)
+  /**
+   * 把「声音那条列表」也取回来。
+   *
+   * 取不到**不算失败**：画面照样能下（只是没声音），所以这里只记一条 `note`，
+   * 由 `_run` 如实写进日志 —— 用户看到的应该是「这条流的声音在别处」，
+   * 而不是一个默默无声的文件。
+   */
+  async _prepareAudio(t, master, variant, common) {
+    const rend = audioRendition(master, variant)
+    if (!rend) {
+      t.note = '这条流只有画面：声音在另一条音频列表里，而主列表没给出它的地址'
+      return
+    }
+    try {
+      const r = await fetchText(rend.uri, common)
+      const pl = parsePlaylist(r.text, r.url)
+      if (pl.type !== 'media' || !pl.segments.length) throw new Error('列表里没有分片')
+      if (pl.segments.length > MAX_SEGS) throw new Error(`分片太多（${pl.segments.length}），疑似列表异常`)
+      for (const s of pl.segments) {
+        if (s.key && s.key.unsupported) throw new Error(`暂不支持的分片加密方式（${s.key.method}）`)
+      }
+      t.audio = {
+        url: r.url,
+        label: rend.name || rend.lang || '',
+        segs: pl.segments,
+        map: pl.map,
+        live: pl.live,
+        fmp4: !!pl.map,
+        tmpDir: path.join(t.tmpDir, 'audio'),
+        done: 0,
+        total: pl.segments.length,
+        bytes: 0,
+        samples: [],
+      }
+    } catch (e) {
+      t.note = `声音在另一条列表里，但那条没取回来（${(e && e.message) || e}）—— 这会是个纯画面文件`
+    }
   }
 
-  async _downloadSegments(t, signal) {
+  /** 分片文件名：序号补零，方便肉眼查临时目录。初始化段单独一个名字（它不是分片） */
+  _segPath(tr, i) {
+    if (i < 0) return path.join(tr.tmpDir, 'init-segment')
+    return path.join(tr.tmpDir, `seg-${String(i).padStart(6, '0')}`)
+  }
+
+  /**
+   * 下**一条轨**的分片。画面与声音共用这一段代码。
+   *
+   * `tr` 是「轨」：画面轨就是任务自己（`t`），声音轨是 `t.audio` ——
+   * 两者都有 `segs / map / tmpDir / done / total / bytes / samples`；
+   * 请求头、代理、并发这些网络配置统一从 `t` 上取。
+   */
+  async _downloadTrack(t, tr, signal) {
     /* 临时目录是断点的唯一来源，所以进度必须**从这里重新数**：
      * 接着上次继续时若在旧的 done/bytes 上继续加，已存在的分片会被算两遍，
      * 进度条会超过 100%，速度也会跳。 */
-    t.done = 0
-    t.bytes = 0
-    t.samples = []
+    tr.done = 0
+    tr.bytes = 0
+    tr.samples = []
+    /* 每条轨各占一个子目录（声音那条是 `<任务临时目录>/audio`），下之前先确保它在 */
+    await fsp.mkdir(tr.tmpDir, { recursive: true })
     /* 断点续下：临时目录里已经存在且非空的分片直接跳过 */
     const todo = []
-    for (let i = 0; i < t.segs.length; i++) {
-      const p = this._segPath(t, i)
+    for (let i = 0; i < tr.segs.length; i++) {
+      const p = this._segPath(tr, i)
       let st = null
       try {
         st = await fsp.stat(p)
@@ -540,17 +692,17 @@ class HlsDownloader extends EventEmitter {
         /* 没有就是没下过 */
       }
       if (st && st.size > 0) {
-        t.done++
-        t.bytes += st.size
+        tr.done++
+        tr.bytes += st.size
         continue
       }
       todo.push(i)
     }
-    if (t.map) {
-      const mp = this._segPath(t, -1)
+    if (tr.map) {
+      const mp = this._segPath(tr, -1)
       const have = await fsp.stat(mp).then((s) => s.size > 0).catch(() => false)
-      if (!have) await this._fetchOne(t, { url: t.map.url, range: t.map.range, seq: 0, key: null }, mp, signal)
-      t.mapDone = true
+      if (!have) await this._fetchOne(t, { url: tr.map.url, range: tr.map.range, seq: 0, key: null }, mp, signal)
+      tr.mapDone = true
     }
     let cursor = 0
     let failure = null
@@ -560,14 +712,14 @@ class HlsDownloader extends EventEmitter {
         const idx = cursor++
         if (idx >= todo.length) return
         const i = todo[idx]
-        const seg = t.segs[i]
-        const out = this._segPath(t, i)
+        const seg = tr.segs[i]
+        const out = this._segPath(tr, i)
         try {
           const bytes = await this._fetchOne(t, seg, out, signal)
-          t.done++
-          t.bytes += bytes
-          t.samples.push({ at: Date.now(), bytes: t.bytes })
-          if (t.samples.length > 40) t.samples.shift()
+          tr.done++
+          tr.bytes += bytes
+          tr.samples.push({ at: Date.now(), bytes: tr.bytes })
+          if (tr.samples.length > 40) tr.samples.shift()
         } catch (e) {
           failure = failure || e
           return
@@ -631,9 +783,9 @@ class HlsDownloader extends EventEmitter {
     return Buffer.concat([d.update(body), d.final()])
   }
 
-  /** 把分片按顺序拼成最终文件（临时分片是分开下的，完成顺序是乱的，必须按下标拼） */
-  async _concat(t) {
-    const out = fs.createWriteStream(t.finalPath)
+  /** 把一条轨的分片按顺序拼成一个文件（分片是并发下的，完成顺序是乱的，必须按下标拼） */
+  async _concatTo(t, tr, dest) {
+    const out = fs.createWriteStream(dest)
     /* 一段一段地灌，`out` 背压满了就等 drain。
      * 不用 stream.pipeline：它每拼一段都往同一个写出流上挂一组监听器，
      * 上千个分片会一路挂着（10 个就报 MaxListenersExceededWarning）。 */
@@ -643,13 +795,41 @@ class HlsDownloader extends EventEmitter {
       }
     }
     try {
-      if (t.map) await append(this._segPath(t, -1))
-      for (let i = 0; i < t.segs.length; i++) await append(this._segPath(t, i))
+      if (tr.map) await append(this._segPath(tr, -1))
+      for (let i = 0; i < tr.segs.length; i++) await append(this._segPath(tr, i))
       await new Promise((res, rej) => out.end((e) => (e ? rej(e) : res())))
     } catch (e) {
       out.destroy()
       throw e
     }
+  }
+
+  /**
+   * 把画面与声音两条 fMP4 轨合并成一个能直接播的文件。
+   *
+   * 只做 fMP4：两条轨的初始化段能并成一份、分片能按解码时间交错（见 `core/fmp4.js`）。
+   * MPEG-TS 的分离音轨**不做** —— 那要拆 TS 包再重新复用，代码量与出错面比这一整段还大，
+   * 而现在还在用 TS 分离音轨的站点已经很少（X、CMAF 系都是 fMP4）。合不了就如实存成两个文件。
+   */
+  async _mux(t) {
+    const init = fmp4.mergeInit(await fsp.readFile(this._segPath(t, -1)), await fsp.readFile(this._segPath(t.audio, -1)))
+    const fragments = []
+    for (const [tr, info] of [
+      [t, init.video],
+      [t.audio, init.audio],
+    ]) {
+      for (let i = 0; i < tr.segs.length; i++) {
+        const p = this._segPath(tr, i)
+        const f = fmp4.readFragment(await fsp.readFile(p))
+        if (!f) throw new Error('分片不是 fMP4，没法合并')
+        fragments.push({ path: p, trackId: f.trackId, retag: info.trackId, time: f.decodeTime / (info.timescale || 1) })
+      }
+    }
+    /* 先写临时文件再改名：中途失败时目录里不会留下一个半截的「成品」 */
+    const tmp = path.join(t.tmpDir, 'merged')
+    const r = await fmp4.mergeToFile({ outputPath: tmp, initBuf: init.buf, fragments })
+    await fsp.rename(tmp, t.finalPath)
+    t.bytes = r.bytes
   }
 
   async _fail(t, e) {
@@ -668,10 +848,25 @@ class HlsDownloader extends EventEmitter {
   _status(t) {
     /* 下完时用真实字节数当总量，进度条才会正好 100% */
     const isDone = t.status === 'complete' && t.bytes > 0
-    const est = t.done > 0 && t.total > 0 ? Math.round((t.bytes / t.done) * t.total) : 0
+    /* 画面与声音分两条轨下，进度是两条加起来 —— 只报画面那条的话，
+     * 界面上会停在 85% 不动（最后一段全在音频上）。 */
+    const doneSegs = (t.done || 0) + (t.audio ? t.audio.done : 0)
+    const allSegs = (t.total || 0) + (t.audio ? t.audio.total : 0)
+    const est = doneSegs > 0 && allSegs > 0 ? Math.round((t.bytes / doneSegs) * allSegs) : 0
     const total = isDone ? t.bytes : est
     const completed = isDone ? t.bytes : Math.min(t.bytes, total || t.bytes)
     const speed = this._speed(t)
+    const files = [
+      {
+        path: t.finalPath || path.join(t.dir, t.name || 'video.ts'),
+        length: String(total || 0),
+        completedLength: String(completed || 0),
+        selected: 'true',
+      },
+    ]
+    if (t.audio && t.audio.path) {
+      files.push({ path: t.audio.path, length: String(t.audio.bytes || 0), completedLength: String(t.audio.bytes || 0), selected: 'false' })
+    }
     return {
       gid: t.gid,
       engine: 'hls',
@@ -679,15 +874,17 @@ class HlsDownloader extends EventEmitter {
       name: t.name,
       dir: t.dir,
       /* 分片总数 / 已完成分片数：界面想显示「第几片」时用得上 */
-      numSegments: String(t.total || 0),
-      completedSegments: String(t.done || 0),
+      numSegments: String(allSegs),
+      completedSegments: String(doneSegs),
       totalLength: String(total || 0),
       completedLength: String(completed || 0),
       downloadSpeed: String(speed),
       connections: String(t.conns),
       live: !!t.live,
       resolution: t.resolution || '',
-      files: [{ path: t.finalPath || path.join(t.dir, t.name || 'video.ts'), length: String(total || 0), completedLength: String(completed || 0), selected: 'true' }],
+      /** 音画分离这类情况的实话（界面/日志可以直接念给用户听） */
+      note: t.note || '',
+      files,
       errorCode: t.status === 'error' ? '1' : '0',
       errorMessage: t.error || '',
     }
@@ -706,4 +903,19 @@ class HlsDownloader extends EventEmitter {
 
 const inst = new HlsDownloader()
 module.exports = inst
-module.exports.__internals = { parsePlaylist, parseAttrs, parseByteRange, pickVariant, ivFor, classify, outName, extForSegments, absUrl, DEFAULT_CONNS, MAX_SEGS }
+module.exports.__internals = {
+  parsePlaylist,
+  parseAttrs,
+  parseByteRange,
+  pickVariant,
+  videoOnly,
+  audioRendition,
+  ivFor,
+  classify,
+  outName,
+  extForSegments,
+  audioFileName,
+  absUrl,
+  DEFAULT_CONNS,
+  MAX_SEGS,
+}
