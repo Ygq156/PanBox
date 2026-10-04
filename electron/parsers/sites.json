@@ -116,6 +116,7 @@
       "label": "移动云盘",
       "share": true,
       "supported": true,
+      "login": true,
       "cookie": true,
       "endpoint": true,
       "match": "(caiyun\\.139\\.com|yun\\.139\\.com|139\\.com/m/i)"

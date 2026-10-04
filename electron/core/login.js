@@ -222,6 +222,54 @@ const SITES = {
       return { header: blob, list, loggedIn: !!token }
     },
   },
+  yidong: {
+    name: '移动云盘',
+    url: 'https://yun.139.com/w/',
+    domains: ['yun.139.com', '139.com', 'caiyun.139.com'],
+    /* 移动云盘的登录态就是**一个 cookie**：`authorization`。
+     * 139 自己的前端（app.ff91d73b.js）里 `enCodeToken` 是这么拼的：
+     *   `Basic ` + base64(`pc:${账号}:${authToken}`)
+     * 拼好之后写回 cookie 的 `authorization` 键，随每个接口请求发出去。
+     * 所以这里只要把分区里那条 cookie 取出来就行；取不到时用
+     * `auth_token`/`token` + 账号现拼一份（网页把账号放在 cookie 里）。
+     * 存成 `{authorization}` JSON 塞进 settings.cookies.yidong，
+     * 解析器侧 `parseCred` 认这段 JSON，也认裸的 `Basic …` 串
+     * （见 electron/parsers/yidong.js）。 */
+    cookieUrls: [
+      'https://yun.139.com/w/',
+      'https://yun.139.com/shareweb/',
+      'https://share-kd-njs.yun.139.com/',
+    ],
+    async read(ses) {
+      const list = await harvestCookies(ses, this)
+      const pick = (n) => {
+        const hit = list.find((c) => c.name.toLowerCase() === n && c.value)
+        return hit ? hit.value : ''
+      }
+      /* 前端有 escape/unescape 那一路，cookie 里可能带 %XX，先解一层 */
+      const unesc = (v) => {
+        if (!v) return ''
+        try {
+          return decodeURIComponent(v)
+        } catch {
+          return v
+        }
+      }
+      let authorization = unesc(pick('authorization'))
+      if (!/^basic\s/i.test(authorization)) {
+        const authToken = unesc(pick('auth_token')) || unesc(pick('token'))
+        const account = unesc(pick('account')) || unesc(pick('accountphone'))
+        if (authToken && account) {
+          authorization = 'Basic ' + Buffer.from(`pc:${account}:${authToken}`).toString('base64')
+        } else {
+          authorization = authorization || ''
+        }
+      }
+      if (!authorization) return { header: '', list, loggedIn: false }
+      const blob = JSON.stringify({ authorization })
+      return { header: blob, list: [{ name: 'authorization', value: authorization }], loggedIn: true }
+    },
+  },
 }
 
 function cookieHeader(list) {
@@ -250,7 +298,7 @@ async function harvestCookies(ses, site) {
 }
 
 /**
- * @param {'quark'|'uc'|'baidu'|'xunlei'|'tianyi'} netdisk
+ * @param {'quark'|'uc'|'baidu'|'xunlei'|'tianyi'|'yidong'} netdisk
  * @param {BrowserWindow|null} parent
  * @returns {Promise<{ok:boolean, cookie?:string, count?:number, message?:string}>}
  */
@@ -369,6 +417,8 @@ const FRESH = {
   xunlei: { name: '', minTtlSec: 0, warmMs: 0 },
   // 天翼云盘：凭证在 localStorage 里，靠重开登录窗拿不到新令牌，也不需要预热
   tianyi: { name: '', minTtlSec: 0, warmMs: 0 },
+  // 移动云盘：凭证就是分区里那条 authorization cookie，重读一遍即可，不用预热
+  yidong: { name: '', minTtlSec: 0, warmMs: 0 },
 }
 
 /**
@@ -385,7 +435,7 @@ const warmedAt = new Map()
  * 让网盘首页把短效令牌重新种进登录分区，然后回收完整 cookie。
  * 令牌还足够新时直接返回，不打开窗口。
  *
- * @param {'quark'|'uc'|'baidu'|'xunlei'|'tianyi'} netdisk
+ * @param {'quark'|'uc'|'baidu'|'xunlei'|'tianyi'|'yidong'} netdisk
  * @param {{force?:boolean}} [opts]
  * @returns {Promise<null|{header:string, list:any[], loggedIn:boolean, refreshed:boolean}>}
  */
