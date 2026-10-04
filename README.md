@@ -29,7 +29,7 @@ Windows 桌面程序：把网盘分享链接粘进来 → 解析 → 多线程�
 | 百度网盘 | ✅ | ✅ | 下载需要 | **0.10 MB/s**（账号级限速，强制单线程） |
 | 迅雷云盘 | ✅ | ✅ | 需要 | **1.1 MB/s**（8 连接） |
 | 天翼云盘 | ✅ | ✅ | 下载需要 | 列目录匿名可列（含文件夹分享）；取下载地址要**会话 cookie**（一键登录会一起存） |
-| 移动云盘 | ✅ | ✅ | 下载需要 | 目录遍历并发 5 + 预算（400 目录 / 45 秒 / 3000 文件）；取地址可借浏览器现场 |
+| 移动云盘 | ✅ | ✅ | 下载需要 | 目录遍历并发 5 + 预算（400 目录 / 45 秒 / 3000 文件）；取地址要你自己的账号（一键登录或借浏览器现场） |
 | 直链 / 境外资源 | ✅ | ✅ | 不需要 | 看源站；GitHub 走代理 **9.5 MB/s** |
 | 论文站（MDPI / SSRN） | ✅ | ✅ | 不需要 | 各自开放获取与预签名地址，看站点 |
 | 阿里云盘 | ⬜ 已撤 | ⬜ | — | 官方已不再向网页端下发分享文件下载地址（410 / 403 / 转存后空地址），解析器已撤掉 |
@@ -41,8 +41,9 @@ PanBox 自带的**分段引擎**开到 **96 连接**（0.8 → 4.4–5.3 MB/s）
 直接 403 且会招来**惩罚性降速**，所以强制单线程。迅雷 8 连接到顶。以上都在「设置 → 分段引擎连接数」里改。
 
 **登录方式**：设置 →「网盘账号」→「登录{网盘名}」→ 在弹窗里正常登录，检测到登录态后自动关闭并写入；
-也可以手动粘 Cookie。四家需要登录的盘都走「用你自己的账号转存到 `/PanBox` → 取直链 → 下载 → 自动删除副本」，
-转存前先给目录拍快照，**你自己原有的同名文件绝不会被误删**，未完成的任务不回收（还要续传）。
+也可以手动粘 Cookie。夸克 / UC / 百度 / 迅雷四家走「用你自己的账号转存到 `/PanBox` → 取直链 → 下载 → 自动删除副本」，
+转存前先给目录拍快照，**你自己原有的同名文件绝不会被误删**，未完成的任务不回收（还要续传）；
+天翼 / 移动登录后直接拿分享的下载地址，不转存。
 
 ## 浏览器插件
 
@@ -146,8 +147,10 @@ electron/                  主进程（CommonJS）
   main.js                  BrowserWindow + 全部 IPC + 转存副本回收
   preload.js               contextBridge → window.panbox
   core/                    aria2 segmentDownloader taskManager settings login bridge proxy trash netHosts
+                           hls fmp4 htmlFile httpStream cancelGuard
   parsers/                 index sites.json util esa esaSolve browserCtx identity probe transferReclaim
-                           lanzou ilanzou clouddrive quark uc pan123 baidu xunlei mdpi ssrn direct custom
+                           lanzou ilanzou clouddrive quark uc pan123 baidu xunlei tianyi yidong
+                           mdpi ssrn direct custom
 src/                       渲染层（React + TS）
 resources/extension/       浏览器插件（MV3）
 resources/aria2/           aria2c.exe（自行下载，不入库）
@@ -171,11 +174,9 @@ resources/aria2/           aria2c.exe（自行下载，不入库）
   这一条已经修好，匿名也能列。
 - **账号级限速是硬天花板**，内置解析拿到的速度取决于你自己账号的档位。
 - **123 云盘**受分享者每月 10 GB 提取配额限制；**115 / 微云**尚未实现（这一轮没做）。
-- 移动云盘的网页端把登录令牌藏在一个懒加载 chunk 里，没查出稳定取值位置，所以它不做
-  「一键登录窗」。取下载地址有两条路：在浏览器里登着 139 打开分享页，用扩展把这一页交给
-  PanBox（插件会按主机把 `Authorization` 交过来，PanBox 只在没有自有凭证时才借）；
-  或手贴凭证（设置 →「网盘账号」→ 移动云盘的凭证框）：粘
-  `Authorization` 的值，形如 `Basic <base64("pc:账号:令牌")>`（解析器也认裸的 base64 串）。
+- **移动云盘**的令牌就是登录后 139 自己写在 cookie 里的那条 `authorization`（值形如
+  `Basic <base64("pc:账号:令牌")>`，解析器也认裸的 base64 串），所以从 1.0.20 起它也能一键登录。
+  取下载地址按「设置里存的凭证 → 借浏览器现场 → 都没有就提示你登录」这个顺序来。
 - 未做代码签名，首次运行会触发 SmartScreen。
 
 ### 解析规格来源（许可证要求的署名）

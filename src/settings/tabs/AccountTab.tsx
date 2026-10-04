@@ -11,7 +11,7 @@ import { Row, Section } from '../../ui/parts'
 export const COOKIE_MASK = '__PANBOX_KEEP__'
 
 /**
- * 「网盘账号」页签：四家的登录状态 + 当前这一家的凭证输入框。
+ * 「网盘账号」页签：各家的登录状态 + 当前这一家的凭证输入框。
  *
  * 纯展示：登录、退出登录、切换当前网盘都由设置弹窗那层执行（它们要落盘 + 刷新
  * 主进程发回来的脱敏副本），这里只把用户点了什么交回去。
@@ -53,7 +53,7 @@ export function AccountTab({
 }: AccountTabProps) {
   return (
     <Section title="网盘账号">
-      {/* 四家各自的状态摆在一行里，不用来回切下拉才知道谁登过 */}
+      {/* 各家各自的状态摆在一行里，不用来回切下拉才知道谁登过 */}
       <div className="acct-chips">
         {LOGIN_TARGETS.map((k) => {
           const on = !!(s.cookies[k] || '').trim()
