@@ -410,9 +410,15 @@
 .item.playing { background: #182a1e; box-shadow: inset 2px 0 0 #3fbf6a; }
 .item .meta { flex: 1; min-width: 0; }
 .item .nm {
+  /* 必须是块级：行内元素上 overflow/text-overflow 都不生效，长文件名会直接
+     压到右边的徽章和「下载」按钮上（用真 CSS 渲图时发现的）。 */
+  display: block;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #e6e9ef;
 }
-.item .sub { font-size: 10.5px; color: #7b8497; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.item .sub {
+  display: block;
+  font-size: 10.5px; color: #7b8497; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .tag {
   flex: 0 0 auto; font-size: 10px; padding: 1px 5px; border-radius: 4px;
   background: #24304a; color: #8fb6ff; border: 1px solid #33405e;
