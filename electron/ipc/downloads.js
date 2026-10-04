@@ -5,6 +5,7 @@
  * 依赖里只有 boot/…/hostOf 这些 main.js 模块级局部来自 ctx，窗口 win 走 ctx.win() 现取。 */
 const { ipcMain } = require('electron')
 const fs = require('node:fs')
+const path = require('node:path')
 
 const settings = require('../core/settings')
 const aria2 = require('../core/aria2')
@@ -16,6 +17,9 @@ const proxy = require('../core/proxy')
 const parsers = require('../parsers')
 const { detectNetdisk, sanitizeFileName } = require('../parsers/util')
 const identity = require('../parsers/identity')
+/* 用户取消过的下载身份：投递（含分段探测失败后的回退、换直链）落地前要核对，
+ * 否则会出现「删掉的任务过一会儿自己又开始下」（详见 core/cancelGuard.js） */
+const cancelGuard = require('../core/cancelGuard')
 
 /**
  * @param {object} ctx main.js 组装的主进程局部依赖（见 main.js 里 require('./ipc') 那处调用）
@@ -183,6 +187,8 @@ function register(ctx) {
  * @returns `{gid, engine, was, live}`
  */
 async function readdTask(gid, o, fresh) {
+  /* 这一轮投递的起点：用来判断「取消」是不是发生在这之后（见下面的 cancelGuard 检查） */
+  const startedAt = Date.now()
   /* 交给引擎的那份头补一层浏览器身份（换链换来的地址同样是「浏览器能用、程序不一定」
    * 那一类）；`fresh.headers` 保持原样，它跟着任务记录走。 */
   const send = identity.forRequest(fresh.url, fresh.headers || {})
@@ -258,6 +264,13 @@ async function readdTask(gid, o, fresh) {
   if (!ngid) {
     ngid = await aria2.addUri([fresh.url], opts)
     nengine = 'aria2'
+  }
+  /* 重新解析 + 重新入列慢起来要好几秒，用户完全可能在这中间把任务删掉。
+   * 删了就把刚加进去的这条也撤掉，别让它在队列里自己复活。 */
+  if (cancelGuard.cancelledAfter(opts.dir, o.name, startedAt)) {
+    await hardRemove(ngid, { label: 'add-cancelled' }).catch(() => {})
+    boot('add-cancelled', o.name, `gid=${ngid} where=readd`)
+    return { gid: '', engine: nengine, was: st ? st.status : 'gone', live: !!live, cancelled: true }
   }
   tasks.remember(ngid, {
     name: o.name,
@@ -369,6 +382,8 @@ var refreshTask = async function (gid) {
   }
   try {
     const r = await readdTask(gid, o, fresh)
+    /* 用户在换链过程中把这条删了：新的那条也已经撤掉，不要再弹「已重新加入队列」 */
+    if (r.cancelled) return { ok: false, message: `「${o.name}」已经被移除，没有再重新加入队列`, name: o.name }
     if (newSession) cleanupRemember(o.name, newSession)
     boot('refresh', o.name, `re-add ok gid=${r.gid} engine=${r.engine} was=${r.was} live=${r.live}`)
     return { ok: true, gid: r.gid, name: o.name, message: '已用新的下载地址重新加入队列（会从断点接着下）' }
@@ -401,7 +416,24 @@ ipcMain.handle('downloads:remove', async (_e, gid, mode) => {
       done = f
     }
 
-    /* ① 还在下载/排队中的任务：先停掉，并把结果从引擎的已停止列表里清干净。
+    /* ① 先立墓碑、再摘任务。这条任务可能正走在「分段引擎探测失败 → 回退到 aria2 重新入列」
+     * 或「换直链、换一个新 gid 重新加」的路上，那两步在落地前会来核对这里 ——
+     * 没有墓碑的话，用户删掉的任务过一会儿会自己回来（见 core/cancelGuard.js）。
+     * 身份用「磁盘上的目录 + 文件名」：已完成的任务直接有 meta；
+     * 探测中的占位行没有 meta（分片引擎先登记、后探测），就现问一次引擎 ——
+     * 它回报的 path 与这轮投递将要落盘的名字是同一个。 */
+    let idDir = (meta && meta.dir) || ''
+    let idName = (meta && meta.name) || ''
+    if (!idName) {
+      const st = await taskFile(gid).catch(() => null)
+      if (st && st.path) {
+        idDir = path.dirname(st.path)
+        idName = path.basename(st.path)
+      }
+    }
+    if (idName) cancelGuard.note(idDir, idName)
+
+    /* ② 还在下载/排队中的任务：先停掉，并把结果从引擎的已停止列表里清干净。
      * ⚠️ 不清结果的话，taskManager 每 800ms 的 tellStopped 会把它原样读回来，
      * 界面上那个任务根本不会消失 —— 这就是「点了移除毫无反应」的根因。
      * 停引擎 + 清结果 + 重试这几步与 purgeTask / readdTask 共用 hardRemove。 */
@@ -412,37 +444,55 @@ ipcMain.handle('downloads:remove', async (_e, gid, mode) => {
     /* 立刻推一次，别让用户等下一个 800ms 轮询 */
     tasks.kick()
 
-    /* ② 文件去留：挪进回收站 / 直接删掉。任务已经摘干净了，这一步失败也不影响队列，
+    /* ③ 文件去留：挪进回收站 / 直接删掉。任务已经摘干净了，这一步失败也不影响队列，
      * 但要把原因如实回报（文件被别的程序占用时删不掉）。 */
     let moved = null
     let wiped = false
+    let gone = false
     let fileErr = ''
     if (done && want === 'trash') {
       try {
         moved = await trash.add(done.path, { netdisk: (meta && meta.netdisk) || '', gid })
-        if (!moved) fileErr = '文件已经不在磁盘上了'
+        if (!moved) gone = true
       } catch (e) {
         fileErr = (e && e.message) || String(e)
       }
     } else if (done && want === 'purge') {
       try {
+        /* force:true 只用来兜住「正好在这一刻被别人删掉」这种竞态；
+         * 路径本来就对不上时不能靠它静默算成功 —— 先问一次在不在，如实回报。 */
+        const existed = fs.existsSync(done.path)
         await fs.promises.rm(done.path, { recursive: true, force: true })
         wiped = true
+        if (!existed) gone = true
       } catch (e) {
         fileErr = (e && e.message) || String(e)
       }
     }
-    boot('remove', gid, `stopped=${stopped} mode=${want || '-'} name=${(meta && meta.name) || ''}`, fileErr ? 'err=' + fileErr : '')
+    const label = (moved && moved.name) || (done && path.basename(done.path)) || (meta && meta.name) || ''
+    boot(
+      'remove',
+      gid,
+      `stopped=${stopped} mode=${want || '-'} name=${label}`,
+      fileErr ? 'err=' + fileErr : gone ? 'gone=1' : '',
+    )
 
-    /* 只要引擎那边没抛（本地引擎 remove 成功 / aria2 的 remove 与清结果都走完）就算摘干净了 */
+    /* 只要引擎那边没抛（本地引擎 remove 成功 / aria2 的 remove 与清结果都走完）就算摘干净了。
+     * message 一律把「队列这边怎么样、磁盘那边怎么样」讲全：这两件事会各自成功或失败。 */
+    let message = ''
+    if (fileErr) message = `「${label}」已从队列移除，但磁盘上的文件没能处理掉：${fileErr}`
+    else if (gone) message = `「${label}」已从队列移除；磁盘上已经没有这个文件了`
+    else if (want === 'trash') message = `已把「${label}」放进回收站，之后可以还原`
+    else if (want === 'purge') message = `已彻底删除「${label}」`
     return {
       ok: stopped && !fileErr,
       moved: !!moved,
       wiped,
-      name: (moved && moved.name) || (meta && meta.name) || '',
+      gone,
+      name: label,
       size: (moved && moved.size) || 0,
       id: (moved && moved.id) || '',
-      message: fileErr,
+      message,
     }
   })
   /* ---- 回收站 ------------------------------------------------------ */
@@ -460,6 +510,8 @@ ipcMain.handle('downloads:remove', async (_e, gid, mode) => {
       return { ok: false, message: (e && e.message) || String(e) }
     }
     if (!moved) return { ok: false, message: '文件已经不在磁盘上了' }
+    /* 与「移除」同一套：这条任务也可能正走在回退/换链重新入列的路上 */
+    cancelGuard.note(path.dirname(st.path), path.basename(st.path))
     await purgeTask(gid)
     if (meta && meta.name) await recycleTransferCopy(meta.name, 'remove').catch(() => {})
     boot('delete-file', gid, `${moved.name} size=${moved.size}`)

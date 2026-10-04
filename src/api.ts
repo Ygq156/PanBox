@@ -114,7 +114,7 @@ export interface PanboxAPI {
   removeTask(
     gid: string,
     mode?: 'trash' | 'purge',
-  ): Promise<{ ok: boolean; moved?: boolean; wiped?: boolean; name?: string; size?: number; id?: string; message?: string }>
+  ): Promise<{ ok: boolean; moved?: boolean; wiped?: boolean; gone?: boolean; name?: string; size?: number; id?: string; message?: string }>
   /** 删掉已下载完成的文件：文件进回收站，任务同时从队列移除 */
   deleteTaskFile(gid: string): Promise<{ ok: boolean; name?: string; size?: number; message?: string }>
   pauseAll(): Promise<boolean>

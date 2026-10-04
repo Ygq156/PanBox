@@ -11,6 +11,9 @@ const seg = require('./core/segmentDownloader')
 const hls = require('./core/hls')
 const tasks = require('./core/taskManager')
 const trash = require('./core/trash')
+/* 用户取消过的下载身份：投递（尤其是分段探测失败后回退 aria2）落地前要核对，
+ * 否则会出现「删掉的任务过一会儿自己又开始下」（见 core/cancelGuard.js） */
+const cancelGuard = require('./core/cancelGuard')
 const parsers = require('./parsers')
 const login = require('./core/login')
 const bridge = require('./core/bridge')
@@ -760,6 +763,10 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
     if (useProxy) options['all-proxy'] = useProxy
     const segConns = perEndpoint ? 0 : segConnectionsFor(cfg, netdisk)
     try {
+      /* 这一轮投递的起点。下面这段可能要跑很久（分段引擎是先登记任务、后探测地址，
+       * 探测最坏 2~3 分钟），用户完全可能在这中间把队列里那行删掉；探测失败回退
+       * aria2 之前要能看出来「这条已经取消了」（见 core/cancelGuard.js）。 */
+      const addStartedAt = Date.now()
       /* 主地址 + 备用地址。与初次添加同一套规矩：分段引擎先试，它自己会探测（探测不通过
        * 就在 add() 里抛错），所以这里按候选顺序逐条试，一条都不行才回退 aria2。
        * aria2 没有「探测」这个环节，遇到 403 只会反复重试卡在 0%，所以先用 handable()
@@ -839,6 +846,13 @@ async function addResolved(cfg, { session, netdisk, source, title, sessionId }) 
         /* 写进 options 的那份头留解析器原样（它跟着 origin 落盘）：浏览器现场的
          * cookie 只用上面 opts2 这一份，进引擎，不落盘。 */
         options.header = buildHeaders(pick.headers)
+      }
+      /* 交引擎之前那一步可能很慢（探测、重试），用户在这中间把这条删掉是常有的事。
+       * 删了就把刚刚加进去的这条也撤掉，别让它换个 gid 复活成队列里的一行。 */
+      if (cancelGuard.cancelledAfter(subdir, f.name, addStartedAt)) {
+        await hardRemove(gid, { label: 'add-cancelled' }).catch(() => {})
+        boot('add-cancelled', f.name, `gid=${gid} engine=${engine}`)
+        continue
       }
       tasks.remember(gid, {
         name: f.name,

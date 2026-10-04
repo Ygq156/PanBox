@@ -783,9 +783,12 @@ export default function App() {
      * 否则下一次轮询会把它原样读回来，看起来像「点了没反应」。 */
     try {
       const r = await api.removeTask(t.gid, mode)
+      /* 主进程把「队列这边」和「磁盘那边」的结果分开讲（文件本来就不在、或者被
+       * 别的程序占着删不掉），有原话就照原话显示，别再自己另编一句。 */
       if (r && r.ok === false) setHint({ kind: 'err', msg: r.message || '移除失败' })
-      else if (mode === 'trash') setHint({ kind: 'ok', msg: `已把「${r?.name || t.name}」放进回收站，之后可以还原` })
-      else if (mode === 'purge') setHint({ kind: 'ok', msg: `已彻底删除「${r?.name || t.name}」` })
+      else if (r && r.message) setHint({ kind: 'ok', msg: r.message })
+      else if (mode === 'trash') setHint({ kind: 'ok', msg: `已把「${t.name}」放进回收站，之后可以还原` })
+      else if (mode === 'purge') setHint({ kind: 'ok', msg: `已彻底删除「${t.name}」` })
       setConfirmDel(null)
       const list = (await api.listDownloads()) || []
       setTasks((prev) => mergeTasks(prev, list))

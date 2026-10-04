@@ -2,7 +2,10 @@
 
 const { contextBridge, ipcRenderer } = require('electron')
 
-const invoke = (channel, payload) => ipcRenderer.invoke(channel, payload)
+/* ⚠️ 必须收**变参**再原样转发。以前写成 `(channel, payload) => ipcRenderer.invoke(channel, payload)`，
+ * 于是 `removeTask(gid, mode)` 的 mode 被悄悄丢掉，主进程里「彻底删除 / 放进回收站」
+ * 整段代码永远进不去 —— 队列行消失了，磁盘上的文件却还在（用户看到的就是「删了但没删」）。 */
+const invoke = (channel, ...args) => ipcRenderer.invoke(channel, ...args)
 
 contextBridge.exposeInMainWorld('panbox', {
   parseShare: (p) => invoke('parse:share', p),
