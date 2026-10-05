@@ -486,7 +486,11 @@ function buildHeaders(obj) {
 /* ------------------------------------------------------------------ */
 
 async function startAria2() {
-  const cfg = settings.load()
+  /* ⚠️ 必须先拷一份：settings.load() 返回的是模块内的 cache 本体，
+   * 直接 `cfg.proxy = …` 会把「跟随系统代理」这个运行时派生值塞进用户配置，
+   * 之后任何一次 save() 整份序列化时都会把它落盘（proxy 从 '' 变成系统代理地址），
+   * 只读状态也会把 auto 误报成 custom。派生值只用于本次 aria2 启动。 */
+  const cfg = { ...settings.load() }
   /* 代理每次启动都重新算（设置可能刚改过，系统代理也可能刚换） */
   cfg.proxy = proxy.effective(cfg)
   boot('proxy', cfg.proxy ? 'using ' + cfg.proxy : '(direct)')
@@ -583,10 +587,18 @@ function createWindow() {
     if (isQuitting) return
     const cfgNow = settings.load()
     /* 关了托盘图标就没有「叫回窗口」的入口了，这时候关窗口必须真的退出 */
-    if (!cfgNow.closeToTray || cfgNow.trayIcon === false) return
+    if (!cfgNow.closeToTray || cfgNow.trayIcon === false) {
+      boot('close-quit', 'closeToTray=' + cfgNow.closeToTray, 'trayIcon=' + cfgNow.trayIcon)
+      return
+    }
     e.preventDefault()
+    /* 用户报「点了 × 程序还在后台跑」或者「点了 × 就退出了」时，先看这一行：
+     * wasVisible 说明点 × 时窗口到底是显示着的还是已经收起来了（隐藏窗口收不到这条消息），
+     * 有这一行才分得清是「收进托盘」还是「根本没有走到关闭流程」。 */
+    const wasVisible = win.isVisible()
     win.hide()
     ensureTray()
+    boot('close-to-tray', 'wasVisible=' + wasVisible, 'visible=' + win.isVisible())
   })
 
   /* 导航管控：界面是单页应用，任何「整页跳转」都不是正常行为
