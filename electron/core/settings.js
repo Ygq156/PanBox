@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const os = require('node:os')
 const { DEFAULT_UA } = require('../parsers/util')
+const secretStore = require('./secretStore')
 
 const FILE = () => path.join(app.getPath('userData'), 'settings.json')
 
@@ -307,16 +308,24 @@ function load() {
           }
         }
       }
+      /* 磁盘上的 cookie 是密文（见 core/secretStore.js）。解不开的值原样保留密文 ——
+       * 好过被下一次 save() 写成空串，把用户的登录态删掉。 */
+      const cookies = { ...base.cookies, ...secretStore.decryptCookies(raw.cookies) }
       cache = {
         ...base,
         ...raw,
         settingsRev: SETTINGS_REV,
-        cookies: { ...base.cookies, ...(raw.cookies || {}) },
+        cookies,
         segConnections: seg,
       }
       /* 落盘一次，把 settingsRev 记下来，之后不再重复判断（用户再改回 96 也不会被覆盖）。
+       * 老版本留下的明文 cookie 也借这一次机会加密（加密不可用时 encryptText 原样返回明文，
+       * 那就交给 ready 之后的 reseal()）。
        * 写盘失败不拦着启动（内存里已经按新 rev 跑了），但别把失败咽掉：下一次启动还会再迁一遍。 */
-      if (migrated && !save({}).ok) console.warn('[settings] 配置迁移没能落盘，下次启动会再迁一次')
+      const cryptDirty = secretStore.keyDurable() && secretStore.hasPlaintext(cookies)
+      if ((migrated || cryptDirty) && !save({}).ok) {
+        console.warn('[settings] 配置迁移没能落盘，下次启动会再迁一次')
+      }
     } else {
       cache = { ...base, settingsRev: SETTINGS_REV }
     }
@@ -344,7 +353,8 @@ function save(partial) {
   let out = { ok: true, cfg: next }
   try {
     fs.mkdirSync(path.dirname(FILE()), { recursive: true })
-    fs.writeFileSync(FILE(), JSON.stringify(next, null, 2), 'utf8')
+    /* 内存里始终是明文（解析器要拿去发请求），**只有落盘这一下**过 safeStorage */
+    fs.writeFileSync(FILE(), JSON.stringify(secretStore.sealConfig(next), null, 2), 'utf8')
   } catch (e) {
     out = { ok: false, message: '配置没能写进磁盘：' + ((e && e.message) || String(e)), cfg: next }
   }
@@ -379,9 +389,55 @@ function resetDefaults() {
   })
 }
 
+/**
+ * app ready 之后补做一次「把凭证加密写回」。
+ *
+ * 两个场景都需要它：
+ *  - 第一次 load() 发生在 ready 之前，那时 safeStorage 不可用，写盘只能落明文，
+ *    或者读到的密文解不开（原样留在内存里）；
+ *  - 老版本留下的明文 settings.json。
+ *
+ * 这里**从磁盘重读一遍**再解密（用现在的可用状态），把内存里还是明文的那些加密写回，
+ * 顺便把上次解不开的密文换成真值。
+ *
+ * @returns {{ok:boolean, changed:boolean, message?:string}}
+ */
+function reseal() {
+  if (!secretStore.available()) return { ok: false, changed: false, message: '系统加密还没就绪' }
+  /* 密钥没落盘（全新 profile 的第一次运行）时不要写密文：那种密文下一次启动解不开。
+   * 这一轮继续用明文，等密钥落盘后任何一次启动都会自动补封（判据见 secretStore.keyDurable）。 */
+  if (!secretStore.keyDurable()) return { ok: false, changed: false, message: '系统密钥还没落盘，本轮先不加密' }
+  const cur = load()
+  let diskCookies = null
+  try {
+    if (fs.existsSync(FILE())) {
+      const disk = JSON.parse(fs.readFileSync(FILE(), 'utf8').replace(/^\uFEFF/, ''))
+      diskCookies = disk.cookies || {}
+    }
+  } catch {
+    diskCookies = null
+  }
+  if (diskCookies) {
+    /* 上一轮解不开、原样留着的密文，现在（ready 之后）能解出真值了：补进内存。
+     * 还是解不开的（换了机器/用户）继续留着密文，不许动。 */
+    const dec = secretStore.decryptCookies(diskCookies)
+    for (const [k, v] of Object.entries(dec)) {
+      if (secretStore.isEncrypted(v)) continue
+      cur.cookies[k] = v
+    }
+  }
+  /* 判据是**磁盘上还有没有明文**：老版本留下的配置，或者 ready 之前那次 save 写的。
+   * 内存里永远是明文（解析器要用），拿它当判据会导致每次启动都白写一遍盘。 */
+  const needWrite = !!diskCookies && secretStore.hasPlaintext(diskCookies)
+  if (!needWrite) return { ok: true, changed: false }
+  const r = save({})
+  return { ok: r.ok, changed: true, message: r.message }
+}
+
 module.exports = {
   load,
   save,
+  reseal,
   resetDefaults,
   /* 渲染层脱敏 / 入参校验（IPC 用，见 electron/main.js 的 settings:get / settings:set） */
   forRenderer,

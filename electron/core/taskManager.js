@@ -7,6 +7,7 @@ const path = require('node:path')
 const aria2 = require('./aria2')
 const seg = require('./segmentDownloader')
 const hls = require('./hls')
+const secretStore = require('./secretStore')
 
 const META_FILE = () => path.join(app.getPath('userData'), 'tasks.json')
 /** 有任务在跑时的轮询间隔 */
@@ -52,21 +53,45 @@ class TaskManager extends EventEmitter {
     /* 元信息落盘状态：_metaDirty=有待写的改动，_metaTimer=合并写盘的定时器 */
     this._metaDirty = false
     this._metaTimer = null
+    /* 加密还没就绪时读不出密文，这时**绝不能**用空表覆盖磁盘上的那份（见 _loadMeta） */
+    this._metaLocked = false
     this._loadMeta()
   }
 
   _loadMeta() {
+    this._metaLocked = false
     try {
-      if (fs.existsSync(META_FILE())) {
-        const obj = JSON.parse(fs.readFileSync(META_FILE(), 'utf8'))
-        for (const [gid, v] of Object.entries(obj)) this.meta.set(gid, v)
+      if (!fs.existsSync(META_FILE())) return
+      const parsed = JSON.parse(fs.readFileSync(META_FILE(), 'utf8'))
+      /* tasks.json 整份过 safeStorage（里面存着「换直链」要用的 Referer/Cookie/UA）。 */
+      const opened = secretStore.openObject(parsed)
+      if (!opened.ok) {
+        /* 磁盘上是密文、现在解不开（app ready 之前，或换了机器/用户）。
+         * 锁住落盘，让 reloadMeta() 在 ready 之后重试，别把这份文件覆盖成空的。 */
+        this._metaLocked = true
+        return
       }
+      for (const [gid, v] of Object.entries(opened.value)) this.meta.set(gid, v)
+      /* 老版本的明文 tasks.json：借一次写盘把它加密掉（加密不可用时写回去还是明文，无害） */
+      if (opened.legacy) this._scheduleMetaSave()
     } catch {
       /* ignore */
     }
   }
 
+  /**
+   * app ready 之后重读一次 tasks.json。
+   * 构造函数跑在 ready 之前，那时 safeStorage 不可用、密文读不出来 —— 只锁着不落盘，
+   * 由 main.js 的 whenReady 调这里补做。
+   */
+  reloadMeta() {
+    this.meta.clear()
+    this._loadMeta()
+    if (!this._metaLocked) this.flushMeta()
+  }
+
   _saveMeta() {
+    if (this._metaLocked) return /* 上一份还没解开：宁可这次不写，也不能覆盖掉 */
     try {
       const obj = {}
       /* 只保留 300 条，而且留**最近动过的**那 300 条。
@@ -78,7 +103,7 @@ class TaskManager extends EventEmitter {
         (a, b) => ((b[1] && b[1].createdAt) || 0) - ((a[1] && a[1].createdAt) || 0),
       )
       for (const [gid, v] of entries.slice(0, META_MAX)) obj[gid] = v
-      fs.writeFileSync(META_FILE(), JSON.stringify(obj, null, 2), 'utf8')
+      fs.writeFileSync(META_FILE(), JSON.stringify(secretStore.sealObject(obj), null, 2), 'utf8')
     } catch {
       /* ignore */
     }
@@ -106,6 +131,9 @@ class TaskManager extends EventEmitter {
       clearTimeout(this._metaTimer)
       this._metaTimer = null
     }
+    /* 还没解开磁盘上的密文（见 _loadMeta）：这次不写，脏标记留着，
+     * 等 reloadMeta() 或下一轮 _tick 再落盘 */
+    if (this._metaLocked) return
     if (!this._metaDirty) return
     this._metaDirty = false
     this._saveMeta()

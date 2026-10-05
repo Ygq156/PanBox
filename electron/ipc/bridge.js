@@ -37,6 +37,10 @@ function register(ctx) {
     return bridgeInfo()
   })
 
+  /* 生成 6 位配对码，给设置界面显示。返回值只走这条 IPC，不进任何 HTTP 响应 ——
+   * /pair 那边靠它证明「来配对的人确实坐在 PanBox 窗口前面」。 */
+  ipcMain.handle('bridge:newPairCode', () => bridge.newPairCode())
+
   /* 设置页要显示「系统代理是多少、当前实际用哪个」。每次现读一遍注册表（fresh=true），
    * 因为用户可能刚在 Clash 里改了端口。 */
   ipcMain.handle('proxy:status', async () => {

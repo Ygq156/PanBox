@@ -38,6 +38,17 @@ export interface BridgeStatus {
   extExists: boolean
 }
 
+/** 一次性的配对码：只在 PanBox 窗口里显示，用户念给插件（见 bridge:newPairCode） */
+export interface PairCode {
+  ok: boolean
+  /** 6 位数字 */
+  code: string
+  /** 到期时间戳（毫秒） */
+  expiresAt: number
+  /** 有效期（毫秒） */
+  ttl: number
+}
+
 export interface ProxyStatus {
   mode: 'auto' | 'off' | 'custom'
   /** Windows 系统里读到的代理（'' = 系统没开代理） */
@@ -138,6 +149,8 @@ export interface PanboxAPI {
   bridgeStart(): Promise<BridgeStatus>
   bridgeOpenFolder(): Promise<{ ok: boolean; dir: string; message: string }>
   bridgeNewToken(): Promise<BridgeStatus>
+  /** 生成一张新的配对码（120 秒有效、用一次就废）；只在窗口里显示，不给 HTTP */
+  bridgeNewPairCode(): Promise<PairCode>
   proxyStatus(): Promise<ProxyStatus>
   appInfo(): Promise<AppInfo>
   setAutoStart(on: boolean): Promise<{ ok: boolean; autoStart: boolean }>

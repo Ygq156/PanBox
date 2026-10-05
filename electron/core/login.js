@@ -14,6 +14,82 @@ const { BrowserWindow, session } = require('electron')
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+/** 站点域名家族：`pan.xunlei.com` 归到 `xunlei.com`，`cloud.189.cn` 归到 `189.cn`。 */
+function siteBaseDomains(site) {
+  const out = new Set()
+  const add = (h) => {
+    const parts = String(h || '')
+      .toLowerCase()
+      .split('.')
+      .filter(Boolean)
+    if (parts.length >= 2) out.add(parts.slice(-2).join('.'))
+    else if (parts.length === 1) out.add(parts[0])
+  }
+  for (const d of site.domains || []) add(d)
+  try {
+    add(new URL(site.url).hostname)
+  } catch {
+    /* ignore */
+  }
+  return out
+}
+
+/** 某个 URL 是否属于这个网盘（含其子域）。 */
+function urlInSiteFamily(url, site) {
+  let host = ''
+  try {
+    host = new URL(String(url)).hostname.toLowerCase()
+  } catch {
+    return false
+  }
+  if (!host) return false
+  for (const base of siteBaseDomains(site)) {
+    if (host === base || host.endsWith('.' + base)) return true
+  }
+  return false
+}
+
+/**
+ * 给登录窗（以及它开出的子窗口）装上导航 / 弹窗 / 权限三道限制。
+ *
+ * 这个窗口用的是网盘登录分区，分区里就存着该网盘的凭证，所以：
+ *   - 整页导航只允许这个网盘自己的域（http(s)），别的页面一律拦下；
+ *   - 服务端 302 只拦非 http(s) 的 scheme —— 扫码授权等流程会跳到第三方域，
+ *     一并拦会直接把登录做废；
+ *   - 弹窗允许，但强制继承同一分区与同一套 webPreferences，不允许出现更弱的窗口；
+ *   - 权限请求（通知/摄像头/剪贴板/定位…）登录流程一个都不需要，全部拒绝。
+ */
+function hardenLoginWindow(win, site, partition) {
+  const wc = win.webContents
+  wc.on('will-navigate', (e, url) => {
+    if (!/^https?:\/\//i.test(url) || !urlInSiteFamily(url, site)) e.preventDefault()
+  })
+  wc.on('will-redirect', (e, url) => {
+    if (!/^https?:\/\//i.test(url)) e.preventDefault()
+  })
+  wc.setWindowOpenHandler(({ url }) => {
+    if (!/^https?:\/\//i.test(url)) return { action: 'deny' }
+    return {
+      action: 'allow',
+      overrideBrowserWindowOptions: {
+        autoHideMenuBar: true,
+        webPreferences: {
+          partition,
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+        },
+      },
+    }
+  })
+  wc.on('did-create-window', (child) => hardenLoginWindow(child, site, partition))
+  try {
+    wc.session.setPermissionRequestHandler((_wc, _perm, cb) => cb(false))
+  } catch {
+    /* ignore */
+  }
+}
+
 const SITES = {
   quark: {
     name: '夸克网盘',
@@ -334,7 +410,13 @@ async function openLogin(netdisk, parent) {
     }
 
     const harvest = async () => {
-      if (typeof site.read === 'function') return site.read(ses, win)
+      if (typeof site.read === 'function') {
+        /* localStorage 型凭证是按「当前页面」读的：页面不在这个网盘的域下时，
+         * 读到的东西不属于它。这时宁可这轮不读（轮询每秒一次，页面回来自然就读到了）。 */
+        const cur = win && !win.isDestroyed() ? win.webContents.getURL() : ''
+        if (cur && !urlInSiteFamily(cur, site)) return { header: '', list: [], loggedIn: false }
+        return site.read(ses, win)
+      }
       const mine = await harvestCookies(ses, site)
       return { header: cookieHeader(mine), list: mine, loggedIn: site.logged(mine) }
     }
@@ -356,6 +438,7 @@ async function openLogin(netdisk, parent) {
     })
 
     win.loadURL(site.url).catch(() => {})
+    hardenLoginWindow(win, site, partition)
 
     timer = setInterval(async () => {
       try {
@@ -500,6 +583,7 @@ async function refreshCookie(netdisk, opts = {}) {
     })
     /* 先把页面等出来再轮询令牌：SPA 首屏要几秒，之前是从打开窗口那一刻就开始掐 12 秒，
      * 网络稍慢就必然超时。 */
+    hardenLoginWindow(win, site, partition)
     const pageSettled = new Promise((resolve) => {
       let done = false
       const fin = () => {
@@ -526,6 +610,9 @@ async function refreshCookie(netdisk, opts = {}) {
       await sleep(2000)
     }
     if (needRead) {
+      /* 同 openLogin：页面不在这个网盘的域下就不读它的 localStorage */
+      const cur = win && !win.isDestroyed() ? win.webContents.getURL() : ''
+      if (cur && !urlInSiteFamily(cur, site)) return { header: '', list: [], loggedIn: false, refreshed: true }
       const got = await site.read(ses, win)
       return { ...got, refreshed: true }
     }
@@ -541,4 +628,4 @@ async function refreshCookie(netdisk, opts = {}) {
   return { ...got, refreshed: true }
 }
 
-module.exports = { openLogin, clearLogin, refreshCookie, SITES }
+module.exports = { openLogin, clearLogin, refreshCookie, SITES, urlInSiteFamily, hardenLoginWindow }

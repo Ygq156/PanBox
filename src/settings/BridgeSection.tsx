@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { BridgeStatus } from '../api'
+import type { BridgeStatus, PairCode } from '../api'
 import { Field } from '../ui/parts'
 import { errText } from '../ui/text'
 
@@ -13,6 +13,8 @@ export function BridgeSection() {
   const [st, setSt] = useState<BridgeStatus | null>(null)
   const [msg, setMsg] = useState('')
   const [busy, setBusy] = useState(false)
+  const [pair, setPair] = useState<PairCode | null>(null)
+  const [left, setLeft] = useState(0)
 
   const refresh = async () => {
     try {
@@ -25,6 +27,15 @@ export function BridgeSection() {
   useEffect(() => {
     refresh()
   }, [])
+
+  /* 配对码只活 120 秒，界面得自己走完这段时间 —— 否则用户会对着一个已经作废的码反复输 */
+  useEffect(() => {
+    if (!pair) return
+    const tick = () => setLeft(Math.max(0, Math.ceil((pair.expiresAt - Date.now()) / 1000)))
+    tick()
+    const h = window.setInterval(tick, 1000)
+    return () => window.clearInterval(h)
+  }, [pair])
 
   const run = async (fn: () => Promise<string>) => {
     setBusy(true)
@@ -81,12 +92,42 @@ export function BridgeSection() {
           <button
             disabled={busy}
             onClick={() =>
-              run(async () => ((await api.bridgeNewToken()) ? '已换新令牌，请到插件「高级」里重新填一次' : '没换成'))
+              run(async () => {
+                const r = await api.bridgeNewPairCode()
+                setPair(r)
+                return '配对码已生成，在插件里填这 6 位数字。'
+              })
+            }
+          >
+            生成配对码
+          </button>
+          <button
+            disabled={busy}
+            onClick={() =>
+              run(async () =>
+                (await api.bridgeNewToken())
+                  ? '已换新令牌，插件要重新配对：点「生成配对码」，把码填进插件。'
+                  : '没换成'
+              )
             }
           >
             重新配对
           </button>
         </div>
+
+        {pair && (
+          <div className="stack">
+            <div className="stack-row">
+              <span className="ep-hint">配对码{left > 0 ? `（剩余 ${left} 秒）` : '（已过期）'}</span>
+              <span className="pair-code">{pair.code}</span>
+            </div>
+            <div className="ep-hint">
+              {left > 0
+                ? '在浏览器里打开 PanBox 插件，把这 6 位数字填进「配对码」，再点「配对」。'
+                : '这个码不能再用了，点「生成配对码」再来一个。'}
+            </div>
+          </div>
+        )}
 
         {st && (
           <div className="stack-row">

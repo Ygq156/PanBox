@@ -1193,6 +1193,14 @@ button.wipe:hover:not(:disabled) {
   font-size: 11px;
 }
 
+/* 配对码：用户要照着念进插件，做成一串大字（body 上是 user-select:none，这里放开好抄） */
+.pair-code {
+  font: 700 22px/1.2 'Cascadia Mono', Consolas, monospace;
+  letter-spacing: 5px;
+  color: var(--accent);
+  user-select: all;
+}
+
 .chip {
   display: inline-flex;
   align-items: center;

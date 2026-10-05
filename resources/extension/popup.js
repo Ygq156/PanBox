@@ -59,11 +59,14 @@ async function refresh() {
   const dot = $('dot')
   dot.className = 'dot ' + (s.alive ? 'on' : 'off')
   if (s.alive) {
-    $('state').textContent = `已连接 PanBox · 127.0.0.1:${s.port}` + (s.paired ? '' : ' · 未配对')
+    $('state').textContent =
+      `已连接 PanBox · 127.0.0.1:${s.port}` + (s.paired ? '' : ' · 未配对（在下面「高级」里填配对码）')
   } else {
     $('state').textContent = '未连接：请先打开 PanBox（设置 → 浏览器插件 里能看到端口）'
   }
   if (s.port) $('port').value = s.port
+  /* 没配对就把「高级」展开：配对码输入框在那里，藏着等于让用户自己找 */
+  if (!s.paired) $('adv').open = true
   $('intercept').checked = !!(s && s.intercept)
   $('panel').checked = !!(s && s.panel)
   $('sendPage').textContent = s && s.panel ? '把本页媒体 / 文件链接交给 PanBox' : '把本页文件链接交给 PanBox'
@@ -107,9 +110,20 @@ $('token').addEventListener('change', async (e) => {
 })
 
 $('pair').addEventListener('click', async () => {
-  const r = await ask({ type: 'pair' })
-  if (r && r.ok) say('配对成功', 'ok')
-  else say('配对失败：确认 PanBox 正在运行', 'err')
+  const code = ($('code').value || '').trim()
+  /* 后台还会再校验一遍；这里先挡一下，用户能立刻看到「填错格式」而不是等到超时 */
+  if (!/^\d{6}$/.test(code)) return say('配对码是 PanBox 里显示的那 6 位数字', 'err')
+  say('正在配对…')
+  const r = await ask({ type: 'pair', code })
+  if (r && r.ok) {
+    $('code').value = ''
+    say('配对成功', 'ok')
+  } else {
+    say(
+      (r && r.message) || '配对失败：先在 PanBox 里打开「设置 → 浏览器插件 → 生成配对码」',
+      'err',
+    )
+  }
   refresh()
 })
 

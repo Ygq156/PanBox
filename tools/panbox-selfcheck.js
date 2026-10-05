@@ -32,7 +32,9 @@ function findInstalls() {
     process.env.ProgramFiles || '',
     process.env['ProgramFiles(x86)'] || '',
     process.env.TEMP || '',
-    'D:\\workSpace',
+    /* 本仓库自身也扫一层（自检脚本就在 tools\ 下）：不写死开发机的盘符，
+     * 从脚本自己的位置推出来，换台机器/换个目录照样能用。 */
+    path.resolve(__dirname, '..'),
   ]
   const seen = new Set()
   const push = (p) => {

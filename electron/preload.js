@@ -49,6 +49,7 @@ contextBridge.exposeInMainWorld('panbox', {
   bridgeStart: () => invoke('bridge:start'),
   bridgeOpenFolder: () => invoke('bridge:openFolder'),
   bridgeNewToken: () => invoke('bridge:newToken'),
+  bridgeNewPairCode: () => invoke('bridge:newPairCode'),
   proxyStatus: () => invoke('proxy:status'),
 
   /* 版本 / 开机自启动 / 检查更新（见 electron/main.js 的 app:* 与 update:* 通道） */

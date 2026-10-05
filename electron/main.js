@@ -549,7 +549,10 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      /* 渲染层沙箱：界面只用 preload 暴露的 window.panbox（见 electron/preload.js，
+       * 里面只 require('electron') 的 contextBridge / ipcRenderer），开沙箱不损失功能，
+       * 但渲染层被注入时连 Node 的边都摸不到。 */
+      sandbox: true,
       /* 界面里没有 <webview>，关掉可以少一类「渲染层加载任意页面」的入口 */
       webviewTag: false,
     },
@@ -1487,6 +1490,22 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     boot('whenReady, resourcesPath=' + process.resourcesPath, 'indexHtml=' + indexHtml(), 'exists=' + fs.existsSync(indexHtml()), 'aria2=' + aria2ExePath(), 'aria2Exists=' + fs.existsSync(aria2ExePath()))
+    /* 凭证落盘加密（见 core/secretStore.js）：safeStorage 只有 ready 之后才可用，
+     * 而 settings.load() 与 taskManager 的构造函数都跑在那之前 —— 这里补做一次：
+     * 把老版本留下的明文 cookie / tasks.json 加密写回，并把上一轮没解开的密文换成真值。
+     * 失败不拦启动：内存里该有的值都在，只是这一次写盘还是明文。日志只说结果，不打值。 */
+    try {
+      const rs = settings.reseal()
+      if (rs.changed) boot('credentials-reseal', rs.ok ? 'ok' : '失败：' + (rs.message || ''))
+      else if (rs.message) boot('credentials-reseal', '没动盘：' + rs.message)
+    } catch (e) {
+      boot('credentials-reseal', '抛错：' + ((e && e.message) || e))
+    }
+    try {
+      tasks.reloadMeta()
+    } catch (e) {
+      boot('tasks-meta-reload', '抛错：' + ((e && e.message) || e))
+    }
     /* 解析请求跟随系统代理：Node 自带的 fetch 不读 Windows 代理设置，直连状态下
      * 有些站点（本机实测 papers.ssrn.com）连挑战页都拿不到，只会超时。 */
     const px = setOutboundProxy(proxy.effective(settings.load()))

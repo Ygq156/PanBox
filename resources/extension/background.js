@@ -141,13 +141,15 @@ try {
  * 接口请求（那一刻我们看到了 Authorization）→ 用户过一会儿才点「把这一页交给 PanBox」。
  * 等点的时候 worker 早被回收，交出去的就是空的，程序那边只能看到「没收到登录头」。
  *
- * 所以把 host → {auth,t} 也写进 `chrome.storage.session`（只在内存、关浏览器就没，
+ * 所以把 host → {auth,t,tabId} 也写进 `chrome.storage.session`（只在内存、关浏览器就没，
  * 长度有时效的令牌本来就该这么放），投递时两个来源合并。
+ * tabId 必须一起记：投递时只交「当前这个标签页」看到的 Authorization，否则会把别的
+ * 站点最近用过的凭据一并送出去。
  * 只在内存里、也不落盘：`session` 就是干这个用的。 */
 const AUTH_KEY = 'authByHost'
 const AUTH_TTL = 10 * 60 * 1000 /* 比 seen 的 5 分钟长一点：留给用户「过一会儿才点」的那段 */
 const AUTH_MAX = 24
-const authStore = new Map() /* host -> {auth, t} */
+const authStore = new Map() /* host -> {auth, t, tabId} */
 
 function trimAuthStore() {
   const now = Date.now()
@@ -171,7 +173,7 @@ async function saveAuth() {
     const now = Date.now()
     for (const [h, v] of authStore) {
       if (now - v.t > AUTH_TTL) continue
-      rows[h] = { auth: v.auth, t: v.t }
+      rows[h] = { auth: v.auth, t: v.t, tabId: v.tabId }
     }
     await chrome.storage.session.set({ [AUTH_KEY]: rows })
   } catch {
@@ -179,7 +181,7 @@ async function saveAuth() {
   }
 }
 
-function noteAuthHeader(url, auth) {
+function noteAuthHeader(url, auth, tabId) {
   if (!auth) return
   const s = String(auth)
   if (!s || s.length > 1024) return
@@ -190,13 +192,16 @@ function noteAuthHeader(url, auth) {
     return
   }
   if (!host) return
+  const tid = Number.isInteger(tabId) ? tabId : -1
   const prev = authStore.get(host)
-  /* 同主机保留最新那份，但别为了同一份头反复写存储 */
+  /* 同主机保留最新那份，但别为了同一份头反复写存储。
+   * tabId 也要跟着更新：这份头是在哪个标签页看到的，决定它能不能被投递出去。 */
   if (prev && prev.auth === s) {
     prev.t = Date.now()
+    prev.tabId = tid
     return
   }
-  authStore.set(host, { auth: s, t: Date.now() })
+  authStore.set(host, { auth: s, t: Date.now(), tabId: tid })
   trimAuthStore()
   scheduleSaveAuth()
 }
@@ -252,23 +257,36 @@ async function raw(path, init) {
 }
 
 /**
- * 拉取配对令牌。只有带扩展 Origin 的请求能拿到，普通网页拿不到。
- * 必须同时确认对端**自称是 PanBox**（`app` 字段）：本机任何进程都能抢在 7799 上
- * 假冒服务端，只认「有没有 token」就等于把页面地址、Referer 与该域的 Cookie 交给它。
+ * 用用户填的 6 位配对码换配对令牌。
+ *
+ * 老版本是「谁问就给」：只看对端自称 PanBox，本机任何进程都能抢在 7799 上假冒服务端，
+ * 拿到令牌后，扩展就会把页面地址、Referer 与该域的 Cookie 交给它。现在令牌只能由用户
+ * 从 PanBox 窗口里抄一个配对码过来换 —— 冒充者看不到那个窗口。
+ * 对端自称 PanBox 这一条仍然保留，两层都要过。
  */
-async function pair() {
+async function pair(code) {
+  const c = String(code || '').trim()
+  if (!/^\d{6}$/.test(c)) return { ok: false, message: '配对码是 PanBox 里显示的那 6 位数字。' }
   let r
   try {
-    r = await raw('/pair')
+    r = await raw('/pair', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: c }),
+    })
   } catch {
-    return false
+    return { ok: false, message: offlineMsg() }
   }
   if (r.ok && r.json && r.json.app === 'PanBox' && r.json.token) {
     cfg.token = r.json.token
     await chrome.storage.local.set({ token: cfg.token })
-    return true
+    return { ok: true, message: '配对成功' }
   }
-  return false
+  const m = (r.json && r.json.message) || ''
+  return {
+    ok: false,
+    message: m || '配对失败：先在 PanBox 里打开「设置 → 浏览器插件 → 生成配对码」，再把这 6 位数字填到这里。',
+  }
 }
 
 async function ping() {
@@ -289,7 +307,16 @@ function offlineMsg() {
 }
 
 /**
- * 投递一条任务。403 时自动重新配对再试一次（用户重装/重置 PanBox 后 token 会变）。
+ * 还没配对时对用户说的同一句话（各入口口径要一致）。扩展不会自己去要令牌，
+ * 令牌只能由用户从 PanBox 窗口里抄配对码换来 —— 所以这句话必须说清去哪拿码。
+ */
+function notPairedMsg() {
+  return '还没有和 PanBox 配对：在 PanBox 里打开「设置 → 浏览器插件 → 生成配对码」，再点插件图标，把显示的 6 位数字填进「配对码」。'
+}
+
+/**
+ * 投递一条任务。令牌不对（PanBox 那边换过令牌）时不再自动重配 ——
+ * 重配要用户去 PanBox 窗口抄一次配对码，这里只把服务端给的话原样带回去。
  */
 async function send(payload) {
   return post('/add', payload)
@@ -306,10 +333,10 @@ async function sendPageContext(payload) {
 
 async function post(path, payload) {
   await loadCfg()
-  /* 没令牌就先配对；配不上说明 7799 上的不是 PanBox（或被别的程序占着），
-   * 这时**不要**继续投递 —— 免得把页面地址与该域 Cookie 送给一个陌生进程。 */
-  if (!cfg.token && !(await pair())) {
-    return { ok: false, message: offlineMsg() }
+  /* 没令牌就不投递：此刻 7799 上可能是任何东西，宁可什么都不发。
+   * 这里**不再自动去要令牌**（老的自动 /pair 正是漏洞入口），要配对只能用配对码。 */
+  if (!cfg.token) {
+    return { ok: false, message: notPairedMsg() }
   }
   const body = JSON.stringify({ ...payload, token: cfg.token, via: payload.via || 'extension' })
   let r
@@ -317,10 +344,6 @@ async function post(path, payload) {
     r = await raw(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body })
   } catch (e) {
     return { ok: false, message: offlineMsg() }
-  }
-  if (r.status === 403 && (await pair())) {
-    const body2 = JSON.stringify({ ...payload, token: cfg.token, via: payload.via || 'extension' })
-    r = await raw(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: body2 })
   }
   if (r.json) return r.json
   return { ok: false, message: r.text || `HTTP ${r.status}` }
@@ -569,7 +592,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     })
     /* Authorization 另存一份到 session 存储：见 AUTH_KEY 那段注释，
      * 只靠 seen 的话 worker 一被回收，用户点「把这一页交给 PanBox」就交不出这个头了。 */
-    if (keep.authorization) noteAuthHeader(d.url, keep.authorization)
+    if (keep.authorization) noteAuthHeader(d.url, keep.authorization, d.tabId)
     trimSeen()
   },
   { urls: ['http://*/*', 'https://*/*'] },
@@ -815,9 +838,14 @@ function authHeadersForTab(tabId, max = 8) {
     }
     if (h) list.push({ host: h, auth: String(a), t: v.t })
   }
-  /* 再把持久化那份（可能来自 worker 上一世）合进来：同一主机以更新的时间为准。 */
+  /* 再把持久化那份（可能来自 worker 上一世）合进来：同一主机以更新的时间为准。
+   * tabId 过滤必须和上面那条循环一致：authStore 是按主机存的，不看标签页就会把
+   * 「最近 10 分钟里在别的标签页看到的 Authorization」一并交出去 —— 那是把不相干
+   * 站点的登录凭据送到另一个站点去。老数据没有 tabId，v.tabId 是 undefined，
+   * 于是这里天然被过滤掉（宁可少交，不可错交）。 */
   for (const [h, v] of authStore) {
     if (!v || !v.auth || now - v.t > AUTH_TTL) continue
+    if (tabId != null && tabId >= 0 && v.tabId !== tabId) continue
     if (String(v.auth).length > 1024) continue
     list.push({ host: h, auth: v.auth, t: v.t, persisted: true })
   }
@@ -1164,7 +1192,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     if (!msg || !msg.type) return reply({ ok: false, message: '未知消息' })
     if (msg.type === 'status') {
       const alive = await ping()
-      if (alive && !cfg.token) await pair()
+      /* 「活着」不等于「是 PanBox」：本机任何进程都能在 7799 上应答 /ping。
+       * 所以这里不再顺手去要令牌（老代码在这里自动 pair），配对只能由用户填码完成。 */
       return reply({
         ok: true,
         alive,
@@ -1233,8 +1262,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       })
     }
     if (msg.type === 'pair') {
-      const ok = await pair()
-      return reply({ ok, paired: !!cfg.token })
+      const r = await pair(msg.code)
+      return reply({ ok: !!r.ok, paired: !!cfg.token, message: r.message || '' })
     }
     if (msg.type === 'sendUrl') {
       const sTab = _sender && _sender.tab ? _sender.tab : null
@@ -1363,7 +1392,9 @@ async function loadAuth() {
     const now = Date.now()
     for (const [h, v] of Object.entries(rows)) {
       if (!v || !v.auth || now - (v.t || 0) > AUTH_TTL) continue
-      authStore.set(String(h).toLowerCase(), { auth: String(v.auth), t: v.t || now })
+      /* tabId 一并读回来：没有它就没法判断这份头属于哪个标签页，投递时必须过滤掉 */
+      const tid = Number.isInteger(v.tabId) ? v.tabId : -1
+      authStore.set(String(h).toLowerCase(), { auth: String(v.auth), t: v.t || now, tabId: tid })
     }
     trimAuthStore()
   } catch {

@@ -9,8 +9,10 @@
  *
  * 协议（全部只监听回环地址，公网访问不到）：
  *   GET  /ping   -> { ok, app:'PanBox', version, running:true }          不给任何密钥
- *   GET  /pair   -> { ok, token, app:'PanBox' }   仅当请求来自 chrome-extension:// / moz-extension://
- *                                    或没有 Origin 头的本机工具，网页拿不到
+ *   POST /pair   -> { ok, token, app:'PanBox' }   body 是 { code }
+ *                    只认下面钉死的那个扩展源，且要带上 PanBox 设置里生成的 6 位配对码
+ *                    （120 秒有效、一次性）。配对码本身从不经过 HTTP 出去，所以先在 7799
+ *                    上占坑、自称 PanBox 的本机进程也拿不到它。
  *   POST /add    -> 需要 token，body 是 JSON：
  *        { url, name?, referer?, cookie?, userAgent?, headers?, pageTitle?, title? }
  *                    -> { ok, kind, message, name, size }
@@ -22,7 +24,8 @@
  *
  * 为什么要有 token：CORS 拦不住「网页把请求发出去」这件事（只拦读响应），
  * 而任何网页都能朝 127.0.0.1 发请求。没有 token 的话，一个恶意页面就能往
- * 下载队列里塞任务。token 只发给带扩展 Origin 的请求，所以网页拿不到。
+ * 下载队列里塞任务。token 只在「固定扩展源 + 正确的配对码」同时成立时发一次，
+ * 所以网页拿不到，冒充 PanBox 的本机进程也拿不到。
  */
 
 const http = require('node:http')
@@ -30,6 +33,12 @@ const crypto = require('node:crypto')
 
 const DEFAULT_PORT = 7799
 const MAX_BODY = 512 * 1024
+
+/* 配对码：6 位数字、120 秒有效、用一次就废。
+ * 只有 6 位，本机进程硬猜 10^6 次总能撞上，所以再加一条：连续错 5 次这张码直接作废，
+ * 想继续试就只能回到 PanBox 窗口重新生成 —— 攻击者拿不到窗口里的码，试错也没有收益。 */
+const PAIR_CODE_TTL = 120 * 1000
+const PAIR_CODE_MAX_TRIES = 5
 
 function ensureToken(token) {
   if (token && String(token).length >= 16) return String(token)
@@ -43,6 +52,24 @@ function sameToken(a, b) {
   return crypto.timingSafeEqual(x, y)
 }
 
+/* ------------------------------------------------------------------ */
+/* 插件身份：只认这一个源                                              */
+/* ------------------------------------------------------------------ */
+
+/* resources/extension/manifest.json 里的 "key" 把扩展 ID 钉死成下面这串：同一份代码装到
+ * 哪台机器、从哪个目录加载、重装几次，源都不变。这样 /pair 才能对着一个精确的源校验，
+ * 而不是「任何自称是扩展的源」——后者等于没校验（任何已安装的扩展都能来领 token）。
+ *
+ * ID 由 key 按 Chrome 的算法算出来：
+ *   key 是 base64 的 SPKI DER；sha256(DER) 取前 16 字节；每个 nibble n 写成字符 'a' + n。
+ * 本仓库这份 key：sha256 = 5701ea40b4845d091fc2ea92d48b5e0242917b9fe380b10f4b7f72c08e1446b8
+ *                 前 16 字节 = 5701ea40b4845d091fc2ea92d48b5e02  ->  fhabokealeiefnajbpmcokjcneilfoac
+ * 换 key 就会换 ID：必须同时改这里和 manifest.json，用户也得重新加载一次扩展。 */
+const EXTENSION_ID = 'fhabokealeiefnajbpmcokjcneilfoac'
+const EXTENSION_ORIGIN = `chrome-extension://${EXTENSION_ID}`
+
+/** 宽松的「长得像扩展源」。只给 _cors 用（决定回不回 ACAO）；
+ *  配对那一步必须用上面的 EXTENSION_ORIGIN 精确比对，不能用这个。 */
 function isExtensionOrigin(origin) {
   return /^(chrome|moz|safari-web|ms-browser)-extension:\/\//i.test(String(origin || ''))
 }
@@ -59,6 +86,10 @@ class Bridge {
     this.token = ''
     this.error = ''
     this.pairedAt = 0
+    /* 当前待用的配对码。只在这里（主进程内存）存在，绝不写进任何 HTTP 响应 */
+    this.pairCode = ''
+    this.pairCodeExp = 0
+    this.pairCodeTries = 0
     this.added = 0
     this.lastAddedName = ''
     this.lastAddedAt = 0
@@ -67,6 +98,31 @@ class Bridge {
 
   get running() {
     return !!this.server && this.server.listening
+  }
+
+  /**
+   * 生成一张新的配对码，给设置界面显示用。只经主进程 IPC 返回，绝不通过 HTTP 发出去 ——
+   * 这正是这次修复的要害：码只在 PanBox 自己的窗口里可见。
+   */
+  newPairCode(ttlMs) {
+    const ttl = Number(ttlMs) > 0 ? Number(ttlMs) : PAIR_CODE_TTL
+    const n = crypto.randomInt(0, 1000000)
+    this.pairCode = String(n).padStart(6, '0')
+    this.pairCodeExp = Date.now() + ttl
+    this.pairCodeTries = 0
+    return { ok: true, code: this.pairCode, expiresAt: this.pairCodeExp, ttl }
+  }
+
+  /** /pair 的准入判定：源必须精确等于插件源，码必须在有效期内且用定长比较对上 */
+  _pairDenied(res, reason) {
+    this.pairCodeTries += 1
+    /* 猜错次数超限就把码作废：6 位空间不大，不能让本机进程无限试 */
+    if (this.pairCodeTries >= PAIR_CODE_MAX_TRIES) {
+      this.pairCode = ''
+      this.pairCodeExp = 0
+    }
+    /* 响应里不带任何区分信息：是没生成、过期了、还是码不对，一律同一句话 */
+    this._json(res, 403, { ok: false, message: reason })
   }
 
   status() {
@@ -201,10 +257,12 @@ class Bridge {
   /**
    * 请求的 Host 必须是本机地址。
    *
-   * 为什么必须有这一道：`/pair` 只靠 Origin 判断「是不是插件」，而浏览器对**同源 GET
+   * 为什么必须有这一道：`/pair` 老版只靠 Origin 判断「是不是插件」，而浏览器对**同源 GET
    * 不发 Origin**。攻击者只要把自己的域名（TTL=0）重绑到 127.0.0.1，受害者页面里的
    * `fetch('/pair')` 就成了同源请求、不带 Origin，于是能读到配对令牌，再用它 POST /add
-   * 往下载队列里塞任意 URL —— DNS rebinding。而 Host 头是浏览器**无法伪造**的：
+   * 往下载队列里塞任意 URL —— DNS rebinding。（/pair 现在还要配对码了，但这一条拦的是
+   * 整个回环通道的「谁在跟我说话」，与具体端点无关，留着。）
+   * 而 Host 头是浏览器**无法伪造**的：
    * 重绑之后请求里的 Host 仍然是 evil.com:7799（或 IP 字面量），不是 127.0.0.1/localhost。
    */
   _hostAllowed(req) {
@@ -283,10 +341,37 @@ class Bridge {
     }
 
     if (p === '/pair') {
-      if (!isExtensionOrigin(origin) && origin) {
-        this._json(res, 403, { ok: false, message: '只给浏览器插件配对' })
+      /* 老版本这里是 GET /pair，谁问给谁 token（只看 Origin 长得像不像扩展），
+       * 于是任意本机进程先在 7799 占坑、自称 PanBox 就能把 cookie 骗走。
+       * 现在只认 POST + 精确扩展源 + 用户从 PanBox 窗口里念过来的配对码。 */
+      if (req.method !== 'POST') {
+        this._json(res, 405, { ok: false, message: '请用 POST 提交配对码' })
         return
       }
+      /* 带 Origin 的必须精确是本扩展：网页 fetch 一定带自己的源，挡的就是它。
+       * 但「没带 Origin」不当成攻击特征——本机进程本来就随便伪造 Origin，这条拦不住它；
+       * 真正拦它的是下面那把只有 PanBox 窗口里才看得到的 6 位配对码。
+       * 这样写也避免了「扩展万一不发 Origin 就直接功能回归」的风险。 */
+      if (origin && String(origin) !== EXTENSION_ORIGIN) {
+        this._json(res, 403, { ok: false, message: '配对失败：请求来源不是 PanBox 的浏览器插件' })
+        return
+      }
+      let sent = ''
+      try {
+        const raw = await this._readBody(req)
+        sent = String((JSON.parse(raw || '{}') || {}).code || '')
+      } catch {
+        sent = ''
+      }
+      const live = !!this.pairCode && Date.now() < this.pairCodeExp
+      if (!live || !sent || !sameToken(sent, this.pairCode)) {
+        this._pairDenied(res, '配对失败：请在 PanBox 的「设置 → 浏览器插件」里生成配对码后重试')
+        return
+      }
+      /* 一次性：用掉就作废，过期时间一并清掉 */
+      this.pairCode = ''
+      this.pairCodeExp = 0
+      this.pairCodeTries = 0
       this.pairedAt = Date.now()
       this._json(res, 200, { ok: true, token: this.token, app: 'PanBox' })
       return
@@ -356,7 +441,7 @@ class Bridge {
     const sent = body.token || req.headers['x-panbox-token']
     if (!sent || !sameToken(sent, this.token)) {
       this.lastError = 'token 不匹配'
-      this._json(res, 403, { ok: false, message: '配对令牌不对：请在 PanBox 的「浏览器插件」里点「重新配对」' })
+      this._json(res, 403, { ok: false, message: '配对令牌不对：请在 PanBox 的「设置 → 浏览器插件」里生成配对码，再到插件里配对一次' })
       return null
     }
     if (!body.url || !/^https?:\/\//i.test(String(body.url))) {

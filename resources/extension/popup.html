@@ -80,14 +80,19 @@
       <div id="msg"></div>
     </div>
 
-    <details class="card">
-      <summary>高级（端口 / 配对令牌）</summary>
+    <details class="card" id="adv">
+      <summary>高级（端口 / 配对码）</summary>
       <div style="margin-top: 8px">
-        <div class="muted">端口</div>
+        <div class="muted">配对码</div>
+        <input type="text" id="code" inputmode="numeric" maxlength="6" placeholder="6 位数字" />
+        <button id="pair" class="ghost">配对</button>
+        <div class="tip">
+          在 PanBox 里打开「设置 → 浏览器插件 → 生成配对码」，把显示出来的 6 位数字填进上面这一栏，再点「配对」。
+        </div>
+        <div class="muted" style="margin-top: 6px">端口</div>
         <input type="number" id="port" min="1" max="65535" />
-        <div class="muted" style="margin-top: 6px">配对令牌</div>
-        <input type="text" id="token" placeholder="在 PanBox 设置里点「重新配对」后自动填入" />
-        <button id="pair" class="ghost">重新配对</button>
+        <div class="muted" style="margin-top: 6px">配对令牌（配对成功后自动保存）</div>
+        <input type="text" id="token" placeholder="配对成功后自动填入" />
       </div>
     </details>
 
